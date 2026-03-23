@@ -1,0 +1,12 @@
+{
+  "details": {
+    "methodFqn": "craton_hsm.HsmService.InitToken"
+  },
+  "requests": [
+    {
+      "location": "InitToken-request.json"
+    }
+  ],
+  "operationType": "unary",
+  "invokerName": "grpc"
+}

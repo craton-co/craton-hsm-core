@@ -1,0 +1,12 @@
+{
+  "details": {
+    "methodFqn": "craton_hsm.HsmService.Digest"
+  },
+  "requests": [
+    {
+      "location": "DigestSHA256-request.json"
+    }
+  ],
+  "operationType": "unary",
+  "invokerName": "grpc"
+}

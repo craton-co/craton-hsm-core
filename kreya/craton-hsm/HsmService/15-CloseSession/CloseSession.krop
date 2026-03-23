@@ -1,0 +1,12 @@
+{
+  "details": {
+    "methodFqn": "craton_hsm.HsmService.CloseSession"
+  },
+  "requests": [
+    {
+      "location": "CloseSession-request.json"
+    }
+  ],
+  "operationType": "unary",
+  "invokerName": "grpc"
+}

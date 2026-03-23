@@ -1,0 +1,12 @@
+{
+  "details": {
+    "methodFqn": "craton_hsm.HsmService.FindObjects"
+  },
+  "requests": [
+    {
+      "location": "FindObjects-request.json"
+    }
+  ],
+  "operationType": "unary",
+  "invokerName": "grpc"
+}

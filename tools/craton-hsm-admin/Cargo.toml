@@ -1,0 +1,19 @@
+[package]
+name = "craton-hsm-admin"
+version = "0.3.0"
+edition = "2021"
+description = "Admin CLI for Craton HSM — token init, key management, PIN operations"
+license = "Apache-2.0"
+repository = "https://github.com/craton-co/craton-hsm-core"
+
+[[bin]]
+name = "craton-hsm-admin"
+path = "src/main.rs"
+
+[dependencies]
+craton-hsm = { path = "../.." }
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+comfy-table = "7"
+rpassword = "7"
+zeroize = { version = "1", features = ["derive"] }

@@ -1,0 +1,19 @@
+{
+  "id": "b7e3a1f0-8d42-4c9b-a5e6-1f2d3c4b5a6e",
+  "importStreams": [
+    {
+      "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "name": "craton_hsm-proto",
+      "importerName": "ProtoFile",
+      "createMissingOperations": false,
+      "options": {
+        "files": [
+          "../craton-hsm-daemon/proto"
+        ],
+        "importPaths": []
+      }
+    }
+  ],
+  "authConfigs": [],
+  "certificates": []
+}

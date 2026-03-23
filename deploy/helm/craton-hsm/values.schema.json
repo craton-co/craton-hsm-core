@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["image", "daemon", "tls", "config", "service", "persistence", "networkPolicy"],
+  "properties": {
+    "image": {
+      "type": "object",
+      "required": ["repository", "tag"],
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string", "minLength": 1 },
+        "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
+      }
+    },
+    "daemon": {
+      "type": "object",
+      "properties": {
+        "bind": {
+          "type": "string",
+          "pattern": "^[0-9.:]+:[0-9]+$",
+          "description": "Listen address in host:port format"
+        },
+        "replicas": { "type": "integer", "minimum": 1 },
+        "resources": { "type": "object" }
+      }
+    },
+    "tls": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "secretName": { "type": "string", "minLength": 1 },
+        "clientCaSecretName": { "type": "string" },
+        "acceptInsecure": {
+          "type": "boolean",
+          "description": "Explicitly acknowledge plaintext gRPC. Must be set to true if tls.enabled is false. NOT recommended for any environment."
+        },
+        "disableMtls": {
+          "type": "boolean",
+          "description": "Explicitly disable mTLS. Must be set to true if clientCaSecretName is empty. NOT recommended for production."
+        }
+      }
+    },
+    "config": {
+      "type": "object",
+      "properties": {
+        "tokenLabel": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "storagePath": { "type": "string", "minLength": 1 },
+        "maxSessions": { "type": "integer", "minimum": 1, "maximum": 10000 },
+        "maxRwSessions": { "type": "integer", "minimum": 1, "maximum": 10000 },
+        "pinMinLength": { "type": "integer", "minimum": 4, "maximum": 256 },
+        "pinMaxLength": { "type": "integer", "minimum": 4, "maximum": 256 },
+        "maxFailedLogins": { "type": "integer", "minimum": 1, "maximum": 20 },
+        "enablePqc": { "type": "boolean" }
+      }
+    },
+    "service": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["ClusterIP"],
+          "description": "Only ClusterIP is permitted. Exposing an HSM outside the cluster via NodePort/LoadBalancer is a security risk."
+        },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    },
+    "persistence": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "storageClass": { "type": "string" },
+        "size": { "type": "string", "pattern": "^[0-9]+(Gi|Mi|Ti)$" }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "properties": {
+        "allowOcsp": {
+          "type": "boolean",
+          "description": "Allow egress to external OCSP/CRL endpoints (ports 80/443) for TLS certificate revocation checks."
+        }
+      }
+    },
+    "audit": {
+      "type": "object",
+      "properties": {
+        "acceptNoLogging": {
+          "type": "boolean",
+          "description": "Must be set to true to explicitly acknowledge running without audit logging when persistence is disabled."
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "details": {
+    "methodFqn": "craton_hsm.HsmService.GenerateKey"
+  },
+  "requests": [
+    {
+      "location": "GenerateKeyAES-request.json"
+    }
+  ],
+  "operationType": "unary",
+  "invokerName": "grpc"
+}

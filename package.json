@@ -1,0 +1,7 @@
+{
+  "dependencies": {
+    "html-pdf": "^3.0.1",
+    "markdown-pdf": "^11.0.0",
+    "marked": "^17.0.4"
+  }
+}

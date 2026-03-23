@@ -1,0 +1,10 @@
+{
+  "session_handle": "{{session_handle}}",
+  "mechanism": {
+    "mechanism_type": "4224",
+    "parameter": ""
+  },
+  "template": [
+    { "attr_type": "353", "value": "IAAAAA==" }
+  ]
+}

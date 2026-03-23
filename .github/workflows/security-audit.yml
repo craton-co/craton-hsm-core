@@ -1,0 +1,62 @@
+name: Security Audit
+
+# Run weekly and when dependency files change on main.
+# Advisory databases don't change with code, so this doesn't need to run on every PR.
+on:
+  schedule:
+    - cron: '17 8 * * 1'  # Monday 8:17 AM UTC
+  push:
+    branches: [main, master]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'deny.toml'
+      - '**/Cargo.toml'
+  workflow_dispatch:  # Allow manual trigger
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  security-audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
+        with:
+          toolchain: stable
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@37461a1de4134bec92ef79ff5d032a53de2c4e85 # v2
+        with:
+          tool: cargo-audit
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@37461a1de4134bec92ef79ff5d032a53de2c4e85 # v2
+        with:
+          tool: cargo-deny
+
+      - name: Run cargo-audit (CVE check)
+        # Ignored advisories — review quarterly (last reviewed 2026-03-21):
+        # RUSTSEC-2023-0071: rsa crate Marvin Attack — no fix available yet
+        # RUSTSEC-2026-0042: aws-lc-fips-sys — optional FIPS backend, update pending
+        # RUSTSEC-2026-004[4-8]: aws-lc-sys — transitive via optional aws-lc-rs
+        # RUSTSEC-2026-0049: rustls-webpki — daemon TLS dep, update pending
+        # RUSTSEC-2025-0134: rustls-pemfile — daemon TLS dep, update pending
+        run: >-
+          cargo audit
+          --ignore RUSTSEC-2023-0071
+          --ignore RUSTSEC-2026-0042
+          --ignore RUSTSEC-2026-0044
+          --ignore RUSTSEC-2026-0045
+          --ignore RUSTSEC-2026-0046
+          --ignore RUSTSEC-2026-0047
+          --ignore RUSTSEC-2026-0048
+          --ignore RUSTSEC-2026-0049
+          --ignore RUSTSEC-2025-0134
+
+      - name: Run cargo-deny (license + advisory)
+        run: cargo deny check advisories licenses

@@ -1,0 +1,8 @@
+{
+  "session_handle": "{{session_handle}}",
+  "mechanism": {
+    "mechanism_type": "592",
+    "parameter": ""
+  },
+  "data": "SGVsbG8gUnVzdEhTTQ=="
+}

@@ -1,0 +1,45 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "craton-hsm.fullname" . }}
+  labels:
+    {{- include "craton-hsm.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "craton-hsm.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        # Restrict to pods in the SAME namespace with the client label.
+        # Cross-namespace access requires adding namespaceSelector entries below.
+        - podSelector:
+            matchLabels:
+              craton-hsm-client: "true"
+      ports:
+        - port: 5696
+          protocol: TCP
+  egress:
+    # DNS resolution — restricted to kube-dns only to prevent DNS exfiltration
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    {{- if .Values.networkPolicy.allowOcsp }}
+    # OCSP/CRL — allow outbound HTTPS for certificate revocation checks
+    - ports:
+        - port: 80
+          protocol: TCP
+        - port: 443
+          protocol: TCP
+    {{- end }}

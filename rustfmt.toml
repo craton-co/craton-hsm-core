@@ -1,0 +1,4 @@
+# Use default rustfmt settings (Rust 2021 edition style).
+# This file exists to signal that the project uses rustfmt and to prevent
+# contributors from introducing custom formatting overrides.
+edition = "2021"

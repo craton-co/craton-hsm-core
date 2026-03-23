@@ -1,0 +1,18 @@
+# Default owners for the entire repository.
+# These users will be requested for review on all PRs.
+* @craton-co/craton_hsm-maintainers
+
+# Cryptographic core — requires crypto-team review.
+/src/crypto/ @craton-co/craton_hsm-crypto
+/src/store/key_material.rs @craton-co/craton_hsm-crypto
+
+# PKCS#11 ABI surface — ABI stability review.
+/src/pkcs11_abi/ @craton-co/craton_hsm-maintainers
+
+# CI & release infrastructure.
+/.github/ @craton-co/craton_hsm-maintainers
+/Cargo.toml @craton-co/craton_hsm-maintainers
+
+# Security-sensitive files.
+/SECURITY.md @craton-co/craton_hsm-maintainers
+/deny.toml @craton-co/craton_hsm-maintainers

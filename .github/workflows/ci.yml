@@ -1,0 +1,319 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── Fast gate: catch formatting errors in ~15s before expensive jobs start ──
+  fmt-check:
+    name: Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
+        with:
+          toolchain: stable
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+  # ── Build & Test: full OS matrix on main, Ubuntu-only on PRs ──
+  #
+  # Tests are split into two groups for performance:
+  #   1. Parallel-safe: pure crypto / unit tests with no global state (~92 tests)
+  #   2. Serial: PKCS#11 ABI tests sharing a process-wide singleton (~625 tests)
+  #
+  # PKCS#11 §5.10 mandates one C_Initialize/C_Finalize per process, so ABI
+  # tests must run with --test-threads=1. Pure crypto tests are stateless and
+  # safe to parallelize. This split yields ~30-50% faster CI wall time.
+  #
+  build-and-test:
+    name: Build & Test (${{ matrix.os }})
+    needs: fmt-check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "windows-latest", "macos-latest"]') }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2
+
+      - name: Run parallel-safe tests (pure crypto, no global state)
+        run: >-
+          cargo test --lib
+          --test crypto_vectors
+          --test drbg_tests
+          --test concurrent_stress
+          --test audit_and_integrity
+          --test zeroization
+          --test integrity_tests
+          --test multi_slot
+          --
+          --test-threads=8
+
+      - name: Run PKCS#11 ABI tests (serial — global singleton)
+        run: >-
+          cargo test
+          --test attribute_management
+          --test attribute_validation
+          --test backup_restore
+          --test concurrent_session_stress
+          --test crypto_vectors_phase2
+          --test digest_abi
+          --test fips_approved_mode
+          --test key_derivation_abi
+          --test key_lifecycle_abi
+          --test key_wrapping_abi
+          --test multipart_encrypt_decrypt
+          --test multipart_sign_verify
+          --test negative_edge_cases
+          --test operation_state
+          --test pairwise_consistency
+          --test persistence
+          --test pkcs11_compliance
+          --test pkcs11_compliance_extended
+          --test pkcs11_conformance
+          --test pkcs11_error_paths
+          --test pkcs11_info_functions
+          --test pqc_abi_comprehensive
+          --test pqc_phase3
+          --test random_and_session
+          --test rsa_abi_comprehensive
+          --test security_properties
+          --test session_state_machine
+          --test supplementary_functions
+          --
+          --test-threads=1
+
+      - name: Run workspace member tests
+        run: >-
+          cargo test
+          -p craton-hsm-admin
+          -p pkcs11-spy
+          -p craton-hsm-daemon
+          --
+          --test-threads=1
+
+  # ── Clippy lint (non-blocking) ──
+  lint:
+    name: Clippy
+    needs: fmt-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2
+
+      - name: Run Clippy
+        # Deny correctness and suspicious lints (safety-critical for a crypto project).
+        # Other clippy categories remain warnings until pre-existing issues are resolved.
+        run: >-
+          cargo clippy --workspace --
+          -D clippy::correctness -D clippy::suspicious
+          -A deprecated -A clippy::incompatible_msrv
+          -A clippy::not_unsafe_ptr_arg_deref
+
+  # ── Semver Checks: catch accidental breaking changes ──
+  semver-checks:
+    name: Semver Compliance
+    needs: fmt-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Check semver compliance
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          package: craton_hsm
+        continue-on-error: true  # Non-blocking until 1.0
+
+  # ── Miri: undefined-behavior checks on safety-critical crypto modules ──
+  miri:
+    name: Miri (Undefined Behavior Check)
+    needs: fmt-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install Rust nightly + Miri
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # nightly
+        with:
+          toolchain: nightly
+          components: miri
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2
+
+      - name: Run Miri on unit tests
+        run: cargo +nightly miri test --lib -- --test-threads=1 crypto::zeroize crypto::digest crypto::integrity
+        env:
+          MIRIFLAGS: "-Zmiri-disable-isolation -Zmiri-symbolic-alignment-check"
+
+  # ── Benchmarks: main-only, compare Craton HSM vs SoftHSMv2 ──
+  benchmarks:
+    name: Benchmarks (PKCS#11 ABI)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
+        with:
+          toolchain: stable
+
+      - name: Install SoftHSMv2
+        run: sudo apt-get update && sudo apt-get install -y softhsm2
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2
+
+      - name: Build release library
+        run: cargo build --release --lib
+
+      - name: Run ABI benchmarks (Craton HSM vs SoftHSMv2)
+        run: SOFTHSM2_LIB=/usr/lib/softhsm/libsofthsm2.so cargo bench --bench pkcs11_abi_bench
+
+      - name: Upload benchmark reports
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: criterion-reports
+          path: target/criterion/
+          retention-days: 30
+
+  # ── Documentation: build on PRs, deploy on main ──
+  docs:
+    name: Documentation
+    needs: fmt-check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2
+
+      - name: Build documentation
+        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: "--cfg docsrs"
+
+      - name: Add redirect index
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: echo '<meta http-equiv="refresh" content="0; url=craton_hsm/index.html">' > target/doc/index.html
+
+      - name: Upload Pages artifact
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
+        with:
+          path: target/doc
+
+      - name: Deploy to GitHub Pages
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
+        continue-on-error: true  # Fails until GitHub Pages is enabled in repo settings
+
+  # ── Code Coverage ──
+  coverage:
+    name: Code Coverage
+    needs: fmt-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2
+
+      - name: Install cargo-tarpaulin
+        uses: taiki-e/install-action@37461a1de4134bec92ef79ff5d032a53de2c4e85 # v2
+        with:
+          tool: cargo-tarpaulin
+
+      - name: Generate coverage report
+        run: cargo tarpaulin --out xml --out html --skip-clean --timeout 300 --exclude-files 'tests/fips_*' -- --test-threads=1
+        timeout-minutes: 20
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@1af58845a975a7985b0beb0cbe6fbbb71a41dbad # v4
+        if: always()
+        with:
+          files: cobertura.xml
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: coverage-report
+          path: |
+            tarpaulin-report.html
+            cobertura.xml
+          retention-days: 30

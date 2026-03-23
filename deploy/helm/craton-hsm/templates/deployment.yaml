@@ -1,0 +1,119 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "craton-hsm.fullname" . }}
+  labels:
+    {{- include "craton-hsm.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.daemon.replicas }}
+  selector:
+    matchLabels:
+      {{- include "craton-hsm.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "craton-hsm.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "craton-hsm.fullname" . }}
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if gt (int .Values.daemon.replicas) 1 }}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  {{- include "craton-hsm.selectorLabels" . | nindent 18 }}
+              topologyKey: kubernetes.io/hostname
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              {{- include "craton-hsm.selectorLabels" . | nindent 14 }}
+      {{- end }}
+      containers:
+        - name: craton-hsm
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: 5696
+              protocol: TCP
+              name: grpc
+          args:
+            - /etc/craton-hsm/craton-hsm.toml
+          volumeMounts:
+            - name: config
+              mountPath: /etc/craton-hsm
+              readOnly: true
+            - name: security
+              mountPath: /etc/craton-hsm/security
+              readOnly: true
+            {{- if .Values.tls.enabled }}
+            - name: tls
+              mountPath: /etc/craton-hsm/tls
+              readOnly: true
+            {{- end }}
+            {{- if .Values.tls.clientCaSecretName }}
+            - name: tls-client-ca
+              mountPath: /etc/craton-hsm/tls-client-ca
+              readOnly: true
+            {{- end }}
+            {{- if .Values.persistence.enabled }}
+            - name: data
+              mountPath: /data
+            {{- end }}
+          resources:
+            {{- toYaml .Values.daemon.resources | nindent 12 }}
+          readinessProbe:
+            grpc:
+              port: 5696
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            grpc:
+              port: 5696
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "craton-hsm.fullname" . }}-config
+        - name: security
+          secret:
+            secretName: {{ include "craton-hsm.fullname" . }}-security
+        {{- if .Values.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.secretName }}
+        {{- end }}
+        {{- if .Values.tls.clientCaSecretName }}
+        - name: tls-client-ca
+          secret:
+            secretName: {{ .Values.tls.clientCaSecretName }}
+        {{- end }}
+        {{- if .Values.persistence.enabled }}
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "craton-hsm.fullname" . }}-data
+        {{- end }}

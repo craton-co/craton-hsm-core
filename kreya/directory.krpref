@@ -1,0 +1,12 @@
+{
+  "settings": [
+    {
+      "options": {
+        "grpc": {
+          "endpoint": "{{server_url}}",
+          "disableServerCertificateValidation": true
+        }
+      }
+    }
+  ]
+}
