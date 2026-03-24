@@ -30,6 +30,7 @@ p384 = { version = "0.13", features = ["ecdh", "ecdsa"] }
 ecdsa = { version = "0.16", features = ["signing", "verifying", "hazmat"] }
 elliptic-curve = { version = "0.13", features = ["sec1"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 aes-gcm = "0.10"
 aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
