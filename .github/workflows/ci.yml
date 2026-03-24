@@ -59,7 +59,7 @@ jobs:
           toolchain: stable
 
       - name: Cache cargo registry & build
-        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
 
       - name: Run parallel-safe tests (pure crypto, no global state)
         run: >-
@@ -137,7 +137,7 @@ jobs:
           components: clippy
 
       - name: Cache cargo registry & build
-        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
 
       - name: Run Clippy
         # Deny correctness and suspicious lints (safety-critical for a crypto project).
@@ -178,7 +178,7 @@ jobs:
           components: miri
 
       - name: Cache cargo registry & build
-        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
 
       - name: Run Miri on unit tests
         run: cargo +nightly miri test --lib -- --test-threads=1 crypto::zeroize crypto::digest crypto::integrity
@@ -202,7 +202,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y softhsm2
 
       - name: Cache cargo registry & build
-        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
 
       - name: Build release library
         run: cargo build --release --lib
@@ -244,7 +244,7 @@ jobs:
           toolchain: stable
 
       - name: Cache cargo registry & build
-        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
 
       - name: Build documentation
         run: cargo doc --no-deps
@@ -286,7 +286,7 @@ jobs:
           toolchain: stable
 
       - name: Cache cargo registry & build
-        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
 
       - name: Install cargo-tarpaulin
         uses: taiki-e/install-action@37461a1de4134bec92ef79ff5d032a53de2c4e85 # v2
