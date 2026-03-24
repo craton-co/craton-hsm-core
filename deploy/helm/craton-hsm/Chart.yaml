@@ -1,0 +1,17 @@
+apiVersion: v2
+name: craton-hsm
+description: Craton HSM — PKCS#11 Software HSM as a Kubernetes sidecar
+version: 0.9.1
+appVersion: "0.9.1"
+type: application
+home: https://github.com/craton-co/craton-hsm-core
+sources:
+  - https://github.com/craton-co/craton-hsm-core
+maintainers:
+  - name: Craton Software Company
+    url: https://github.com/craton-co
+keywords:
+  - hsm
+  - pkcs11
+  - cryptography
+  - security

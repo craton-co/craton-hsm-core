@@ -1,0 +1,74 @@
+image:
+  repository: craton-hsm
+  tag: "0.9.1"
+  pullPolicy: IfNotPresent
+
+daemon:
+  bind: "0.0.0.0:5696"
+  replicas: 1
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+      ephemeral-storage: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+      ephemeral-storage: 256Mi
+
+tls:
+  enabled: true
+  # Provide cert and key via a Kubernetes secret
+  secretName: craton-hsm-tls
+  # Client CA secret for mutual TLS (mTLS). REQUIRED for production.
+  # The secret must contain a ca.crt key with the PEM-encoded CA certificate.
+  # Without mTLS, any pod with network access can call the HSM unauthenticated.
+  # Deliberately empty — you MUST set this to your client CA secret name.
+  # The chart will fail to render if this is empty and disableMtls is false.
+  clientCaSecretName: ""
+  # Set to true to explicitly acknowledge running without TLS (plaintext gRPC).
+  # NOT recommended for any environment. Without this, the chart fails to render
+  # when tls.enabled=false, preventing accidental plaintext deployments.
+  acceptInsecure: false
+  # Set to true to explicitly disable mTLS (NOT recommended for production).
+  # Forces you to acknowledge the security implications of running without
+  # client certificate authentication.
+  disableMtls: false
+
+config:
+  # Token configuration
+  tokenLabel: "Craton HSM Token"
+  storagePath: "/data/craton-hsm_store"
+  maxSessions: 100
+  maxRwSessions: 10
+
+  # Security settings
+  pinMinLength: 8
+  pinMaxLength: 64
+  maxFailedLogins: 5
+
+  # Algorithm settings
+  enablePqc: true
+
+service:
+  # Only ClusterIP is allowed by default. NodePort/LoadBalancer would expose
+  # the HSM outside the cluster, which is almost never appropriate.
+  type: ClusterIP
+  port: 5696
+
+persistence:
+  enabled: true
+  storageClass: ""
+  size: 1Gi
+
+networkPolicy:
+  # Allow egress to external OCSP/CRL endpoints for TLS certificate revocation
+  # checks. Only enable if your CA certificates require online revocation validation.
+  allowOcsp: false
+
+audit:
+  # Must be set to true to explicitly acknowledge running without audit logging
+  # when persistence is disabled. Without this, the chart will fail to render,
+  # preventing silent loss of audit trails.
+  acceptNoLogging: false

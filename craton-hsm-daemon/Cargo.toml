@@ -1,0 +1,31 @@
+[package]
+name = "craton-hsm-daemon"
+version = "0.3.0"
+edition = "2021"
+description = "Craton HSM network daemon — gRPC over TLS for remote HSM access"
+license = "Apache-2.0"
+repository = "https://github.com/craton-co/craton-hsm-core"
+
+[[bin]]
+name = "craton-hsm-daemon"
+path = "src/main.rs"
+
+[dependencies]
+craton-hsm = { path = ".." }
+tokio = { version = "1", features = ["full"] }
+tonic = { version = "0.14", features = ["tls-ring"] }
+tonic-prost = "0.14"
+tower = { version = "0.5", features = ["limit"] }
+prost = "0.14"
+rustls = "0.23"
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+zeroize = "1"
+async-stream = "0.3"
+
+[build-dependencies]
+tonic-prost-build = "0.14"

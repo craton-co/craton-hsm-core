@@ -1,0 +1,41 @@
+{{- include "craton-hsm.validateReplicas" . -}}
+{{- include "craton-hsm.validateTls" . -}}
+{{- include "craton-hsm.validateMtls" . -}}
+{{- include "craton-hsm.validateAudit" . -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "craton-hsm.fullname" . }}-config
+  labels:
+    {{- include "craton-hsm.labels" . | nindent 4 }}
+data:
+  craton-hsm.toml: |
+    [token]
+    label = {{ .Values.config.tokenLabel | quote }}
+    storage_path = {{ .Values.config.storagePath | quote }}
+    max_sessions = {{ .Values.config.maxSessions }}
+    max_rw_sessions = {{ .Values.config.maxRwSessions }}
+
+    [algorithms]
+    enable_pqc = {{ .Values.config.enablePqc }}
+
+    [audit]
+    {{- if .Values.persistence.enabled }}
+    enabled = true
+    log_path = "/data/craton-hsm_audit.jsonl"
+    {{- else }}
+    # Audit disabled — persistence is off and audit.acceptNoLogging=true was set.
+    enabled = false
+    log_path = "/tmp/craton-hsm_audit.jsonl"
+    {{- end }}
+    log_level = "all"
+
+    [daemon]
+    bind = {{ .Values.daemon.bind | quote }}
+    {{- if .Values.tls.enabled }}
+    tls_cert = "/etc/craton-hsm/tls/tls.crt"
+    tls_key = "/etc/craton-hsm/tls/tls.key"
+    {{- end }}
+    {{- if .Values.tls.clientCaSecretName }}
+    tls_client_ca = "/etc/craton-hsm/tls-client-ca/ca.crt"
+    {{- end }}

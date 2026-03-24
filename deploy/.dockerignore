@@ -1,0 +1,48 @@
+# ── Secrets & credentials ─────────────────────────────────────────────────
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+credentials*
+secrets*
+*secret*
+*password*
+
+# ── Test fixtures that may contain key material ──────────────────────────
+tests/fixtures/
+test_data/
+**/testdata/
+
+# ── Git ───────────────────────────────────────────────────────────────────
+.git
+.gitignore
+
+# ── Build artifacts ───────────────────────────────────────────────────────
+target/
+**/*.o
+**/*.so
+**/*.dylib
+
+# ── Deploy / CI (not needed inside image) ─────────────────────────────────
+deploy/
+.github/
+.gitlab-ci.yml
+Jenkinsfile
+*.dockerfile
+docker-compose*.yml
+
+# ── IDE / editor ──────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── Documentation & misc ─────────────────────────────────────────────────
+*.md
+LICENSE*
+CHANGELOG*
+docs/

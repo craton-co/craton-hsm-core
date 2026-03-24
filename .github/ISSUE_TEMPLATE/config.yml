@@ -1,0 +1,10 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security Vulnerability
+    url: https://github.com/craton-co/craton-hsm-core/security/advisories/new
+    about: >
+      Please report security vulnerabilities through GitHub Security Advisories,
+      NOT as public issues. See SECURITY.md for our disclosure policy.
+  - name: Questions & Discussion
+    url: https://github.com/craton-co/craton-hsm-core/discussions
+    about: Ask questions, share ideas, or discuss Craton HSM usage.

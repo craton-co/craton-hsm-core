@@ -1,0 +1,218 @@
+syntax = "proto3";
+
+package craton_hsm;
+
+service HsmService {
+  // Session management
+  rpc OpenSession(OpenSessionRequest) returns (OpenSessionResponse);
+  rpc CloseSession(CloseSessionRequest) returns (CloseSessionResponse);
+  rpc Login(LoginRequest) returns (LoginResponse);
+  rpc Logout(LogoutRequest) returns (LogoutResponse);
+
+  // Token management
+  rpc GetTokenInfo(GetTokenInfoRequest) returns (GetTokenInfoResponse);
+  rpc InitToken(InitTokenRequest) returns (InitTokenResponse);
+
+  // Key operations
+  rpc GenerateKey(GenerateKeyRequest) returns (GenerateKeyResponse);
+  rpc GenerateKeyPair(GenerateKeyPairRequest) returns (GenerateKeyPairResponse);
+  rpc DestroyObject(DestroyObjectRequest) returns (DestroyObjectResponse);
+  rpc FindObjects(FindObjectsRequest) returns (FindObjectsResponse);
+  rpc GetAttributeValue(GetAttributeValueRequest) returns (GetAttributeValueResponse);
+
+  // Cryptographic operations
+  rpc Sign(SignRequest) returns (SignResponse);
+  rpc Verify(VerifyRequest) returns (VerifyResponse);
+  rpc Encrypt(EncryptRequest) returns (EncryptResponse);
+  rpc Decrypt(DecryptRequest) returns (DecryptResponse);
+  rpc Digest(DigestRequest) returns (DigestResponse);
+  rpc GenerateRandom(GenerateRandomRequest) returns (GenerateRandomResponse);
+}
+
+// ── Common types ─────────────────────────────────────────────────────────────
+
+message Attribute {
+  uint64 attr_type = 1;
+  bytes value = 2;
+}
+
+message Mechanism {
+  uint64 mechanism_type = 1;
+  bytes parameter = 2;
+}
+
+// ── Session ──────────────────────────────────────────────────────────────────
+
+message OpenSessionRequest {
+  uint64 slot_id = 1;
+  bool read_write = 2;
+}
+
+message OpenSessionResponse {
+  uint64 session_handle = 1;
+}
+
+message CloseSessionRequest {
+  uint64 session_handle = 1;
+}
+
+message CloseSessionResponse {}
+
+message LoginRequest {
+  uint64 session_handle = 1;
+  uint64 user_type = 2;  // CKU_USER=1, CKU_SO=3
+  bytes pin = 3;          // bytes, not string — caller must zeroize after use
+}
+
+message LoginResponse {}
+
+message LogoutRequest {
+  uint64 session_handle = 1;
+}
+
+message LogoutResponse {}
+
+// ── Token Info ───────────────────────────────────────────────────────────────
+
+message GetTokenInfoRequest {
+  uint64 slot_id = 1;
+  // (#26) Session handle required to prevent unauthenticated slot enumeration.
+  // Callers must have an open session to query token info.
+  uint64 session_handle = 2;
+}
+
+message GetTokenInfoResponse {
+  string label = 1;
+  bool initialized = 2;
+  bool user_pin_initialized = 3;
+  string login_state = 4;
+  uint64 session_count = 5;
+  uint64 max_sessions = 6;
+  uint64 rw_session_count = 7;
+  uint64 max_rw_sessions = 8;
+}
+
+message InitTokenRequest {
+  uint64 slot_id = 1;
+  bytes so_pin = 2;        // bytes, not string — caller must zeroize after use
+  string label = 3;
+}
+
+message InitTokenResponse {}
+
+// ── Key Operations ───────────────────────────────────────────────────────────
+
+message GenerateKeyRequest {
+  uint64 session_handle = 1;
+  Mechanism mechanism = 2;
+  repeated Attribute template = 3;
+}
+
+message GenerateKeyResponse {
+  uint64 key_handle = 1;
+}
+
+message GenerateKeyPairRequest {
+  uint64 session_handle = 1;
+  Mechanism mechanism = 2;
+  repeated Attribute public_template = 3;
+  repeated Attribute private_template = 4;
+}
+
+message GenerateKeyPairResponse {
+  uint64 public_key_handle = 1;
+  uint64 private_key_handle = 2;
+}
+
+message DestroyObjectRequest {
+  uint64 session_handle = 1;
+  uint64 object_handle = 2;
+}
+
+message DestroyObjectResponse {}
+
+message FindObjectsRequest {
+  uint64 session_handle = 1;
+  repeated Attribute template = 2;
+  uint64 max_count = 3;
+}
+
+message FindObjectsResponse {
+  repeated uint64 object_handles = 1;
+}
+
+message GetAttributeValueRequest {
+  uint64 session_handle = 1;
+  uint64 object_handle = 2;
+  repeated uint64 attribute_types = 3;
+}
+
+message GetAttributeValueResponse {
+  repeated Attribute attributes = 1;
+}
+
+// ── Crypto Operations ────────────────────────────────────────────────────────
+
+message SignRequest {
+  uint64 session_handle = 1;
+  Mechanism mechanism = 2;
+  uint64 key_handle = 3;
+  bytes data = 4;
+}
+
+message SignResponse {
+  bytes signature = 1;
+}
+
+message VerifyRequest {
+  uint64 session_handle = 1;
+  Mechanism mechanism = 2;
+  uint64 key_handle = 3;
+  bytes data = 4;
+  bytes signature = 5;
+}
+
+message VerifyResponse {
+  bool valid = 1;
+}
+
+message EncryptRequest {
+  uint64 session_handle = 1;
+  Mechanism mechanism = 2;
+  uint64 key_handle = 3;
+  bytes data = 4;
+}
+
+message EncryptResponse {
+  bytes encrypted_data = 1;
+}
+
+message DecryptRequest {
+  uint64 session_handle = 1;
+  Mechanism mechanism = 2;
+  uint64 key_handle = 3;
+  bytes encrypted_data = 4;
+}
+
+message DecryptResponse {
+  bytes data = 1;
+}
+
+message DigestRequest {
+  uint64 session_handle = 1;
+  Mechanism mechanism = 2;
+  bytes data = 3;
+}
+
+message DigestResponse {
+  bytes digest = 1;
+}
+
+message GenerateRandomRequest {
+  uint64 session_handle = 1;
+  uint64 length = 2;
+}
+
+message GenerateRandomResponse {
+  bytes random_data = 1;
+}

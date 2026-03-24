@@ -1,0 +1,21 @@
+/target
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+*.redb
+*.redb.lock
+craton_hsm_store
+craton_hsm_audit.jsonl
+rusthsm_store
+rusthsm_audit.jsonl
+
+# IDE / editor config
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Node.js tooling (used for doc PDF generation only)
+node_modules/
+bun.lock

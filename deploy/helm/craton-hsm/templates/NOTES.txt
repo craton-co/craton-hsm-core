@@ -1,0 +1,29 @@
+Craton HSM has been deployed as {{ .Release.Name }}.
+
+  gRPC endpoint: {{ include "craton-hsm.fullname" . }}:{{ .Values.service.port }}
+
+{{- if not .Values.tls.enabled }}
+
+  ⚠  WARNING: TLS is DISABLED. gRPC traffic is unencrypted.
+     Set tls.enabled=true and provide a TLS secret for production use.
+{{- end }}
+
+{{- if and .Values.tls.enabled .Values.tls.disableMtls }}
+
+  ⚠  WARNING: Mutual TLS (mTLS) is EXPLICITLY DISABLED (tls.disableMtls=true).
+     Any pod with network access can call the HSM without client authentication.
+     Remove tls.disableMtls and set tls.clientCaSecretName for production use.
+{{- end }}
+
+{{- if and (not .Values.persistence.enabled) .Values.audit.acceptNoLogging }}
+
+  ⚠  WARNING: Persistence is DISABLED and audit.acceptNoLogging=true.
+     HSM key material and audit logs will be LOST on pod restart.
+     Set persistence.enabled=true for production use.
+{{- end }}
+
+  NetworkPolicy is active — client pods must have the label:
+    craton-hsm-client: "true"
+
+  Security configuration is stored in Secret:
+    {{ include "craton-hsm.fullname" . }}-security

@@ -1,0 +1,43 @@
+# cargo-deny configuration for Craton HSM
+# https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+# RUSTSEC-2023-0071: rsa crate Marvin Attack — no fixed version available.
+# We mitigate by not exposing raw RSA decryption; revisit when rsa crate ships a fix.
+ignore = ["RUSTSEC-2023-0071"]
+
+[licenses]
+# Allow these license expressions
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "BSL-1.0",
+    "OpenSSL",
+    "CC0-1.0",
+]
+# Confidence threshold for license detection
+confidence-threshold = 0.8
+# Allow ring's OpenSSL-derived license (used by aws-lc-rs / rustls)
+exceptions = [
+    { allow = ["ISC", "MIT", "OpenSSL"], name = "ring" },
+]
+
+[bans]
+# Warn on multiple versions of the same crate
+multiple-versions = "warn"
+# Highlight specific crates that should be audited carefully
+highlight = "all"
+
+[sources]
+# Only allow crates from crates.io
+unknown-registry = "deny"
+unknown-git = "deny"
+# Allow specific git sources if needed
+allow-git = []

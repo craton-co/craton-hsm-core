@@ -1,0 +1,12 @@
+{
+  "details": {
+    "methodFqn": "craton_hsm.HsmService.OpenSession"
+  },
+  "requests": [
+    {
+      "location": "OpenSession-request.json"
+    }
+  ],
+  "operationType": "unary",
+  "invokerName": "grpc"
+}

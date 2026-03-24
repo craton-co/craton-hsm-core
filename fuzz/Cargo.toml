@@ -1,0 +1,78 @@
+[package]
+name = "craton-hsm-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.craton_hsm]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_c_abi"
+path = "fuzz_targets/fuzz_c_abi.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_crypto_ops"
+path = "fuzz_targets/fuzz_crypto_ops.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_attributes"
+path = "fuzz_targets/fuzz_attributes.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_session_lifecycle"
+path = "fuzz_targets/fuzz_session_lifecycle.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_buffer_overflow"
+path = "fuzz_targets/fuzz_buffer_overflow.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_rsa_ops"
+path = "fuzz_targets/fuzz_rsa_ops.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_keygen"
+path = "fuzz_targets/fuzz_keygen.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_wrap_unwrap"
+path = "fuzz_targets/fuzz_wrap_unwrap.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_multipart_crypto"
+path = "fuzz_targets/fuzz_multipart_crypto.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_derive_key"
+path = "fuzz_targets/fuzz_derive_key.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_set_attribute"
+path = "fuzz_targets/fuzz_set_attribute.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_init_token"
+path = "fuzz_targets/fuzz_init_token.rs"
+doc = false

@@ -1,0 +1,13 @@
+[package]
+name = "pkcs11-spy"
+version = "0.3.0"
+edition = "2021"
+description = "PKCS#11 spy/debug wrapper — logs all function calls to any PKCS#11 library"
+license = "Apache-2.0"
+repository = "https://github.com/craton-co/craton-hsm-core"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+libloading = "0.9"

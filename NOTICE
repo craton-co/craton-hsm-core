@@ -1,0 +1,44 @@
+Craton HSM
+Copyright 2026 Craton Software Company
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+This product includes software developed at Craton Software Company (https://github.com/craton-co).
+
+---
+
+Third-party notices:
+
+This software uses cryptographic libraries from the RustCrypto project
+(https://github.com/RustCrypto), licensed under Apache-2.0 / MIT.
+
+The optional FIPS-validated aws-lc-rs backend is available separately
+in the craton_hsm-enterprise repository under the Business Source License 1.1.
+
+Key dependencies and their licenses:
+
+- rsa, p256, p384, ecdsa, ed25519-dalek, aes-gcm, aes, sha2, sha3,
+  hmac, pbkdf2, aes-kw, subtle, zeroize, secrecy (RustCrypto project):
+  Apache-2.0 / MIT
+
+- ml-kem, ml-dsa, slh-dsa (post-quantum crates): Apache-2.0 / MIT
+
+- redb: Apache-2.0 / MIT
+- dashmap: MIT
+- parking_lot: Apache-2.0 / MIT
+- serde, serde_json, toml: Apache-2.0 / MIT
+- thiserror: Apache-2.0 / MIT
+- tracing, tracing-subscriber: MIT
+- tonic, prost (gRPC): MIT
+- clap: Apache-2.0 / MIT
+- rand, rand_core, getrandom: Apache-2.0 / MIT

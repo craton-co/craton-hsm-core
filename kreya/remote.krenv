@@ -1,0 +1,9 @@
+{
+  "values": {
+    "server_url": "http://185.177.116.16:9898",
+    "so_pin_b64": "U29QMW4hRmlwcyMyMDI0",
+    "user_pin_b64": "VXNyUDFuIUZpcHMjMjAyNA==",
+    "session_handle": "0",
+    "key_handle": "0"
+  }
+}
