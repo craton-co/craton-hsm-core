@@ -488,6 +488,189 @@ pub fn hybrid_verify(
 }
 
 // ============================================================================
+// Hybrid X25519 + ML-KEM Key Exchange
+// ============================================================================
+
+/// Which ML-KEM variant to pair with X25519 in hybrid KEM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HybridKemVariant {
+    X25519MlKem768,
+    X25519MlKem1024,
+}
+
+fn hybrid_kem_ml_kem_variant(v: HybridKemVariant) -> MlKemVariant {
+    match v {
+        HybridKemVariant::X25519MlKem768 => MlKemVariant::MlKem768,
+        HybridKemVariant::X25519MlKem1024 => MlKemVariant::MlKem1024,
+    }
+}
+
+/// X25519 private key size + ML-KEM seed size.
+const X25519_KEY_LEN: usize = 32;
+const ML_KEM_SEED_LEN: usize = 64;
+
+/// Generate a hybrid X25519 + ML-KEM keypair.
+///
+/// Private key format: `[32B X25519 secret | 64B ML-KEM dk seed]`
+/// Public key format:  `[32B X25519 public | ML-KEM ek bytes]`
+pub fn hybrid_kem_keygen(variant: HybridKemVariant) -> HsmResult<(RawKeyMaterial, Vec<u8>)> {
+    use x25519_dalek::PublicKey;
+
+    // Generate X25519 keypair via DRBG
+    let mut x_secret_bytes = zeroize::Zeroizing::new([0u8; X25519_KEY_LEN]);
+    let mut drbg = crate::crypto::drbg::HmacDrbg::new()?;
+    drbg.generate(&mut *x_secret_bytes)?;
+
+    let x_secret = x25519_dalek::StaticSecret::from(*x_secret_bytes);
+    let x_public = PublicKey::from(&x_secret);
+
+    // Generate ML-KEM keypair
+    let ml_variant = hybrid_kem_ml_kem_variant(variant);
+    let (ml_dk_seed, ml_ek_bytes) = ml_kem_keygen(ml_variant)?;
+
+    // Composite private key: [X25519 secret | ML-KEM dk seed]
+    // Wrap in Zeroizing so the intermediate Vec is zeroized after move into RawKeyMaterial
+    let mut priv_key =
+        zeroize::Zeroizing::new(Vec::with_capacity(X25519_KEY_LEN + ML_KEM_SEED_LEN));
+    priv_key.extend_from_slice(&x_secret_bytes[..]);
+    priv_key.extend_from_slice(ml_dk_seed.as_bytes());
+    let private_key = RawKeyMaterial::new(priv_key.to_vec());
+
+    // Composite public key: [X25519 public | ML-KEM ek bytes]
+    let mut pub_key = Vec::with_capacity(X25519_KEY_LEN + ml_ek_bytes.len());
+    pub_key.extend_from_slice(x_public.as_bytes());
+    pub_key.extend_from_slice(&ml_ek_bytes);
+
+    Ok((private_key, pub_key))
+}
+
+/// Hybrid X25519 + ML-KEM encapsulate.
+///
+/// Input: composite public key `[32B X25519 public | ML-KEM ek bytes]`
+/// Output: (composite_ciphertext, shared_secret)
+///
+/// Composite ciphertext format: `[32B X25519 ephemeral public | ML-KEM ciphertext]`
+/// Shared secret: `HKDF-SHA256(X25519_ss || ML-KEM_ss)` → 32 bytes
+pub fn hybrid_kem_encapsulate(
+    composite_ek: &[u8],
+    variant: HybridKemVariant,
+) -> HsmResult<(Vec<u8>, Vec<u8>)> {
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    if composite_ek.len() < X25519_KEY_LEN + 1 {
+        return Err(HsmError::KeyHandleInvalid);
+    }
+
+    let x_peer_pub_bytes: [u8; X25519_KEY_LEN] = composite_ek[..X25519_KEY_LEN]
+        .try_into()
+        .map_err(|_| HsmError::KeyHandleInvalid)?;
+    let ml_ek_bytes = &composite_ek[X25519_KEY_LEN..];
+
+    // X25519: generate ephemeral keypair and compute shared secret
+    let mut eph_secret_bytes = zeroize::Zeroizing::new([0u8; X25519_KEY_LEN]);
+    let mut drbg = crate::crypto::drbg::HmacDrbg::new()?;
+    drbg.generate(&mut *eph_secret_bytes)?;
+
+    let eph_secret = StaticSecret::from(*eph_secret_bytes);
+    let eph_public = PublicKey::from(&eph_secret);
+    let x_peer_pub = PublicKey::from(x_peer_pub_bytes);
+    let x_shared = eph_secret.diffie_hellman(&x_peer_pub);
+
+    // ML-KEM: encapsulate
+    let ml_variant = hybrid_kem_ml_kem_variant(variant);
+    let (ml_ct, ml_ss) = ml_kem_encapsulate(ml_ek_bytes, ml_variant)?;
+
+    // Combine shared secrets via HKDF-SHA256
+    let combined_ss = combine_kem_secrets(x_shared.as_bytes(), &ml_ss)?;
+
+    // Composite ciphertext: [X25519 ephemeral public | ML-KEM ciphertext]
+    let mut ct = Vec::with_capacity(X25519_KEY_LEN + ml_ct.len());
+    ct.extend_from_slice(eph_public.as_bytes());
+    ct.extend_from_slice(&ml_ct);
+
+    Ok((ct, combined_ss))
+}
+
+/// Hybrid X25519 + ML-KEM decapsulate.
+///
+/// Input: composite private key `[32B X25519 secret | 64B ML-KEM dk seed]`
+///        composite ciphertext `[32B X25519 ephemeral public | ML-KEM ciphertext]`
+/// Output: shared_secret (32 bytes)
+pub fn hybrid_kem_decapsulate(
+    composite_dk: &[u8],
+    composite_ct: &[u8],
+    variant: HybridKemVariant,
+) -> HsmResult<Vec<u8>> {
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    if composite_dk.len() < X25519_KEY_LEN + ML_KEM_SEED_LEN {
+        return Err(HsmError::KeyHandleInvalid);
+    }
+    if composite_ct.len() < X25519_KEY_LEN + 1 {
+        return Err(HsmError::EncryptedDataInvalid);
+    }
+
+    // Split composite private key — wrap in Zeroizing for FIPS 140-3 zeroization
+    let mut x_secret_bytes = zeroize::Zeroizing::new([0u8; X25519_KEY_LEN]);
+    x_secret_bytes.copy_from_slice(&composite_dk[..X25519_KEY_LEN]);
+    let ml_dk_seed = &composite_dk[X25519_KEY_LEN..X25519_KEY_LEN + ML_KEM_SEED_LEN];
+
+    // Split composite ciphertext
+    let eph_pub_bytes: [u8; X25519_KEY_LEN] = composite_ct[..X25519_KEY_LEN]
+        .try_into()
+        .map_err(|_| HsmError::EncryptedDataInvalid)?;
+    let ml_ct = &composite_ct[X25519_KEY_LEN..];
+
+    // X25519: compute shared secret
+    let x_secret = StaticSecret::from(*x_secret_bytes);
+    let eph_public = PublicKey::from(eph_pub_bytes);
+    let x_shared = x_secret.diffie_hellman(&eph_public);
+
+    // ML-KEM: decapsulate
+    let ml_variant = hybrid_kem_ml_kem_variant(variant);
+    let ml_ss = ml_kem_decapsulate(ml_dk_seed, ml_ct, ml_variant)?;
+
+    // Combine shared secrets via HKDF-SHA256
+    combine_kem_secrets(x_shared.as_bytes(), &ml_ss)
+}
+
+/// Combine X25519 and ML-KEM shared secrets using HKDF-SHA256.
+fn combine_kem_secrets(x25519_ss: &[u8], ml_kem_ss: &[u8]) -> HsmResult<Vec<u8>> {
+    use hkdf::Hkdf;
+    use sha2::Sha256;
+
+    let mut ikm = Vec::with_capacity(x25519_ss.len() + ml_kem_ss.len());
+    ikm.extend_from_slice(x25519_ss);
+    ikm.extend_from_slice(ml_kem_ss);
+
+    let hk = Hkdf::<Sha256>::new(Some(b"CratonHSM-HybridKEM-v1"), &ikm);
+    let mut okm = vec![0u8; 32];
+    hk.expand(b"hybrid-kem-shared-secret", &mut okm)
+        .map_err(|_| HsmError::GeneralError)?;
+
+    // Zeroize intermediate concatenated material
+    use zeroize::Zeroize;
+    ikm.zeroize();
+
+    Ok(okm)
+}
+
+pub fn mechanism_to_hybrid_kem_variant(
+    mechanism: crate::pkcs11_abi::types::CK_MECHANISM_TYPE,
+) -> Option<HybridKemVariant> {
+    use crate::pkcs11_abi::constants::*;
+    match mechanism {
+        CKM_HYBRID_X25519_ML_KEM_768 => Some(HybridKemVariant::X25519MlKem768),
+        CKM_HYBRID_X25519_ML_KEM_1024 => Some(HybridKemVariant::X25519MlKem1024),
+        _ => None,
+    }
+}
+
+pub fn is_hybrid_kem_mechanism(mechanism: crate::pkcs11_abi::types::CK_MECHANISM_TYPE) -> bool {
+    mechanism_to_hybrid_kem_variant(mechanism).is_some()
+}
+
+// ============================================================================
 // Helpers
 // ============================================================================
 
