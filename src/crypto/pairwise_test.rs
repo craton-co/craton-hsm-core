@@ -145,6 +145,7 @@ pub fn ed25519_pairwise_test(
 
 /// ML-DSA pairwise consistency test (post-quantum signature).
 pub fn ml_dsa_pairwise_test(
+    backend: &dyn CryptoBackend,
     private_key: &RawKeyMaterial,
     public_key: &[u8],
     variant: &str,
@@ -158,13 +159,15 @@ pub fn ml_dsa_pairwise_test(
         _ => return Err(HsmError::MechanismInvalid),
     };
 
-    let signature = pqc::ml_dsa_sign(private_key.as_bytes(), PAIRWISE_TEST_DATA, ml_dsa_variant)
+    let signature = backend
+        .ml_dsa_sign(private_key.as_bytes(), PAIRWISE_TEST_DATA, ml_dsa_variant)
         .map_err(|_| {
             tracing::error!("ML-DSA pairwise test: signing failed");
             HsmError::GeneralError
         })?;
 
-    let valid = pqc::ml_dsa_verify(public_key, PAIRWISE_TEST_DATA, &signature, ml_dsa_variant)
+    let valid = backend
+        .ml_dsa_verify(public_key, PAIRWISE_TEST_DATA, &signature, ml_dsa_variant)
         .map_err(|_| {
             tracing::error!("ML-DSA pairwise test: verification call failed");
             HsmError::GeneralError
@@ -181,6 +184,7 @@ pub fn ml_dsa_pairwise_test(
 
 /// SLH-DSA pairwise consistency test (post-quantum signature, stateless hash-based).
 pub fn slh_dsa_pairwise_test(
+    backend: &dyn CryptoBackend,
     private_key: &RawKeyMaterial,
     public_key: &[u8],
     variant: &str,
@@ -193,13 +197,15 @@ pub fn slh_dsa_pairwise_test(
         _ => return Err(HsmError::MechanismInvalid),
     };
 
-    let signature = pqc::slh_dsa_sign(private_key.as_bytes(), PAIRWISE_TEST_DATA, slh_dsa_variant)
+    let signature = backend
+        .slh_dsa_sign(private_key.as_bytes(), PAIRWISE_TEST_DATA, slh_dsa_variant)
         .map_err(|_| {
             tracing::error!("SLH-DSA pairwise test: signing failed");
             HsmError::GeneralError
         })?;
 
-    let valid = pqc::slh_dsa_verify(public_key, PAIRWISE_TEST_DATA, &signature, slh_dsa_variant)
+    let valid = backend
+        .slh_dsa_verify(public_key, PAIRWISE_TEST_DATA, &signature, slh_dsa_variant)
         .map_err(|_| {
             tracing::error!("SLH-DSA pairwise test: verification call failed");
             HsmError::GeneralError
@@ -216,6 +222,7 @@ pub fn slh_dsa_pairwise_test(
 
 /// ML-KEM pairwise consistency test (encapsulate/decapsulate roundtrip).
 pub fn ml_kem_pairwise_test(
+    backend: &dyn CryptoBackend,
     private_key: &RawKeyMaterial,
     public_key: &[u8],
     variant: &str,
@@ -230,20 +237,20 @@ pub fn ml_kem_pairwise_test(
     };
 
     // Encapsulate: produce (ciphertext, shared_secret) from public key
-    let (ciphertext, shared_secret_enc) = pqc::ml_kem_encapsulate(public_key, ml_kem_variant)
+    let (ciphertext, shared_secret_enc) = backend
+        .ml_kem_encapsulate(public_key, ml_kem_variant)
         .map_err(|_| {
             tracing::error!("ML-KEM pairwise test: encapsulation failed");
             HsmError::GeneralError
         })?;
 
     // Decapsulate: recover shared secret from private key + ciphertext
-    let shared_secret_dec =
-        pqc::ml_kem_decapsulate(private_key.as_bytes(), &ciphertext, ml_kem_variant).map_err(
-            |_| {
-                tracing::error!("ML-KEM pairwise test: decapsulation failed");
-                HsmError::GeneralError
-            },
-        )?;
+    let shared_secret_dec = backend
+        .ml_kem_decapsulate(private_key.as_bytes(), &ciphertext, ml_kem_variant)
+        .map_err(|_| {
+            tracing::error!("ML-KEM pairwise test: decapsulation failed");
+            HsmError::GeneralError
+        })?;
 
     use subtle::ConstantTimeEq;
     let secrets_match: bool = shared_secret_enc.ct_eq(&shared_secret_dec).into();
