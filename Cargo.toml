@@ -42,7 +42,7 @@ sha2 = "0.10"
 sha3 = "0.10"
 pbkdf2 = { version = "0.12", features = ["hmac"] }
 subtle = "2"
-hkdf = "0.12"
+hkdf = "0.13"
 aes-kw = "0.2"
 
 # Post-quantum cryptography (Phase 3)
