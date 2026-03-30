@@ -10,6 +10,7 @@ rusthsm_store
 rusthsm_audit.jsonl
 
 # IDE / editor config
+.claude
 .idea/
 .vscode/
 *.swp

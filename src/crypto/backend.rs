@@ -1,18 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Craton Software Company
-//! Crypto backend trait — abstracts all classical crypto operations behind a trait interface.
+//! Crypto backend trait — abstracts all crypto operations behind a trait interface.
 //! This enables swapping in FIPS-validated backends (e.g., aws-lc-rs) without modifying
 //! the PKCS#11 ABI layer.
 //!
-//! PQC operations are excluded: no alternative PQC backends exist yet.
+//! Both classical and post-quantum operations are included. PQC methods have default
+//! implementations that delegate to the reference `pqc.rs` free functions, so backends
+//! that don't provide native PQC can inherit them without extra code.
 
 use super::digest::DigestAccumulator;
+use super::pqc::{HybridKemVariant, MlDsaVariant, MlKemVariant, SlhDsaVariant};
 use super::sign::HashAlg;
 use crate::error::HsmResult;
 use crate::pkcs11_abi::types::CK_MECHANISM_TYPE;
 use crate::store::key_material::RawKeyMaterial;
 
-/// Combined crypto backend trait. Implementors provide all classical crypto operations.
+/// Combined crypto backend trait. Implementors provide all crypto operations.
 pub trait CryptoBackend: Send + Sync {
     // ========================================================================
     // Signing
@@ -228,4 +231,145 @@ pub trait CryptoBackend: Send + Sync {
         peer_public_key_sec1: &[u8],
         okm_len: Option<usize>,
     ) -> HsmResult<RawKeyMaterial>;
+
+    // ========================================================================
+    // Post-Quantum: ML-KEM (FIPS 203) — Key Encapsulation
+    // ========================================================================
+
+    /// Generate an ML-KEM keypair. Returns (dk_seed_64bytes, ek_bytes).
+    fn ml_kem_keygen(&self, variant: MlKemVariant) -> HsmResult<(RawKeyMaterial, Vec<u8>)> {
+        super::pqc::ml_kem_keygen(variant)
+    }
+
+    /// ML-KEM encapsulate: given ek bytes, produce (ciphertext, shared_secret).
+    fn ml_kem_encapsulate(
+        &self,
+        ek_bytes: &[u8],
+        variant: MlKemVariant,
+    ) -> HsmResult<(Vec<u8>, Vec<u8>)> {
+        super::pqc::ml_kem_encapsulate(ek_bytes, variant)
+    }
+
+    /// ML-KEM decapsulate: given dk seed + ciphertext, recover shared_secret.
+    fn ml_kem_decapsulate(
+        &self,
+        dk_seed: &[u8],
+        ciphertext: &[u8],
+        variant: MlKemVariant,
+    ) -> HsmResult<Vec<u8>> {
+        super::pqc::ml_kem_decapsulate(dk_seed, ciphertext, variant)
+    }
+
+    // ========================================================================
+    // Post-Quantum: ML-DSA (FIPS 204) — Digital Signatures
+    // ========================================================================
+
+    /// Generate an ML-DSA keypair. Returns (signing_key_seed_32bytes, verifying_key_bytes).
+    fn ml_dsa_keygen(&self, variant: MlDsaVariant) -> HsmResult<(RawKeyMaterial, Vec<u8>)> {
+        super::pqc::ml_dsa_keygen(variant)
+    }
+
+    /// ML-DSA sign a message.
+    fn ml_dsa_sign(
+        &self,
+        signing_key_seed: &[u8],
+        data: &[u8],
+        variant: MlDsaVariant,
+    ) -> HsmResult<Vec<u8>> {
+        super::pqc::ml_dsa_sign(signing_key_seed, data, variant)
+    }
+
+    /// ML-DSA verify a signature.
+    fn ml_dsa_verify(
+        &self,
+        verifying_key_bytes: &[u8],
+        data: &[u8],
+        signature: &[u8],
+        variant: MlDsaVariant,
+    ) -> HsmResult<bool> {
+        super::pqc::ml_dsa_verify(verifying_key_bytes, data, signature, variant)
+    }
+
+    // ========================================================================
+    // Post-Quantum: SLH-DSA (FIPS 205) — Hash-Based Signatures
+    // ========================================================================
+
+    /// Generate an SLH-DSA keypair. Returns (signing_key_bytes, verifying_key_bytes).
+    fn slh_dsa_keygen(&self, variant: SlhDsaVariant) -> HsmResult<(RawKeyMaterial, Vec<u8>)> {
+        super::pqc::slh_dsa_keygen(variant)
+    }
+
+    /// SLH-DSA sign a message.
+    fn slh_dsa_sign(
+        &self,
+        signing_key_bytes: &[u8],
+        data: &[u8],
+        variant: SlhDsaVariant,
+    ) -> HsmResult<Vec<u8>> {
+        super::pqc::slh_dsa_sign(signing_key_bytes, data, variant)
+    }
+
+    /// SLH-DSA verify a signature.
+    fn slh_dsa_verify(
+        &self,
+        verifying_key_bytes: &[u8],
+        data: &[u8],
+        signature: &[u8],
+        variant: SlhDsaVariant,
+    ) -> HsmResult<bool> {
+        super::pqc::slh_dsa_verify(verifying_key_bytes, data, signature, variant)
+    }
+
+    // ========================================================================
+    // Post-Quantum: Hybrid Classical + PQC
+    // ========================================================================
+
+    /// Hybrid ML-DSA-65 + ECDSA-P256 signing.
+    fn hybrid_sign(
+        &self,
+        ml_dsa_sk_seed: &[u8],
+        ecdsa_sk_bytes: &[u8],
+        data: &[u8],
+    ) -> HsmResult<Vec<u8>> {
+        super::pqc::hybrid_sign(ml_dsa_sk_seed, ecdsa_sk_bytes, data)
+    }
+
+    /// Hybrid ML-DSA-65 + ECDSA-P256 verification.
+    fn hybrid_verify(
+        &self,
+        ml_dsa_vk_bytes: &[u8],
+        ecdsa_pk_sec1: &[u8],
+        data: &[u8],
+        combined_signature: &[u8],
+    ) -> HsmResult<bool> {
+        super::pqc::hybrid_verify(ml_dsa_vk_bytes, ecdsa_pk_sec1, data, combined_signature)
+    }
+
+    // ========================================================================
+    // Post-Quantum: Hybrid X25519 + ML-KEM Key Exchange
+    // ========================================================================
+
+    /// Generate a hybrid X25519 + ML-KEM keypair.
+    fn hybrid_kem_keygen(&self, variant: HybridKemVariant) -> HsmResult<(RawKeyMaterial, Vec<u8>)> {
+        super::pqc::hybrid_kem_keygen(variant)
+    }
+
+    /// Hybrid X25519 + ML-KEM encapsulate.
+    fn hybrid_kem_encapsulate(
+        &self,
+        composite_ek: &[u8],
+        variant: HybridKemVariant,
+    ) -> HsmResult<(Vec<u8>, Vec<u8>)> {
+        super::pqc::hybrid_kem_encapsulate(composite_ek, variant)
+    }
+
+    /// Hybrid X25519 + ML-KEM decapsulate.
+    fn hybrid_kem_decapsulate(
+        &self,
+        composite_dk: &[u8],
+        composite_ct: &[u8],
+        variant: HybridKemVariant,
+    ) -> HsmResult<Vec<u8>> {
+        super::pqc::hybrid_kem_decapsulate(composite_dk, composite_ct, variant)
+    }
 }
