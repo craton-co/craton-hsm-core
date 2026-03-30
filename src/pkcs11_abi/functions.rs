@@ -2177,10 +2177,10 @@ fn sign_single_shot(
         backend.ed25519_sign(key_bytes, data)
     } else if pqc::is_ml_dsa_mechanism(mechanism) {
         let variant = pqc::mechanism_to_ml_dsa_variant(mechanism).unwrap();
-        pqc::ml_dsa_sign(key_bytes, data, variant)
+        backend.ml_dsa_sign(key_bytes, data, variant)
     } else if pqc::is_slh_dsa_mechanism(mechanism) {
         let variant = pqc::mechanism_to_slh_dsa_variant(mechanism).unwrap();
-        pqc::slh_dsa_sign(key_bytes, data, variant)
+        backend.slh_dsa_sign(key_bytes, data, variant)
     } else if pqc::is_hybrid_mechanism(mechanism) {
         let ecdsa_key = obj
             .extra_attributes
@@ -2188,7 +2188,7 @@ fn sign_single_shot(
             .or(obj.ec_point.as_ref())
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
-        pqc::hybrid_sign(key_bytes, ecdsa_key, data)
+        backend.hybrid_sign(key_bytes, ecdsa_key, data)
     } else {
         // RSA PKCS#1 v1.5
         let hash_alg = sign::mechanism_to_hash(mechanism);
@@ -2265,14 +2265,14 @@ fn verify_single_shot(
             .as_deref()
             .ok_or(HsmError::KeyHandleInvalid)?;
         let variant = pqc::mechanism_to_ml_dsa_variant(mechanism).unwrap();
-        pqc::ml_dsa_verify(pub_key, data, signature, variant)
+        backend.ml_dsa_verify(pub_key, data, signature, variant)
     } else if pqc::is_slh_dsa_mechanism(mechanism) {
         let pub_key = obj
             .public_key_data
             .as_deref()
             .ok_or(HsmError::KeyHandleInvalid)?;
         let variant = pqc::mechanism_to_slh_dsa_variant(mechanism).unwrap();
-        pqc::slh_dsa_verify(pub_key, data, signature, variant)
+        backend.slh_dsa_verify(pub_key, data, signature, variant)
     } else if pqc::is_hybrid_mechanism(mechanism) {
         let ml_dsa_vk = obj
             .public_key_data
@@ -2284,7 +2284,7 @@ fn verify_single_shot(
             .or(obj.ec_point.as_ref())
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
-        pqc::hybrid_verify(ml_dsa_vk, ecdsa_pk, data, signature)
+        backend.hybrid_verify(ml_dsa_vk, ecdsa_pk, data, signature)
     } else {
         // RSA PKCS#1 v1.5
         let modulus = obj.modulus.as_deref().ok_or(HsmError::KeyHandleInvalid)?;
@@ -2995,7 +2995,10 @@ fn generate_pqc_keypair(
 ) -> Result<(CK_OBJECT_HANDLE, CK_OBJECT_HANDLE, u32), CK_RV> {
     let (private_key, public_key, key_type, key_bits) =
         if let Some(variant) = pqc::mechanism_to_ml_kem_variant(mechanism) {
-            let (dk_seed, ek_bytes) = pqc::ml_kem_keygen(variant).map_err(err_to_rv)?;
+            let (dk_seed, ek_bytes) = hsm
+                .crypto_backend
+                .ml_kem_keygen(variant)
+                .map_err(err_to_rv)?;
             let bits = match variant {
                 pqc::MlKemVariant::MlKem512 => 512u32,
                 pqc::MlKemVariant::MlKem768 => 768,
@@ -3003,7 +3006,10 @@ fn generate_pqc_keypair(
             };
             (dk_seed, ek_bytes, CKK_ML_KEM, bits)
         } else if let Some(variant) = pqc::mechanism_to_ml_dsa_variant(mechanism) {
-            let (sk_seed, vk_bytes) = pqc::ml_dsa_keygen(variant).map_err(err_to_rv)?;
+            let (sk_seed, vk_bytes) = hsm
+                .crypto_backend
+                .ml_dsa_keygen(variant)
+                .map_err(err_to_rv)?;
             let bits = match variant {
                 pqc::MlDsaVariant::MlDsa44 => 44u32,
                 pqc::MlDsaVariant::MlDsa65 => 65,
@@ -3011,7 +3017,10 @@ fn generate_pqc_keypair(
             };
             (sk_seed, vk_bytes, CKK_ML_DSA, bits)
         } else if let Some(variant) = pqc::mechanism_to_slh_dsa_variant(mechanism) {
-            let (sk_bytes, vk_bytes) = pqc::slh_dsa_keygen(variant).map_err(err_to_rv)?;
+            let (sk_bytes, vk_bytes) = hsm
+                .crypto_backend
+                .slh_dsa_keygen(variant)
+                .map_err(err_to_rv)?;
             let bits = match variant {
                 pqc::SlhDsaVariant::Sha2_128s => 128u32,
                 pqc::SlhDsaVariant::Sha2_256s => 256,
@@ -3028,20 +3037,35 @@ fn generate_pqc_keypair(
             pqc::MlKemVariant::MlKem768 => "ML-KEM-768",
             pqc::MlKemVariant::MlKem1024 => "ML-KEM-1024",
         };
-        pairwise_test::ml_kem_pairwise_test(&private_key, &public_key, variant_name)
+        pairwise_test::ml_kem_pairwise_test(
+            hsm.crypto_backend.as_ref(),
+            &private_key,
+            &public_key,
+            variant_name,
+        )
     } else if key_type == CKK_ML_DSA {
         let variant_name = match pqc::mechanism_to_ml_dsa_variant(mechanism).unwrap() {
             pqc::MlDsaVariant::MlDsa44 => "ML-DSA-44",
             pqc::MlDsaVariant::MlDsa65 => "ML-DSA-65",
             pqc::MlDsaVariant::MlDsa87 => "ML-DSA-87",
         };
-        pairwise_test::ml_dsa_pairwise_test(&private_key, &public_key, variant_name)
+        pairwise_test::ml_dsa_pairwise_test(
+            hsm.crypto_backend.as_ref(),
+            &private_key,
+            &public_key,
+            variant_name,
+        )
     } else if key_type == CKK_SLH_DSA {
         let variant_name = match pqc::mechanism_to_slh_dsa_variant(mechanism).unwrap() {
             pqc::SlhDsaVariant::Sha2_128s => "SLH-DSA-SHA2-128s",
             pqc::SlhDsaVariant::Sha2_256s => "SLH-DSA-SHA2-256s",
         };
-        pairwise_test::slh_dsa_pairwise_test(&private_key, &public_key, variant_name)
+        pairwise_test::slh_dsa_pairwise_test(
+            hsm.crypto_backend.as_ref(),
+            &private_key,
+            &public_key,
+            variant_name,
+        )
     } else {
         Ok(())
     };
@@ -5341,7 +5365,10 @@ pub extern "C" fn C_DeriveKey(
 
         let shared_secret = if let Some(variant) = pqc::mechanism_to_ml_kem_variant(mechanism) {
             // ML-KEM decapsulation: base key is dk seed, param is ciphertext
-            match pqc::ml_kem_decapsulate(&bk_bytes, &mech_param, variant) {
+            match hsm
+                .crypto_backend
+                .ml_kem_decapsulate(&bk_bytes, &mech_param, variant)
+            {
                 Ok(ss) => RawKeyMaterial::new(ss),
                 Err(e) => return err_to_rv(e),
             }
