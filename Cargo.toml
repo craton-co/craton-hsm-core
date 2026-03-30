@@ -38,7 +38,7 @@ ctr = "0.9"
 cipher = "0.5"
 hmac = "0.12"
 sha1 = "0.10"
-sha2 = "0.10"
+sha2 = "0.11"
 sha3 = "0.10"
 pbkdf2 = { version = "0.12", features = ["hmac"] }
 subtle = "2"
