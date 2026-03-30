@@ -300,7 +300,7 @@ jobs:
           RUST_BACKTRACE: 1
 
       - name: Upload to Codecov
-        uses: codecov/codecov-action@1af58845a975a7985b0beb0cbe6fbbb71a41dbad # v4
+        uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # v4
         if: always()
         with:
           files: cobertura.xml
