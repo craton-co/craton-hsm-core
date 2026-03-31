@@ -10,19 +10,100 @@ use crate::pkcs11_abi::constants::*;
 use crate::pkcs11_abi::types::CK_MECHANISM_TYPE;
 
 // ============================================================================
-// RSA Private Key Cache
+// RSA Key Caches
 // ============================================================================
 //
 // Parsing PKCS#8 DER → RsaPrivateKey is expensive (bignum reconstruction).
-// Since the same key is reused across many sign operations, we cache the
-// parsed key keyed by a SHA-256 hash of the DER bytes. The cache is bounded
-// to prevent unbounded memory growth.
+// Since the same key is reused across many sign operations, we maintain two
+// caches:
+//
+// 1. **DER-hash cache** (`RSA_KEY_CACHE`) — the legacy/slow path keyed by
+//    SHA-256(DER).  Used by callers that don't have an object handle.
+//
+// 2. **Handle-based caches** (`RSA_PRIV_CACHE`, `RSA_PUB_CACHE`) — the fast
+//    path keyed by `CK_OBJECT_HANDLE` (u64).  O(1) lookup with no hashing,
+//    returns `Arc` (no clone of the inner key), and supports both private and
+//    public RSA keys.
+//
+// When either cache is full (64 entries), a single arbitrary entry is evicted
+// instead of clearing the entire map, avoiding thundering-herd repopulation.
 
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use zeroize::Zeroize;
 
-/// Maximum number of cached parsed RSA private keys.
+/// Maximum number of entries per cache.
 const RSA_KEY_CACHE_MAX: usize = 64;
+
+// ---------------------------------------------------------------------------
+// Handle-based Arc caches (fast path)
+// ---------------------------------------------------------------------------
+
+/// Handle-based RSA private key cache.
+///
+/// Keyed by (slot_id, handle) to prevent cross-slot cache collisions.
+/// The Arc avoids cloning RSA BigNums on cache hits but note that
+/// SigningKey construction still requires a clone due to the rsa crate's
+/// ownership API.
+static RSA_PRIV_CACHE: LazyLock<dashmap::DashMap<(u64, u64), Arc<RsaPrivateKey>>> =
+    LazyLock::new(|| dashmap::DashMap::with_capacity(RSA_KEY_CACHE_MAX));
+
+/// Handle-based RSA public key cache.
+///
+/// Keyed by (slot_id, handle) to prevent cross-slot cache collisions.
+/// The Arc avoids cloning RSA BigNums on cache hits but note that
+/// SigningKey construction still requires a clone due to the rsa crate's
+/// ownership API.
+static RSA_PUB_CACHE: LazyLock<dashmap::DashMap<(u64, u64), Arc<RsaPublicKey>>> =
+    LazyLock::new(|| dashmap::DashMap::with_capacity(RSA_KEY_CACHE_MAX));
+
+/// Evict one arbitrary entry from a `DashMap` when it is at capacity.
+/// This avoids clearing the entire cache (thundering herd) while keeping
+/// the implementation simple (no LRU metadata overhead).
+fn evict_one_if_full<K: std::hash::Hash + Eq + Clone, V>(map: &dashmap::DashMap<K, V>) {
+    if map.len() >= RSA_KEY_CACHE_MAX {
+        if let Some(entry) = map.iter().next() {
+            let key = entry.key().clone();
+            drop(entry); // release the read guard before removing
+            map.remove(&key);
+        }
+    }
+}
+
+/// Cache an already-parsed RSA private key by (slot_id, handle).
+pub fn cache_rsa_private_key(slot_id: u64, handle: u64, key: Arc<RsaPrivateKey>) {
+    evict_one_if_full(&RSA_PRIV_CACHE);
+    RSA_PRIV_CACHE.insert((slot_id, handle), key);
+}
+
+/// Get a cached RSA private key by (slot_id, handle). Returns `None` on miss.
+pub fn get_cached_rsa_private_key(slot_id: u64, handle: u64) -> Option<Arc<RsaPrivateKey>> {
+    RSA_PRIV_CACHE
+        .get(&(slot_id, handle))
+        .map(|entry| Arc::clone(entry.value()))
+}
+
+/// Cache an already-parsed RSA public key by (slot_id, handle).
+pub fn cache_rsa_public_key(slot_id: u64, handle: u64, key: Arc<RsaPublicKey>) {
+    evict_one_if_full(&RSA_PUB_CACHE);
+    RSA_PUB_CACHE.insert((slot_id, handle), key);
+}
+
+/// Get a cached RSA public key by (slot_id, handle). Returns `None` on miss.
+pub fn get_cached_rsa_public_key(slot_id: u64, handle: u64) -> Option<Arc<RsaPublicKey>> {
+    RSA_PUB_CACHE
+        .get(&(slot_id, handle))
+        .map(|entry| Arc::clone(entry.value()))
+}
+
+/// Evict all cached keys for a given (slot_id, handle) pair (call on C_DestroyObject).
+pub fn evict_cached_keys(slot_id: u64, handle: u64) {
+    RSA_PRIV_CACHE.remove(&(slot_id, handle));
+    RSA_PUB_CACHE.remove(&(slot_id, handle));
+}
+
+// ---------------------------------------------------------------------------
+// DER-hash cache (legacy / slow path)
+// ---------------------------------------------------------------------------
 
 /// Wrapper around `RsaPrivateKey` that zeroizes the PKCS#8 DER encoding on drop.
 ///
@@ -68,14 +149,21 @@ impl Drop for ZeroizingRsaKey {
 /// Cache of parsed RSA private keys, keyed by SHA-256(DER).
 /// Uses DashMap for lock-free concurrent access. Values are wrapped in
 /// `ZeroizingRsaKey` to best-effort zeroize key material on eviction.
+///
+/// **Slow path** — prefer the handle-based `RSA_PRIV_CACHE` when an object
+/// handle is available.
 static RSA_KEY_CACHE: LazyLock<dashmap::DashMap<[u8; 32], ZeroizingRsaKey>> =
     LazyLock::new(|| dashmap::DashMap::with_capacity(RSA_KEY_CACHE_MAX));
 
-/// Parse an RSA private key from PKCS#8 DER, using the cache when possible.
+/// Parse an RSA private key from PKCS#8 DER, using the DER-hash cache.
+///
+/// **Slow path** — computes SHA-256(DER) on every call and clones the key on
+/// cache hit.  Prefer the `*_cached` function variants when a
+/// `CK_OBJECT_HANDLE` is available.
 fn parse_rsa_private_key(der: &[u8]) -> HsmResult<RsaPrivateKey> {
     let cache_key: [u8; 32] = Sha256::digest(der).into();
 
-    // Fast path: cache hit
+    // Fast path: cache hit (still clones — use handle cache to avoid this)
     if let Some(entry) = RSA_KEY_CACHE.get(&cache_key) {
         return Ok(entry.value().key.clone());
     }
@@ -83,20 +171,31 @@ fn parse_rsa_private_key(der: &[u8]) -> HsmResult<RsaPrivateKey> {
     // Slow path: parse and cache
     let private_key = RsaPrivateKey::from_pkcs8_der(der).map_err(|_| HsmError::KeyHandleInvalid)?;
 
-    // Evict all entries if cache is full (simple strategy — avoids LRU complexity).
-    // ZeroizingRsaKey::drop() will best-effort zeroize evicted key material.
-    if RSA_KEY_CACHE.len() >= RSA_KEY_CACHE_MAX {
-        RSA_KEY_CACHE.clear();
-    }
+    // Evict one arbitrary entry instead of clearing the whole cache.
+    evict_one_if_full_zeroizing(&RSA_KEY_CACHE);
 
     RSA_KEY_CACHE.insert(cache_key, ZeroizingRsaKey::new(private_key.clone()));
     Ok(private_key)
 }
 
-/// Clear the RSA key cache. Called on C_Finalize / C_InitToken.
-/// Each evicted entry is zeroized via `ZeroizingRsaKey::drop()`.
+/// Single-entry eviction for the ZeroizingRsaKey DER-hash cache.
+fn evict_one_if_full_zeroizing(map: &dashmap::DashMap<[u8; 32], ZeroizingRsaKey>) {
+    if map.len() >= RSA_KEY_CACHE_MAX {
+        if let Some(entry) = map.iter().next() {
+            let key = *entry.key();
+            drop(entry);
+            map.remove(&key);
+        }
+    }
+}
+
+/// Clear all RSA key caches. Called on C_Finalize / C_InitToken.
+/// Each evicted private-key entry in the DER-hash cache is zeroized via
+/// `ZeroizingRsaKey::drop()`.
 pub fn clear_rsa_key_cache() {
     RSA_KEY_CACHE.clear();
+    RSA_PRIV_CACHE.clear();
+    RSA_PUB_CACHE.clear();
 }
 
 /// Minimum RSA modulus size in bits. Keys below this threshold are rejected
@@ -449,6 +548,41 @@ pub fn rsa_oaep_decrypt(
                 .map_err(|_| HsmError::EncryptedDataInvalid)
         }
     }
+}
+
+// ============================================================================
+// Handle-cached helpers
+// ============================================================================
+
+/// Look up a private key in the handle cache, or parse from DER and cache it.
+fn get_or_parse_private_key(
+    slot_id: u64,
+    handle: u64,
+    der: &[u8],
+) -> HsmResult<Arc<RsaPrivateKey>> {
+    if let Some(k) = get_cached_rsa_private_key(slot_id, handle) {
+        return Ok(k);
+    }
+    let k = Arc::new(RsaPrivateKey::from_pkcs8_der(der).map_err(|_| HsmError::KeyHandleInvalid)?);
+    cache_rsa_private_key(slot_id, handle, Arc::clone(&k));
+    Ok(k)
+}
+
+/// Look up a public key in the handle cache, or build from components and cache it.
+fn get_or_build_public_key(
+    slot_id: u64,
+    handle: u64,
+    modulus: &[u8],
+    public_exponent: &[u8],
+) -> HsmResult<Arc<RsaPublicKey>> {
+    if let Some(k) = get_cached_rsa_public_key(slot_id, handle) {
+        return Ok(k);
+    }
+    let n = rsa::BigUint::from_bytes_be(modulus);
+    let e = rsa::BigUint::from_bytes_be(public_exponent);
+    let k = Arc::new(RsaPublicKey::new(n, e).map_err(|_| HsmError::KeyHandleInvalid)?);
+    cache_rsa_public_key(slot_id, handle, Arc::clone(&k));
+    Ok(k)
 }
 
 // ============================================================================
