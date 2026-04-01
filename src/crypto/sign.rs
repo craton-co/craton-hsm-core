@@ -551,6 +551,175 @@ pub fn rsa_oaep_decrypt(
 }
 
 // ============================================================================
+// Handle-cached RSA PKCS#1 v1.5 (fast path)
+// ============================================================================
+
+/// RSA PKCS#1 v1.5 sign using handle-based cache (avoids SHA-256(DER) hashing
+/// and BigNum cloning on cache hits).
+pub fn rsa_pkcs1v15_sign_cached(
+    slot_id: u64,
+    handle: u64,
+    private_key_der: &[u8],
+    data: &[u8],
+    hash_alg: Option<HashAlg>,
+) -> HsmResult<Vec<u8>> {
+    use rsa::signature::SignatureEncoding;
+
+    validate_data_size(data)?;
+    let key = get_or_parse_private_key(slot_id, handle, private_key_der)?;
+    validate_rsa_private_key_size(&key)?;
+
+    match hash_alg {
+        Some(HashAlg::Sha256) => {
+            use rsa::pkcs1v15::SigningKey;
+            use rsa::signature::Signer;
+            let signing_key = SigningKey::<Sha256>::new((*key).clone());
+            let signature = signing_key.sign(data);
+            Ok(signature.to_vec())
+        }
+        Some(HashAlg::Sha384) => {
+            use rsa::pkcs1v15::SigningKey;
+            use rsa::signature::Signer;
+            let signing_key = SigningKey::<Sha384>::new((*key).clone());
+            let signature = signing_key.sign(data);
+            Ok(signature.to_vec())
+        }
+        Some(HashAlg::Sha512) => {
+            use rsa::pkcs1v15::SigningKey;
+            use rsa::signature::Signer;
+            let signing_key = SigningKey::<Sha512>::new((*key).clone());
+            let signature = signing_key.sign(data);
+            Ok(signature.to_vec())
+        }
+        None => Err(HsmError::MechanismParamInvalid),
+    }
+}
+
+/// RSA PKCS#1 v1.5 verify using handle-based cache (avoids BigUint
+/// reconstruction on cache hits).
+pub fn rsa_pkcs1v15_verify_cached(
+    slot_id: u64,
+    handle: u64,
+    modulus: &[u8],
+    public_exponent: &[u8],
+    data: &[u8],
+    signature: &[u8],
+    hash_alg: Option<HashAlg>,
+) -> HsmResult<bool> {
+    validate_data_size(data)?;
+    validate_rsa_public_key_size(modulus)?;
+    let key = get_or_build_public_key(slot_id, handle, modulus, public_exponent)?;
+
+    match hash_alg {
+        Some(HashAlg::Sha256) => {
+            use rsa::pkcs1v15::VerifyingKey;
+            use rsa::signature::Verifier;
+            let verifying_key = VerifyingKey::<Sha256>::new((*key).clone());
+            let sig = rsa::pkcs1v15::Signature::try_from(signature)
+                .map_err(|_| HsmError::SignatureInvalid)?;
+            Ok(verifying_key.verify(data, &sig).is_ok())
+        }
+        Some(HashAlg::Sha384) => {
+            use rsa::pkcs1v15::VerifyingKey;
+            use rsa::signature::Verifier;
+            let verifying_key = VerifyingKey::<Sha384>::new((*key).clone());
+            let sig = rsa::pkcs1v15::Signature::try_from(signature)
+                .map_err(|_| HsmError::SignatureInvalid)?;
+            Ok(verifying_key.verify(data, &sig).is_ok())
+        }
+        Some(HashAlg::Sha512) => {
+            use rsa::pkcs1v15::VerifyingKey;
+            use rsa::signature::Verifier;
+            let verifying_key = VerifyingKey::<Sha512>::new((*key).clone());
+            let sig = rsa::pkcs1v15::Signature::try_from(signature)
+                .map_err(|_| HsmError::SignatureInvalid)?;
+            Ok(verifying_key.verify(data, &sig).is_ok())
+        }
+        None => Err(HsmError::MechanismParamInvalid),
+    }
+}
+
+// ============================================================================
+// Handle-cached RSA-PSS (fast path)
+// ============================================================================
+
+/// RSA-PSS sign using handle-based cache.
+pub fn rsa_pss_sign_cached(
+    slot_id: u64,
+    handle: u64,
+    private_key_der: &[u8],
+    data: &[u8],
+    hash_alg: HashAlg,
+) -> HsmResult<Vec<u8>> {
+    use crate::crypto::drbg::DrbgRng;
+    use rsa::pss::SigningKey;
+    use rsa::signature::{RandomizedSigner, SignatureEncoding};
+
+    validate_data_size(data)?;
+    let key = get_or_parse_private_key(slot_id, handle, private_key_der)?;
+    validate_rsa_private_key_size(&key)?;
+
+    let mut rng = DrbgRng::new()?;
+
+    match hash_alg {
+        HashAlg::Sha256 => {
+            let signing_key = SigningKey::<Sha256>::new((*key).clone());
+            let signature = signing_key.sign_with_rng(&mut rng, data);
+            Ok(signature.to_vec())
+        }
+        HashAlg::Sha384 => {
+            let signing_key = SigningKey::<Sha384>::new((*key).clone());
+            let signature = signing_key.sign_with_rng(&mut rng, data);
+            Ok(signature.to_vec())
+        }
+        HashAlg::Sha512 => {
+            let signing_key = SigningKey::<Sha512>::new((*key).clone());
+            let signature = signing_key.sign_with_rng(&mut rng, data);
+            Ok(signature.to_vec())
+        }
+    }
+}
+
+/// RSA-PSS verify using handle-based cache.
+pub fn rsa_pss_verify_cached(
+    slot_id: u64,
+    handle: u64,
+    modulus: &[u8],
+    public_exponent: &[u8],
+    data: &[u8],
+    signature: &[u8],
+    hash_alg: HashAlg,
+) -> HsmResult<bool> {
+    use rsa::pss::VerifyingKey;
+    use rsa::signature::Verifier;
+
+    validate_data_size(data)?;
+    validate_rsa_public_key_size(modulus)?;
+    let key = get_or_build_public_key(slot_id, handle, modulus, public_exponent)?;
+
+    match hash_alg {
+        HashAlg::Sha256 => {
+            let verifying_key = VerifyingKey::<Sha256>::new((*key).clone());
+            let sig =
+                rsa::pss::Signature::try_from(signature).map_err(|_| HsmError::SignatureInvalid)?;
+            Ok(verifying_key.verify(data, &sig).is_ok())
+        }
+        HashAlg::Sha384 => {
+            let verifying_key = VerifyingKey::<Sha384>::new((*key).clone());
+            let sig =
+                rsa::pss::Signature::try_from(signature).map_err(|_| HsmError::SignatureInvalid)?;
+            Ok(verifying_key.verify(data, &sig).is_ok())
+        }
+        HashAlg::Sha512 => {
+            let verifying_key = VerifyingKey::<Sha512>::new((*key).clone());
+            let sig =
+                rsa::pss::Signature::try_from(signature).map_err(|_| HsmError::SignatureInvalid)?;
+            Ok(verifying_key.verify(data, &sig).is_ok())
+        }
+    }
+}
+
+// ============================================================================
 // Handle-cached helpers
 // ============================================================================
 
