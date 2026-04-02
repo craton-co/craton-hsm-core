@@ -27,18 +27,21 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
-  # ── Build & Test: full OS matrix on main, Ubuntu-only on PRs ──
+  # ── Build & Test ──
   #
-  # Tests are split into two groups for performance:
-  #   1. Parallel-safe: pure crypto / unit tests with no global state (~92 tests)
-  #   2. Serial: PKCS#11 ABI tests sharing a process-wide singleton (~625 tests)
+  # Tests are split into four parallel jobs for performance:
+  #   1. Unit + crypto: lib tests + pure crypto (no global state, parallel-safe)
+  #   2-4. PKCS#11 ABI shards: serial tests split across 3 runners
   #
   # PKCS#11 §5.10 mandates one C_Initialize/C_Finalize per process, so ABI
-  # tests must run with --test-threads=1. Pure crypto tests are stateless and
-  # safe to parallelize. This split yields ~30-50% faster CI wall time.
+  # tests must run with --test-threads=1. Each `cargo test --test X` invocation
+  # gets its own process, so sharding across runners is safe.
   #
-  build-and-test:
-    name: Build & Test (${{ matrix.os }})
+  # On PRs: Ubuntu-only. On main push: full OS matrix.
+
+  # ── Shard 1: Unit tests + pure crypto (parallel-safe) + workspace members ──
+  test-unit:
+    name: Unit & Crypto Tests (${{ matrix.os }})
     needs: fmt-check
     runs-on: ${{ matrix.os }}
     strategy:
@@ -74,46 +77,102 @@ jobs:
           --
           --test-threads=8
 
-      - name: Run PKCS#11 ABI tests (serial — global singleton)
-        run: >-
-          cargo test
-          --test attribute_management
-          --test attribute_validation
-          --test backup_restore
-          --test concurrent_session_stress
-          --test crypto_vectors_phase2
-          --test digest_abi
-          --test fips_approved_mode
-          --test key_derivation_abi
-          --test key_lifecycle_abi
-          --test key_wrapping_abi
-          --test multipart_encrypt_decrypt
-          --test multipart_sign_verify
-          --test negative_edge_cases
-          --test operation_state
-          --test pairwise_consistency
-          --test persistence
-          --test pkcs11_compliance
-          --test pkcs11_compliance_extended
-          --test pkcs11_conformance
-          --test pkcs11_error_paths
-          --test pkcs11_info_functions
-          --test pqc_abi_comprehensive
-          --test pqc_phase3
-          --test random_and_session
-          --test rsa_abi_comprehensive
-          --test security_properties
-          --test session_state_machine
-          --test supplementary_functions
-          --
-          --test-threads=1
-
       - name: Run workspace member tests
         run: >-
           cargo test
           -p craton-hsm-admin
           -p pkcs11-spy
           -p craton-hsm-daemon
+          --
+          --test-threads=1
+
+  # ── Shard 2: PKCS#11 ABI — compliance, conformance, error paths, info ──
+  test-abi-shard1:
+    name: ABI Tests — Compliance (${{ matrix.os }})
+    needs: fmt-check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "windows-latest", "macos-latest"]') }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2
+
+      - name: Run PKCS#11 compliance & conformance tests
+        run: >-
+          cargo test
+          --test attribute_management
+          --test attribute_validation
+          --test digest_abi
+          --test fips_approved_mode
+          --test negative_edge_cases
+          --test operation_state
+          --test pkcs11_compliance
+          --test pkcs11_compliance_extended
+          --test pkcs11_conformance
+          --test pkcs11_error_paths
+          --test pkcs11_info_functions
+          --test random_and_session
+          --test session_state_machine
+          --test supplementary_functions
+          --
+          --test-threads=1
+
+  # ── Shard 3: PKCS#11 ABI — crypto operations (keys, encrypt, sign, PQC) ──
+  test-abi-shard2:
+    name: ABI Tests — Crypto Ops (${{ matrix.os }})
+    needs: fmt-check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "windows-latest", "macos-latest"]') }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2
+
+      - name: Run PKCS#11 crypto operation tests
+        run: >-
+          cargo test
+          --test backup_restore
+          --test concurrent_session_stress
+          --test crypto_vectors_phase2
+          --test key_derivation_abi
+          --test key_lifecycle_abi
+          --test key_wrapping_abi
+          --test multipart_encrypt_decrypt
+          --test multipart_sign_verify
+          --test pairwise_consistency
+          --test persistence
+          --test pqc_abi_comprehensive
+          --test pqc_phase3
+          --test rsa_abi_comprehensive
+          --test security_properties
           --
           --test-threads=1
 
@@ -289,7 +348,7 @@ jobs:
         uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2
 
       - name: Install cargo-tarpaulin
-        uses: taiki-e/install-action@37461a1de4134bec92ef79ff5d032a53de2c4e85 # v2
+        uses: taiki-e/install-action@d858f8113943481093e02986a7586a4819a3bfd6 # v2
         with:
           tool: cargo-tarpaulin
 
