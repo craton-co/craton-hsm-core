@@ -331,7 +331,7 @@ pub fn rsa_pkcs1v15_sign(
         None => {
             // Reject unprefixed PKCS#1 v1.5 signing — vulnerable to Bleichenbacher forgery.
             // Callers must specify a hash algorithm for DigestInfo wrapping.
-            return Err(HsmError::MechanismParamInvalid);
+            Err(HsmError::MechanismParamInvalid)
         }
     }
 }
@@ -379,7 +379,7 @@ pub fn rsa_pkcs1v15_verify(
             // Reject unprefixed PKCS#1 v1.5 verification — vulnerable to
             // Bleichenbacher signature forgery with low public exponents (e=3).
             // Callers must specify a hash algorithm for DigestInfo validation.
-            return Err(HsmError::MechanismParamInvalid);
+            Err(HsmError::MechanismParamInvalid)
         }
     }
 }

@@ -327,6 +327,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_compute_hash_deterministic() {
         // Write a temp file, compute hash twice, verify same result
         let dir = std::env::temp_dir().join("craton_hsm_integrity_test");
@@ -351,6 +352,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_different_content_different_hash() {
         let dir = std::env::temp_dir().join("craton_hsm_integrity_test2");
         let _ = std::fs::create_dir_all(&dir);
