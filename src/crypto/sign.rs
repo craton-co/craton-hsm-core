@@ -1187,6 +1187,137 @@ pub(crate) fn rsa_pss_verify_prehashed(
 }
 
 // ============================================================================
+// Handle-cached Prehashed RSA PKCS#1 v1.5 (fast path)
+// ============================================================================
+
+/// RSA PKCS#1 v1.5 sign with pre-computed digest, using handle-based cache.
+pub(crate) fn rsa_pkcs1v15_sign_prehashed_cached(
+    slot_id: u64,
+    handle: u64,
+    private_key_der: &[u8],
+    digest: &[u8],
+    hash_alg: HashAlg,
+) -> HsmResult<Vec<u8>> {
+    validate_digest_length(digest, hash_alg)?;
+    let key = get_or_parse_private_key(slot_id, handle, private_key_der)?;
+    validate_rsa_private_key_size(&key)?;
+
+    let scheme = match hash_alg {
+        HashAlg::Sha256 => Pkcs1v15Sign::new::<Sha256>(),
+        HashAlg::Sha384 => Pkcs1v15Sign::new::<Sha384>(),
+        HashAlg::Sha512 => Pkcs1v15Sign::new::<Sha512>(),
+    };
+
+    key.sign(scheme, digest).map_err(|_| HsmError::GeneralError)
+}
+
+/// RSA PKCS#1 v1.5 verify with pre-computed digest, using handle-based cache.
+pub(crate) fn rsa_pkcs1v15_verify_prehashed_cached(
+    slot_id: u64,
+    handle: u64,
+    modulus: &[u8],
+    public_exponent: &[u8],
+    digest: &[u8],
+    signature: &[u8],
+    hash_alg: HashAlg,
+) -> HsmResult<bool> {
+    validate_digest_length(digest, hash_alg)?;
+    validate_rsa_public_key_size(modulus)?;
+    let key = get_or_build_public_key(slot_id, handle, modulus, public_exponent)?;
+
+    let scheme = match hash_alg {
+        HashAlg::Sha256 => Pkcs1v15Sign::new::<Sha256>(),
+        HashAlg::Sha384 => Pkcs1v15Sign::new::<Sha384>(),
+        HashAlg::Sha512 => Pkcs1v15Sign::new::<Sha512>(),
+    };
+
+    Ok(key.verify(scheme, digest, signature).is_ok())
+}
+
+// ============================================================================
+// Handle-cached Prehashed RSA-PSS (fast path)
+// ============================================================================
+
+/// RSA-PSS sign with pre-computed digest, using handle-based cache.
+pub(crate) fn rsa_pss_sign_prehashed_cached(
+    slot_id: u64,
+    handle: u64,
+    private_key_der: &[u8],
+    digest: &[u8],
+    hash_alg: HashAlg,
+) -> HsmResult<Vec<u8>> {
+    use crate::crypto::drbg::DrbgRng;
+    use rsa::pss::SigningKey;
+    use rsa::signature::hazmat::RandomizedPrehashSigner;
+    use rsa::signature::SignatureEncoding;
+
+    validate_digest_length(digest, hash_alg)?;
+    let key = get_or_parse_private_key(slot_id, handle, private_key_der)?;
+    validate_rsa_private_key_size(&key)?;
+
+    let mut rng = DrbgRng::new()?;
+
+    match hash_alg {
+        HashAlg::Sha256 => {
+            let signing_key = SigningKey::<Sha256>::new((*key).clone());
+            let signature = signing_key
+                .sign_prehash_with_rng(&mut rng, digest)
+                .map_err(|_| HsmError::GeneralError)?;
+            Ok(signature.to_vec())
+        }
+        HashAlg::Sha384 => {
+            let signing_key = SigningKey::<Sha384>::new((*key).clone());
+            let signature = signing_key
+                .sign_prehash_with_rng(&mut rng, digest)
+                .map_err(|_| HsmError::GeneralError)?;
+            Ok(signature.to_vec())
+        }
+        HashAlg::Sha512 => {
+            let signing_key = SigningKey::<Sha512>::new((*key).clone());
+            let signature = signing_key
+                .sign_prehash_with_rng(&mut rng, digest)
+                .map_err(|_| HsmError::GeneralError)?;
+            Ok(signature.to_vec())
+        }
+    }
+}
+
+/// RSA-PSS verify with pre-computed digest, using handle-based cache.
+pub(crate) fn rsa_pss_verify_prehashed_cached(
+    slot_id: u64,
+    handle: u64,
+    modulus: &[u8],
+    public_exponent: &[u8],
+    digest: &[u8],
+    signature: &[u8],
+    hash_alg: HashAlg,
+) -> HsmResult<bool> {
+    use rsa::pss::VerifyingKey;
+    use rsa::signature::hazmat::PrehashVerifier;
+
+    validate_digest_length(digest, hash_alg)?;
+    validate_rsa_public_key_size(modulus)?;
+    let key = get_or_build_public_key(slot_id, handle, modulus, public_exponent)?;
+
+    let sig = rsa::pss::Signature::try_from(signature).map_err(|_| HsmError::SignatureInvalid)?;
+
+    match hash_alg {
+        HashAlg::Sha256 => {
+            let verifying_key = VerifyingKey::<Sha256>::new((*key).clone());
+            Ok(verifying_key.verify_prehash(digest, &sig).is_ok())
+        }
+        HashAlg::Sha384 => {
+            let verifying_key = VerifyingKey::<Sha384>::new((*key).clone());
+            Ok(verifying_key.verify_prehash(digest, &sig).is_ok())
+        }
+        HashAlg::Sha512 => {
+            let verifying_key = VerifyingKey::<Sha512>::new((*key).clone());
+            Ok(verifying_key.verify_prehash(digest, &sig).is_ok())
+        }
+    }
+}
+
+// ============================================================================
 // Prehashed ECDSA P-256
 // ============================================================================
 
