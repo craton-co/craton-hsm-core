@@ -435,7 +435,8 @@ fn test_successful_login_resets_failure_count() {
         let _ = token.login(CKU_USER, b"wrongpin");
     }
     // Wait for rate-limit backoff to expire before trying the correct PIN
-    std::thread::sleep(std::time::Duration::from_secs(6));
+    // After 3 failures: backoff = min(100ms * 2^2, 5000ms) = 400ms; 1s margin is plenty.
+    std::thread::sleep(std::time::Duration::from_secs(1));
     // Succeed — resets counter
     token.login(CKU_USER, b"userpin1").unwrap();
     token.logout().unwrap();
@@ -685,6 +686,12 @@ fn test_pin_lockout_concurrent_attempts() {
     // the failure counter). To properly test lockout, we spawn one thread
     // per wave and wait for the backoff window to expire between waves.
     // max_failed_logins = 5 for Token::new().
+    //
+    // Backoff = min(100ms * 2^(failures-1), 5000ms), so we sleep just enough
+    // past each wave's backoff to keep the test fast:
+    //   wave 0: 100ms, wave 1: 200ms, wave 2: 400ms, wave 3: 800ms,
+    //   wave 4: 1600ms, wave 5 (final): capped 5000ms.
+    let backoff_ms = [200, 300, 500, 1000, 2000];
     for wave in 0..6 {
         let token = Arc::clone(&token);
         let h = std::thread::spawn(move || {
@@ -692,12 +699,11 @@ fn test_pin_lockout_concurrent_attempts() {
         });
         h.join().unwrap();
         if wave < 5 {
-            // Wait for rate-limit backoff to expire (max 5s cap)
-            std::thread::sleep(std::time::Duration::from_secs(6));
+            std::thread::sleep(std::time::Duration::from_millis(backoff_ms[wave]));
         }
     }
 
-    // Wait for final backoff to expire
+    // Wait for final backoff to expire (capped at 5000ms)
     std::thread::sleep(std::time::Duration::from_secs(6));
 
     // After 6 failed attempts (>5 threshold), the PIN must be locked.
