@@ -720,6 +720,78 @@ pub fn rsa_pss_verify_cached(
 }
 
 // ============================================================================
+// Handle-cached RSA-OAEP (fast path)
+// ============================================================================
+
+/// RSA-OAEP encrypt using handle-based public key cache.
+pub fn rsa_oaep_encrypt_cached(
+    slot_id: u64,
+    handle: u64,
+    modulus: &[u8],
+    public_exponent: &[u8],
+    plaintext: &[u8],
+    hash_alg: OaepHash,
+) -> HsmResult<Vec<u8>> {
+    use crate::crypto::drbg::DrbgRng;
+    use rsa::Oaep;
+
+    validate_rsa_public_key_size(modulus)?;
+    let key = get_or_build_public_key(slot_id, handle, modulus, public_exponent)?;
+
+    let mut rng = DrbgRng::new()?;
+
+    match hash_alg {
+        OaepHash::Sha256 => {
+            let padding = Oaep::new::<Sha256>();
+            key.encrypt(&mut rng, padding, plaintext)
+                .map_err(|_| HsmError::GeneralError)
+        }
+        OaepHash::Sha384 => {
+            let padding = Oaep::new::<Sha384>();
+            key.encrypt(&mut rng, padding, plaintext)
+                .map_err(|_| HsmError::GeneralError)
+        }
+        OaepHash::Sha512 => {
+            let padding = Oaep::new::<Sha512>();
+            key.encrypt(&mut rng, padding, plaintext)
+                .map_err(|_| HsmError::GeneralError)
+        }
+    }
+}
+
+/// RSA-OAEP decrypt using handle-based private key cache.
+pub fn rsa_oaep_decrypt_cached(
+    slot_id: u64,
+    handle: u64,
+    private_key_der: &[u8],
+    ciphertext: &[u8],
+    hash_alg: OaepHash,
+) -> HsmResult<Vec<u8>> {
+    use rsa::Oaep;
+
+    let key = get_or_parse_private_key(slot_id, handle, private_key_der)?;
+    validate_rsa_private_key_size(&key)?;
+
+    match hash_alg {
+        OaepHash::Sha256 => {
+            let padding = Oaep::new::<Sha256>();
+            key.decrypt(padding, ciphertext)
+                .map_err(|_| HsmError::EncryptedDataInvalid)
+        }
+        OaepHash::Sha384 => {
+            let padding = Oaep::new::<Sha384>();
+            key.decrypt(padding, ciphertext)
+                .map_err(|_| HsmError::EncryptedDataInvalid)
+        }
+        OaepHash::Sha512 => {
+            let padding = Oaep::new::<Sha512>();
+            key.decrypt(padding, ciphertext)
+                .map_err(|_| HsmError::EncryptedDataInvalid)
+        }
+    }
+}
+
+// ============================================================================
 // Handle-cached helpers
 // ============================================================================
 
