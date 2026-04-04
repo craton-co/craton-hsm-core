@@ -365,8 +365,8 @@ mod tests {
         let entropy = [0x42u8; 32];
         let nonce = [0x13u8; 16];
 
-        let mut drbg1 = HmacDrbg::new_deterministic(&entropy, &nonce);
-        let mut drbg2 = HmacDrbg::new_deterministic(&entropy, &nonce);
+        let drbg1 = HmacDrbg::new_deterministic(&entropy, &nonce);
+        let drbg2 = HmacDrbg::new_deterministic(&entropy, &nonce);
 
         // Without prediction resistance, outputs would be identical.
         // But our generate() always reseeds, so deterministic mode

@@ -10,19 +10,100 @@ use crate::pkcs11_abi::constants::*;
 use crate::pkcs11_abi::types::CK_MECHANISM_TYPE;
 
 // ============================================================================
-// RSA Private Key Cache
+// RSA Key Caches
 // ============================================================================
 //
 // Parsing PKCS#8 DER → RsaPrivateKey is expensive (bignum reconstruction).
-// Since the same key is reused across many sign operations, we cache the
-// parsed key keyed by a SHA-256 hash of the DER bytes. The cache is bounded
-// to prevent unbounded memory growth.
+// Since the same key is reused across many sign operations, we maintain two
+// caches:
+//
+// 1. **DER-hash cache** (`RSA_KEY_CACHE`) — the legacy/slow path keyed by
+//    SHA-256(DER).  Used by callers that don't have an object handle.
+//
+// 2. **Handle-based caches** (`RSA_PRIV_CACHE`, `RSA_PUB_CACHE`) — the fast
+//    path keyed by `CK_OBJECT_HANDLE` (u64).  O(1) lookup with no hashing,
+//    returns `Arc` (no clone of the inner key), and supports both private and
+//    public RSA keys.
+//
+// When either cache is full (64 entries), a single arbitrary entry is evicted
+// instead of clearing the entire map, avoiding thundering-herd repopulation.
 
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use zeroize::Zeroize;
 
-/// Maximum number of cached parsed RSA private keys.
+/// Maximum number of entries per cache.
 const RSA_KEY_CACHE_MAX: usize = 64;
+
+// ---------------------------------------------------------------------------
+// Handle-based Arc caches (fast path)
+// ---------------------------------------------------------------------------
+
+/// Handle-based RSA private key cache.
+///
+/// Keyed by (slot_id, handle) to prevent cross-slot cache collisions.
+/// The Arc avoids cloning RSA BigNums on cache hits but note that
+/// SigningKey construction still requires a clone due to the rsa crate's
+/// ownership API.
+static RSA_PRIV_CACHE: LazyLock<dashmap::DashMap<(u64, u64), Arc<RsaPrivateKey>>> =
+    LazyLock::new(|| dashmap::DashMap::with_capacity(RSA_KEY_CACHE_MAX));
+
+/// Handle-based RSA public key cache.
+///
+/// Keyed by (slot_id, handle) to prevent cross-slot cache collisions.
+/// The Arc avoids cloning RSA BigNums on cache hits but note that
+/// SigningKey construction still requires a clone due to the rsa crate's
+/// ownership API.
+static RSA_PUB_CACHE: LazyLock<dashmap::DashMap<(u64, u64), Arc<RsaPublicKey>>> =
+    LazyLock::new(|| dashmap::DashMap::with_capacity(RSA_KEY_CACHE_MAX));
+
+/// Evict one arbitrary entry from a `DashMap` when it is at capacity.
+/// This avoids clearing the entire cache (thundering herd) while keeping
+/// the implementation simple (no LRU metadata overhead).
+fn evict_one_if_full<K: std::hash::Hash + Eq + Clone, V>(map: &dashmap::DashMap<K, V>) {
+    if map.len() >= RSA_KEY_CACHE_MAX {
+        if let Some(entry) = map.iter().next() {
+            let key = entry.key().clone();
+            drop(entry); // release the read guard before removing
+            map.remove(&key);
+        }
+    }
+}
+
+/// Cache an already-parsed RSA private key by (slot_id, handle).
+pub fn cache_rsa_private_key(slot_id: u64, handle: u64, key: Arc<RsaPrivateKey>) {
+    evict_one_if_full(&RSA_PRIV_CACHE);
+    RSA_PRIV_CACHE.insert((slot_id, handle), key);
+}
+
+/// Get a cached RSA private key by (slot_id, handle). Returns `None` on miss.
+pub fn get_cached_rsa_private_key(slot_id: u64, handle: u64) -> Option<Arc<RsaPrivateKey>> {
+    RSA_PRIV_CACHE
+        .get(&(slot_id, handle))
+        .map(|entry| Arc::clone(entry.value()))
+}
+
+/// Cache an already-parsed RSA public key by (slot_id, handle).
+pub fn cache_rsa_public_key(slot_id: u64, handle: u64, key: Arc<RsaPublicKey>) {
+    evict_one_if_full(&RSA_PUB_CACHE);
+    RSA_PUB_CACHE.insert((slot_id, handle), key);
+}
+
+/// Get a cached RSA public key by (slot_id, handle). Returns `None` on miss.
+pub fn get_cached_rsa_public_key(slot_id: u64, handle: u64) -> Option<Arc<RsaPublicKey>> {
+    RSA_PUB_CACHE
+        .get(&(slot_id, handle))
+        .map(|entry| Arc::clone(entry.value()))
+}
+
+/// Evict all cached keys for a given (slot_id, handle) pair (call on C_DestroyObject).
+pub fn evict_cached_keys(slot_id: u64, handle: u64) {
+    RSA_PRIV_CACHE.remove(&(slot_id, handle));
+    RSA_PUB_CACHE.remove(&(slot_id, handle));
+}
+
+// ---------------------------------------------------------------------------
+// DER-hash cache (legacy / slow path)
+// ---------------------------------------------------------------------------
 
 /// Wrapper around `RsaPrivateKey` that zeroizes the PKCS#8 DER encoding on drop.
 ///
@@ -68,14 +149,21 @@ impl Drop for ZeroizingRsaKey {
 /// Cache of parsed RSA private keys, keyed by SHA-256(DER).
 /// Uses DashMap for lock-free concurrent access. Values are wrapped in
 /// `ZeroizingRsaKey` to best-effort zeroize key material on eviction.
+///
+/// **Slow path** — prefer the handle-based `RSA_PRIV_CACHE` when an object
+/// handle is available.
 static RSA_KEY_CACHE: LazyLock<dashmap::DashMap<[u8; 32], ZeroizingRsaKey>> =
     LazyLock::new(|| dashmap::DashMap::with_capacity(RSA_KEY_CACHE_MAX));
 
-/// Parse an RSA private key from PKCS#8 DER, using the cache when possible.
+/// Parse an RSA private key from PKCS#8 DER, using the DER-hash cache.
+///
+/// **Slow path** — computes SHA-256(DER) on every call and clones the key on
+/// cache hit.  Prefer the `*_cached` function variants when a
+/// `CK_OBJECT_HANDLE` is available.
 fn parse_rsa_private_key(der: &[u8]) -> HsmResult<RsaPrivateKey> {
     let cache_key: [u8; 32] = Sha256::digest(der).into();
 
-    // Fast path: cache hit
+    // Fast path: cache hit (still clones — use handle cache to avoid this)
     if let Some(entry) = RSA_KEY_CACHE.get(&cache_key) {
         return Ok(entry.value().key.clone());
     }
@@ -83,20 +171,31 @@ fn parse_rsa_private_key(der: &[u8]) -> HsmResult<RsaPrivateKey> {
     // Slow path: parse and cache
     let private_key = RsaPrivateKey::from_pkcs8_der(der).map_err(|_| HsmError::KeyHandleInvalid)?;
 
-    // Evict all entries if cache is full (simple strategy — avoids LRU complexity).
-    // ZeroizingRsaKey::drop() will best-effort zeroize evicted key material.
-    if RSA_KEY_CACHE.len() >= RSA_KEY_CACHE_MAX {
-        RSA_KEY_CACHE.clear();
-    }
+    // Evict one arbitrary entry instead of clearing the whole cache.
+    evict_one_if_full_zeroizing(&RSA_KEY_CACHE);
 
     RSA_KEY_CACHE.insert(cache_key, ZeroizingRsaKey::new(private_key.clone()));
     Ok(private_key)
 }
 
-/// Clear the RSA key cache. Called on C_Finalize / C_InitToken.
-/// Each evicted entry is zeroized via `ZeroizingRsaKey::drop()`.
+/// Single-entry eviction for the ZeroizingRsaKey DER-hash cache.
+fn evict_one_if_full_zeroizing(map: &dashmap::DashMap<[u8; 32], ZeroizingRsaKey>) {
+    if map.len() >= RSA_KEY_CACHE_MAX {
+        if let Some(entry) = map.iter().next() {
+            let key = *entry.key();
+            drop(entry);
+            map.remove(&key);
+        }
+    }
+}
+
+/// Clear all RSA key caches. Called on C_Finalize / C_InitToken.
+/// Each evicted private-key entry in the DER-hash cache is zeroized via
+/// `ZeroizingRsaKey::drop()`.
 pub fn clear_rsa_key_cache() {
     RSA_KEY_CACHE.clear();
+    RSA_PRIV_CACHE.clear();
+    RSA_PUB_CACHE.clear();
 }
 
 /// Minimum RSA modulus size in bits. Keys below this threshold are rejected
@@ -232,7 +331,7 @@ pub fn rsa_pkcs1v15_sign(
         None => {
             // Reject unprefixed PKCS#1 v1.5 signing — vulnerable to Bleichenbacher forgery.
             // Callers must specify a hash algorithm for DigestInfo wrapping.
-            return Err(HsmError::MechanismParamInvalid);
+            Err(HsmError::MechanismParamInvalid)
         }
     }
 }
@@ -280,7 +379,7 @@ pub fn rsa_pkcs1v15_verify(
             // Reject unprefixed PKCS#1 v1.5 verification — vulnerable to
             // Bleichenbacher signature forgery with low public exponents (e=3).
             // Callers must specify a hash algorithm for DigestInfo validation.
-            return Err(HsmError::MechanismParamInvalid);
+            Err(HsmError::MechanismParamInvalid)
         }
     }
 }
@@ -449,6 +548,282 @@ pub fn rsa_oaep_decrypt(
                 .map_err(|_| HsmError::EncryptedDataInvalid)
         }
     }
+}
+
+// ============================================================================
+// Handle-cached RSA PKCS#1 v1.5 (fast path)
+// ============================================================================
+
+/// RSA PKCS#1 v1.5 sign using handle-based cache (avoids SHA-256(DER) hashing
+/// and BigNum cloning on cache hits).
+pub fn rsa_pkcs1v15_sign_cached(
+    slot_id: u64,
+    handle: u64,
+    private_key_der: &[u8],
+    data: &[u8],
+    hash_alg: Option<HashAlg>,
+) -> HsmResult<Vec<u8>> {
+    use rsa::signature::SignatureEncoding;
+
+    validate_data_size(data)?;
+    let key = get_or_parse_private_key(slot_id, handle, private_key_der)?;
+    validate_rsa_private_key_size(&key)?;
+
+    match hash_alg {
+        Some(HashAlg::Sha256) => {
+            use rsa::pkcs1v15::SigningKey;
+            use rsa::signature::Signer;
+            let signing_key = SigningKey::<Sha256>::new((*key).clone());
+            let signature = signing_key.sign(data);
+            Ok(signature.to_vec())
+        }
+        Some(HashAlg::Sha384) => {
+            use rsa::pkcs1v15::SigningKey;
+            use rsa::signature::Signer;
+            let signing_key = SigningKey::<Sha384>::new((*key).clone());
+            let signature = signing_key.sign(data);
+            Ok(signature.to_vec())
+        }
+        Some(HashAlg::Sha512) => {
+            use rsa::pkcs1v15::SigningKey;
+            use rsa::signature::Signer;
+            let signing_key = SigningKey::<Sha512>::new((*key).clone());
+            let signature = signing_key.sign(data);
+            Ok(signature.to_vec())
+        }
+        None => Err(HsmError::MechanismParamInvalid),
+    }
+}
+
+/// RSA PKCS#1 v1.5 verify using handle-based cache (avoids BigUint
+/// reconstruction on cache hits).
+pub fn rsa_pkcs1v15_verify_cached(
+    slot_id: u64,
+    handle: u64,
+    modulus: &[u8],
+    public_exponent: &[u8],
+    data: &[u8],
+    signature: &[u8],
+    hash_alg: Option<HashAlg>,
+) -> HsmResult<bool> {
+    validate_data_size(data)?;
+    validate_rsa_public_key_size(modulus)?;
+    let key = get_or_build_public_key(slot_id, handle, modulus, public_exponent)?;
+
+    match hash_alg {
+        Some(HashAlg::Sha256) => {
+            use rsa::pkcs1v15::VerifyingKey;
+            use rsa::signature::Verifier;
+            let verifying_key = VerifyingKey::<Sha256>::new((*key).clone());
+            let sig = rsa::pkcs1v15::Signature::try_from(signature)
+                .map_err(|_| HsmError::SignatureInvalid)?;
+            Ok(verifying_key.verify(data, &sig).is_ok())
+        }
+        Some(HashAlg::Sha384) => {
+            use rsa::pkcs1v15::VerifyingKey;
+            use rsa::signature::Verifier;
+            let verifying_key = VerifyingKey::<Sha384>::new((*key).clone());
+            let sig = rsa::pkcs1v15::Signature::try_from(signature)
+                .map_err(|_| HsmError::SignatureInvalid)?;
+            Ok(verifying_key.verify(data, &sig).is_ok())
+        }
+        Some(HashAlg::Sha512) => {
+            use rsa::pkcs1v15::VerifyingKey;
+            use rsa::signature::Verifier;
+            let verifying_key = VerifyingKey::<Sha512>::new((*key).clone());
+            let sig = rsa::pkcs1v15::Signature::try_from(signature)
+                .map_err(|_| HsmError::SignatureInvalid)?;
+            Ok(verifying_key.verify(data, &sig).is_ok())
+        }
+        None => Err(HsmError::MechanismParamInvalid),
+    }
+}
+
+// ============================================================================
+// Handle-cached RSA-PSS (fast path)
+// ============================================================================
+
+/// RSA-PSS sign using handle-based cache.
+pub fn rsa_pss_sign_cached(
+    slot_id: u64,
+    handle: u64,
+    private_key_der: &[u8],
+    data: &[u8],
+    hash_alg: HashAlg,
+) -> HsmResult<Vec<u8>> {
+    use crate::crypto::drbg::DrbgRng;
+    use rsa::pss::SigningKey;
+    use rsa::signature::{RandomizedSigner, SignatureEncoding};
+
+    validate_data_size(data)?;
+    let key = get_or_parse_private_key(slot_id, handle, private_key_der)?;
+    validate_rsa_private_key_size(&key)?;
+
+    let mut rng = DrbgRng::new()?;
+
+    match hash_alg {
+        HashAlg::Sha256 => {
+            let signing_key = SigningKey::<Sha256>::new((*key).clone());
+            let signature = signing_key.sign_with_rng(&mut rng, data);
+            Ok(signature.to_vec())
+        }
+        HashAlg::Sha384 => {
+            let signing_key = SigningKey::<Sha384>::new((*key).clone());
+            let signature = signing_key.sign_with_rng(&mut rng, data);
+            Ok(signature.to_vec())
+        }
+        HashAlg::Sha512 => {
+            let signing_key = SigningKey::<Sha512>::new((*key).clone());
+            let signature = signing_key.sign_with_rng(&mut rng, data);
+            Ok(signature.to_vec())
+        }
+    }
+}
+
+/// RSA-PSS verify using handle-based cache.
+pub fn rsa_pss_verify_cached(
+    slot_id: u64,
+    handle: u64,
+    modulus: &[u8],
+    public_exponent: &[u8],
+    data: &[u8],
+    signature: &[u8],
+    hash_alg: HashAlg,
+) -> HsmResult<bool> {
+    use rsa::pss::VerifyingKey;
+    use rsa::signature::Verifier;
+
+    validate_data_size(data)?;
+    validate_rsa_public_key_size(modulus)?;
+    let key = get_or_build_public_key(slot_id, handle, modulus, public_exponent)?;
+
+    match hash_alg {
+        HashAlg::Sha256 => {
+            let verifying_key = VerifyingKey::<Sha256>::new((*key).clone());
+            let sig =
+                rsa::pss::Signature::try_from(signature).map_err(|_| HsmError::SignatureInvalid)?;
+            Ok(verifying_key.verify(data, &sig).is_ok())
+        }
+        HashAlg::Sha384 => {
+            let verifying_key = VerifyingKey::<Sha384>::new((*key).clone());
+            let sig =
+                rsa::pss::Signature::try_from(signature).map_err(|_| HsmError::SignatureInvalid)?;
+            Ok(verifying_key.verify(data, &sig).is_ok())
+        }
+        HashAlg::Sha512 => {
+            let verifying_key = VerifyingKey::<Sha512>::new((*key).clone());
+            let sig =
+                rsa::pss::Signature::try_from(signature).map_err(|_| HsmError::SignatureInvalid)?;
+            Ok(verifying_key.verify(data, &sig).is_ok())
+        }
+    }
+}
+
+// ============================================================================
+// Handle-cached RSA-OAEP (fast path)
+// ============================================================================
+
+/// RSA-OAEP encrypt using handle-based public key cache.
+pub fn rsa_oaep_encrypt_cached(
+    slot_id: u64,
+    handle: u64,
+    modulus: &[u8],
+    public_exponent: &[u8],
+    plaintext: &[u8],
+    hash_alg: OaepHash,
+) -> HsmResult<Vec<u8>> {
+    use crate::crypto::drbg::DrbgRng;
+    use rsa::Oaep;
+
+    validate_rsa_public_key_size(modulus)?;
+    let key = get_or_build_public_key(slot_id, handle, modulus, public_exponent)?;
+
+    let mut rng = DrbgRng::new()?;
+
+    match hash_alg {
+        OaepHash::Sha256 => {
+            let padding = Oaep::new::<Sha256>();
+            key.encrypt(&mut rng, padding, plaintext)
+                .map_err(|_| HsmError::GeneralError)
+        }
+        OaepHash::Sha384 => {
+            let padding = Oaep::new::<Sha384>();
+            key.encrypt(&mut rng, padding, plaintext)
+                .map_err(|_| HsmError::GeneralError)
+        }
+        OaepHash::Sha512 => {
+            let padding = Oaep::new::<Sha512>();
+            key.encrypt(&mut rng, padding, plaintext)
+                .map_err(|_| HsmError::GeneralError)
+        }
+    }
+}
+
+/// RSA-OAEP decrypt using handle-based private key cache.
+pub fn rsa_oaep_decrypt_cached(
+    slot_id: u64,
+    handle: u64,
+    private_key_der: &[u8],
+    ciphertext: &[u8],
+    hash_alg: OaepHash,
+) -> HsmResult<Vec<u8>> {
+    use rsa::Oaep;
+
+    let key = get_or_parse_private_key(slot_id, handle, private_key_der)?;
+    validate_rsa_private_key_size(&key)?;
+
+    match hash_alg {
+        OaepHash::Sha256 => {
+            let padding = Oaep::new::<Sha256>();
+            key.decrypt(padding, ciphertext)
+                .map_err(|_| HsmError::EncryptedDataInvalid)
+        }
+        OaepHash::Sha384 => {
+            let padding = Oaep::new::<Sha384>();
+            key.decrypt(padding, ciphertext)
+                .map_err(|_| HsmError::EncryptedDataInvalid)
+        }
+        OaepHash::Sha512 => {
+            let padding = Oaep::new::<Sha512>();
+            key.decrypt(padding, ciphertext)
+                .map_err(|_| HsmError::EncryptedDataInvalid)
+        }
+    }
+}
+
+// ============================================================================
+// Handle-cached helpers
+// ============================================================================
+
+/// Look up a private key in the handle cache, or parse from DER and cache it.
+fn get_or_parse_private_key(
+    slot_id: u64,
+    handle: u64,
+    der: &[u8],
+) -> HsmResult<Arc<RsaPrivateKey>> {
+    if let Some(k) = get_cached_rsa_private_key(slot_id, handle) {
+        return Ok(k);
+    }
+    let k = Arc::new(RsaPrivateKey::from_pkcs8_der(der).map_err(|_| HsmError::KeyHandleInvalid)?);
+    cache_rsa_private_key(slot_id, handle, Arc::clone(&k));
+    Ok(k)
+}
+
+/// Look up a public key in the handle cache, or build from components and cache it.
+fn get_or_build_public_key(
+    slot_id: u64,
+    handle: u64,
+    modulus: &[u8],
+    public_exponent: &[u8],
+) -> HsmResult<Arc<RsaPublicKey>> {
+    if let Some(k) = get_cached_rsa_public_key(slot_id, handle) {
+        return Ok(k);
+    }
+    let n = rsa::BigUint::from_bytes_be(modulus);
+    let e = rsa::BigUint::from_bytes_be(public_exponent);
+    let k = Arc::new(RsaPublicKey::new(n, e).map_err(|_| HsmError::KeyHandleInvalid)?);
+    cache_rsa_public_key(slot_id, handle, Arc::clone(&k));
+    Ok(k)
 }
 
 // ============================================================================
@@ -806,6 +1181,137 @@ pub(crate) fn rsa_pss_verify_prehashed(
         }
         HashAlg::Sha512 => {
             let verifying_key = VerifyingKey::<Sha512>::new(public_key);
+            Ok(verifying_key.verify_prehash(digest, &sig).is_ok())
+        }
+    }
+}
+
+// ============================================================================
+// Handle-cached Prehashed RSA PKCS#1 v1.5 (fast path)
+// ============================================================================
+
+/// RSA PKCS#1 v1.5 sign with pre-computed digest, using handle-based cache.
+pub(crate) fn rsa_pkcs1v15_sign_prehashed_cached(
+    slot_id: u64,
+    handle: u64,
+    private_key_der: &[u8],
+    digest: &[u8],
+    hash_alg: HashAlg,
+) -> HsmResult<Vec<u8>> {
+    validate_digest_length(digest, hash_alg)?;
+    let key = get_or_parse_private_key(slot_id, handle, private_key_der)?;
+    validate_rsa_private_key_size(&key)?;
+
+    let scheme = match hash_alg {
+        HashAlg::Sha256 => Pkcs1v15Sign::new::<Sha256>(),
+        HashAlg::Sha384 => Pkcs1v15Sign::new::<Sha384>(),
+        HashAlg::Sha512 => Pkcs1v15Sign::new::<Sha512>(),
+    };
+
+    key.sign(scheme, digest).map_err(|_| HsmError::GeneralError)
+}
+
+/// RSA PKCS#1 v1.5 verify with pre-computed digest, using handle-based cache.
+pub(crate) fn rsa_pkcs1v15_verify_prehashed_cached(
+    slot_id: u64,
+    handle: u64,
+    modulus: &[u8],
+    public_exponent: &[u8],
+    digest: &[u8],
+    signature: &[u8],
+    hash_alg: HashAlg,
+) -> HsmResult<bool> {
+    validate_digest_length(digest, hash_alg)?;
+    validate_rsa_public_key_size(modulus)?;
+    let key = get_or_build_public_key(slot_id, handle, modulus, public_exponent)?;
+
+    let scheme = match hash_alg {
+        HashAlg::Sha256 => Pkcs1v15Sign::new::<Sha256>(),
+        HashAlg::Sha384 => Pkcs1v15Sign::new::<Sha384>(),
+        HashAlg::Sha512 => Pkcs1v15Sign::new::<Sha512>(),
+    };
+
+    Ok(key.verify(scheme, digest, signature).is_ok())
+}
+
+// ============================================================================
+// Handle-cached Prehashed RSA-PSS (fast path)
+// ============================================================================
+
+/// RSA-PSS sign with pre-computed digest, using handle-based cache.
+pub(crate) fn rsa_pss_sign_prehashed_cached(
+    slot_id: u64,
+    handle: u64,
+    private_key_der: &[u8],
+    digest: &[u8],
+    hash_alg: HashAlg,
+) -> HsmResult<Vec<u8>> {
+    use crate::crypto::drbg::DrbgRng;
+    use rsa::pss::SigningKey;
+    use rsa::signature::hazmat::RandomizedPrehashSigner;
+    use rsa::signature::SignatureEncoding;
+
+    validate_digest_length(digest, hash_alg)?;
+    let key = get_or_parse_private_key(slot_id, handle, private_key_der)?;
+    validate_rsa_private_key_size(&key)?;
+
+    let mut rng = DrbgRng::new()?;
+
+    match hash_alg {
+        HashAlg::Sha256 => {
+            let signing_key = SigningKey::<Sha256>::new((*key).clone());
+            let signature = signing_key
+                .sign_prehash_with_rng(&mut rng, digest)
+                .map_err(|_| HsmError::GeneralError)?;
+            Ok(signature.to_vec())
+        }
+        HashAlg::Sha384 => {
+            let signing_key = SigningKey::<Sha384>::new((*key).clone());
+            let signature = signing_key
+                .sign_prehash_with_rng(&mut rng, digest)
+                .map_err(|_| HsmError::GeneralError)?;
+            Ok(signature.to_vec())
+        }
+        HashAlg::Sha512 => {
+            let signing_key = SigningKey::<Sha512>::new((*key).clone());
+            let signature = signing_key
+                .sign_prehash_with_rng(&mut rng, digest)
+                .map_err(|_| HsmError::GeneralError)?;
+            Ok(signature.to_vec())
+        }
+    }
+}
+
+/// RSA-PSS verify with pre-computed digest, using handle-based cache.
+pub(crate) fn rsa_pss_verify_prehashed_cached(
+    slot_id: u64,
+    handle: u64,
+    modulus: &[u8],
+    public_exponent: &[u8],
+    digest: &[u8],
+    signature: &[u8],
+    hash_alg: HashAlg,
+) -> HsmResult<bool> {
+    use rsa::pss::VerifyingKey;
+    use rsa::signature::hazmat::PrehashVerifier;
+
+    validate_digest_length(digest, hash_alg)?;
+    validate_rsa_public_key_size(modulus)?;
+    let key = get_or_build_public_key(slot_id, handle, modulus, public_exponent)?;
+
+    let sig = rsa::pss::Signature::try_from(signature).map_err(|_| HsmError::SignatureInvalid)?;
+
+    match hash_alg {
+        HashAlg::Sha256 => {
+            let verifying_key = VerifyingKey::<Sha256>::new((*key).clone());
+            Ok(verifying_key.verify_prehash(digest, &sig).is_ok())
+        }
+        HashAlg::Sha384 => {
+            let verifying_key = VerifyingKey::<Sha384>::new((*key).clone());
+            Ok(verifying_key.verify_prehash(digest, &sig).is_ok())
+        }
+        HashAlg::Sha512 => {
+            let verifying_key = VerifyingKey::<Sha512>::new((*key).clone());
             Ok(verifying_key.verify_prehash(digest, &sig).is_ok())
         }
     }

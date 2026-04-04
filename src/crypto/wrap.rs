@@ -74,7 +74,7 @@ pub fn aes_key_unwrap(
             let kek =
                 Kek::<aes::Aes128>::try_from(wrapping_key).map_err(|_| HsmError::KeySizeRange)?;
             let mut buf = vec![0u8; wrapped_key.len() - 8];
-            if let Err(_) = kek.unwrap(wrapped_key, &mut buf) {
+            if kek.unwrap(wrapped_key, &mut buf).is_err() {
                 buf.zeroize(); // scrub partial key material on failure
                 return Err(HsmError::EncryptedDataInvalid);
             }
@@ -84,7 +84,7 @@ pub fn aes_key_unwrap(
             let kek =
                 Kek::<aes::Aes192>::try_from(wrapping_key).map_err(|_| HsmError::KeySizeRange)?;
             let mut buf = vec![0u8; wrapped_key.len() - 8];
-            if let Err(_) = kek.unwrap(wrapped_key, &mut buf) {
+            if kek.unwrap(wrapped_key, &mut buf).is_err() {
                 buf.zeroize();
                 return Err(HsmError::EncryptedDataInvalid);
             }
@@ -94,7 +94,7 @@ pub fn aes_key_unwrap(
             let kek =
                 Kek::<aes::Aes256>::try_from(wrapping_key).map_err(|_| HsmError::KeySizeRange)?;
             let mut buf = vec![0u8; wrapped_key.len() - 8];
-            if let Err(_) = kek.unwrap(wrapped_key, &mut buf) {
+            if kek.unwrap(wrapped_key, &mut buf).is_err() {
                 buf.zeroize();
                 return Err(HsmError::EncryptedDataInvalid);
             }

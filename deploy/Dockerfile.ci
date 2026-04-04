@@ -1,0 +1,53 @@
+# ============================================================================
+# Craton HSM — CI & Development Container
+#
+# Contains all tools needed to run the full CI pipeline locally:
+# - Rust stable (rustfmt, clippy)
+# - Rust nightly (miri)
+# - Protoc (gRPC)
+# - SoftHSMv2 (Benchmarks)
+# - Cargo plugins: audit, deny, tarpaulin, semver-checks
+#
+# Build: docker build -t craton_hsm_ci:latest -f deploy/Dockerfile.ci .
+# Run:   ./scripts/local-ci-container.sh
+# ============================================================================
+
+FROM rust:1.83-bookworm
+
+# 1. Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    protobuf-compiler \
+    softhsm2 \
+    pkg-config \
+    libssl-dev \
+    curl \
+    git \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2. Configure Rust toolchains
+# Stable components
+RUN rustup component add rustfmt clippy
+
+# Nightly + Miri
+RUN rustup toolchain install nightly --component miri
+
+# 3. Install Cargo tools
+# We use cargo-binstall or manual downloads where possible to skip compilation time.
+RUN curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+
+RUN cargo binstall -y --locked \
+    cargo-audit \
+    cargo-deny \
+    cargo-tarpaulin \
+    cargo-semver-checks
+
+# 4. Set environment variables
+ENV CARGO_TERM_COLOR=always
+ENV RUST_BACKTRACE=1
+
+WORKDIR /app
+
+# The entrypoint will be the local-ci script
+ENTRYPOINT ["/bin/bash", "./scripts/ci-local.sh"]
+CMD ["all"]
