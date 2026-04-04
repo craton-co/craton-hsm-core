@@ -115,6 +115,8 @@ pub enum HsmError {
     ConfigError(String),
     #[error("audit chain integrity broken: {0}")]
     AuditChainBroken(String),
+    #[error("session closed")]
+    SessionClosed,
 }
 
 impl From<HsmError> for CK_RV {
@@ -175,6 +177,7 @@ impl From<HsmError> for CK_RV {
             HsmError::RandomSeedNotSupported => CKR_RANDOM_SEED_NOT_SUPPORTED,
             HsmError::ConfigError(_) => CKR_GENERAL_ERROR,
             HsmError::AuditChainBroken(_) => CKR_GENERAL_ERROR,
+            HsmError::SessionClosed => CKR_SESSION_CLOSED,
         }
     }
 }
