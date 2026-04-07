@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Craton Software Company
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::error::{HsmError, HsmResult};
 use crate::pkcs11_abi::constants::*;
@@ -369,6 +370,13 @@ pub struct Session {
     /// FIPS 140-3 IG 2.4.C: Algorithm indicator for the last completed operation.
     /// `Some(true)` = approved, `Some(false)` = non-approved, `None` = no operation yet.
     pub last_operation_fips_approved: Option<bool>,
+    /// Monotonic timestamp of the last activity on this session, used for
+    /// idle-timeout cleanup. Updated by `touch()`.
+    pub last_activity: Instant,
+    /// Set to `true` when this session has been logically closed. Any thread
+    /// that still holds an `Arc<RwLock<Session>>` after the DashMap removal
+    /// can check this flag to detect a use-after-close condition.
+    pub closed: bool,
 }
 
 impl Drop for Session {
@@ -397,7 +405,23 @@ impl Session {
             active_operation: None,
             find_context: None,
             last_operation_fips_approved: None,
+            last_activity: Instant::now(),
+            closed: false,
         }
+    }
+
+    /// Update the last-activity timestamp to now. Call this on every
+    /// operation that constitutes "activity" (crypto ops, find, login, etc.)
+    /// to prevent the session from being reaped by idle-timeout cleanup.
+    pub fn touch(&mut self) {
+        self.last_activity = Instant::now();
+    }
+
+    /// Return how long this session has been idle (time since last `touch()`
+    /// or creation). Uses `Instant` so it is monotonic and not affected by
+    /// wall-clock adjustments.
+    pub fn idle_duration(&self) -> Duration {
+        self.last_activity.elapsed()
     }
 
     pub fn is_rw(&self) -> bool {
