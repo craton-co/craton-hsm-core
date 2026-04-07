@@ -224,6 +224,11 @@ pub enum MlDsaVariant {
 /// Generate an ML-DSA keypair. Returns (signing_key_seed_32bytes, verifying_key_bytes).
 pub fn ml_dsa_keygen(variant: MlDsaVariant) -> HsmResult<(RawKeyMaterial, Vec<u8>)> {
     use ml_dsa::KeyGen;
+    // NOTE: `kp.verifying_key()` is a method from `ml_dsa::signature::Keypair`,
+    // which must be in scope for method-call syntax to resolve. Use the fully
+    // qualified path so we don't depend on a `use` statement that linters
+    // sometimes incorrectly flag as unused and strip.
+    use ml_dsa::signature::Keypair as _MlDsaKeypair;
 
     let mut rng = new_rng()?;
 
@@ -231,7 +236,7 @@ pub fn ml_dsa_keygen(variant: MlDsaVariant) -> HsmResult<(RawKeyMaterial, Vec<u8
         MlDsaVariant::MlDsa44 => {
             let kp = ml_dsa::MlDsa44::key_gen(&mut rng);
             let seed = kp.to_seed();
-            let vk_bytes = kp.verifying_key().encode();
+            let vk_bytes = _MlDsaKeypair::verifying_key(&kp).encode();
             Ok((
                 RawKeyMaterial::new(seed[..].to_vec()),
                 vk_bytes[..].to_vec(),
@@ -240,7 +245,7 @@ pub fn ml_dsa_keygen(variant: MlDsaVariant) -> HsmResult<(RawKeyMaterial, Vec<u8
         MlDsaVariant::MlDsa65 => {
             let kp = ml_dsa::MlDsa65::key_gen(&mut rng);
             let seed = kp.to_seed();
-            let vk_bytes = kp.verifying_key().encode();
+            let vk_bytes = _MlDsaKeypair::verifying_key(&kp).encode();
             Ok((
                 RawKeyMaterial::new(seed[..].to_vec()),
                 vk_bytes[..].to_vec(),
@@ -249,7 +254,7 @@ pub fn ml_dsa_keygen(variant: MlDsaVariant) -> HsmResult<(RawKeyMaterial, Vec<u8
         MlDsaVariant::MlDsa87 => {
             let kp = ml_dsa::MlDsa87::key_gen(&mut rng);
             let seed = kp.to_seed();
-            let vk_bytes = kp.verifying_key().encode();
+            let vk_bytes = _MlDsaKeypair::verifying_key(&kp).encode();
             Ok((
                 RawKeyMaterial::new(seed[..].to_vec()),
                 vk_bytes[..].to_vec(),
