@@ -248,7 +248,7 @@ pub extern "C" fn C_Initialize(p_init_args: CK_VOID_PTR) -> CK_RV {
         POST_FAILED.store(false, Ordering::Release);
 
         // Run FIPS 140-3 Power-On Self-Tests before any crypto service is available
-        if let Err(_) = crate::crypto::self_test::run_post() {
+        if crate::crypto::self_test::run_post().is_err() {
             POST_FAILED.store(true, Ordering::Release);
             return CKR_GENERAL_ERROR;
         }
@@ -931,9 +931,9 @@ pub extern "C" fn C_Login(
                 // Update all sessions for this slot
                 let _ = hsm.session_manager.login_all(slot_id, user_type);
                 let _ = hsm.audit_log.record(
-                    session as u64,
+                    u64::from(session),
                     AuditOperation::Login {
-                        user_type: user_type as u64,
+                        user_type: u64::from(user_type),
                     },
                     AuditResult::Success,
                     None,
@@ -943,11 +943,11 @@ pub extern "C" fn C_Login(
             Err(e) => {
                 let rv = err_to_rv(e);
                 let _ = hsm.audit_log.record(
-                    session as u64,
+                    u64::from(session),
                     AuditOperation::Login {
-                        user_type: user_type as u64,
+                        user_type: u64::from(user_type),
                     },
-                    AuditResult::Failure(rv as u64),
+                    AuditResult::Failure(u64::from(rv)),
                     None,
                 );
                 rv

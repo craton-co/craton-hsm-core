@@ -91,9 +91,96 @@ job_fmt() {
 }
 
 # ── Job: Build & Test ────────────────────────────────────────────────────────
+# Mirrors CI shards: separate cargo test invocations avoid PKCS#11 singleton
+# contamination between test files.
 job_test() {
-    log_header "Build & Test (cargo test --workspace)"
-    if cargo test --workspace -- --test-threads=1 2>&1; then
+    log_header "Build & Test"
+    local test_ok=true
+
+    echo -e "\n${BOLD}  Shard 1: Unit & crypto tests (parallel-safe)${NC}"
+    if cargo test --lib \
+        --test crypto_vectors \
+        --test drbg_tests \
+        --test concurrent_stress \
+        --test zeroization \
+        --test integrity_tests \
+        --test multi_slot \
+        -- --test-threads=8 2>&1; then
+        echo -e "  ${GREEN}✓${NC} Unit & crypto tests passed"
+    else
+        echo -e "  ${RED}✗${NC} Unit & crypto tests failed"
+        test_ok=false
+    fi
+
+    echo -e "\n${BOLD}  Audit & FIPS POST tests (serial — shared IV tracker)${NC}"
+    if cargo test \
+        --test audit_and_integrity \
+        -- --test-threads=1 2>&1; then
+        echo -e "  ${GREEN}✓${NC} Audit & FIPS POST tests passed"
+    else
+        echo -e "  ${RED}✗${NC} Audit & FIPS POST tests failed"
+        test_ok=false
+    fi
+
+    echo -e "\n${BOLD}  Shard 2: PKCS#11 ABI — compliance${NC}"
+    if cargo test \
+        --test attribute_management \
+        --test attribute_validation \
+        --test digest_abi \
+        --test fips_approved_mode \
+        --test negative_edge_cases \
+        --test operation_state \
+        --test pkcs11_compliance \
+        --test pkcs11_compliance_extended \
+        --test pkcs11_conformance \
+        --test pkcs11_error_paths \
+        --test pkcs11_info_functions \
+        --test random_and_session \
+        --test session_state_machine \
+        --test supplementary_functions \
+        -- --test-threads=1 2>&1; then
+        echo -e "  ${GREEN}✓${NC} PKCS#11 compliance tests passed"
+    else
+        echo -e "  ${RED}✗${NC} PKCS#11 compliance tests failed"
+        test_ok=false
+    fi
+
+    echo -e "\n${BOLD}  Shard 3: PKCS#11 ABI — crypto ops${NC}"
+    if cargo test \
+        --test backup_restore \
+        --test concurrent_session_stress \
+        --test crypto_vectors_phase2 \
+        --test key_derivation_abi \
+        --test key_lifecycle_abi \
+        --test key_wrapping_abi \
+        --test multipart_encrypt_decrypt \
+        --test multipart_sign_verify \
+        --test pairwise_consistency \
+        --test persistence \
+        --test pqc_abi_comprehensive \
+        --test pqc_phase3 \
+        --test rsa_abi_comprehensive \
+        --test security_properties \
+        -- --test-threads=1 2>&1; then
+        echo -e "  ${GREEN}✓${NC} PKCS#11 crypto ops tests passed"
+    else
+        echo -e "  ${RED}✗${NC} PKCS#11 crypto ops tests failed"
+        test_ok=false
+    fi
+
+    echo -e "\n${BOLD}  Workspace member tests${NC}"
+    if cargo test \
+        -p craton-hsm-admin \
+        -p pkcs11-spy \
+        -p craton-hsm-daemon \
+        -- --test-threads=1 2>&1; then
+        echo -e "  ${GREEN}✓${NC} Workspace member tests passed"
+    else
+        echo -e "  ${RED}✗${NC} Workspace member tests failed"
+        test_ok=false
+    fi
+
+    if $test_ok; then
         log_pass "Build & Test"
     else
         log_fail "Build & Test"
