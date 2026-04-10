@@ -57,6 +57,11 @@ impl ObjectStore {
         }
     }
 
+    /// Return the number of objects currently stored.
+    pub fn objects_len(&self) -> usize {
+        self.objects.len()
+    }
+
     /// Create an ObjectStore with persistence enabled.
     pub fn with_persistence(store: EncryptedStore) -> Self {
         Self {
@@ -389,6 +394,44 @@ impl ObjectStore {
             }
         }
         results
+    }
+
+    /// Sweep all objects, applying date-based lifecycle transitions.
+    ///
+    /// Write-locks each object individually to check and persist any
+    /// SP 800-57 state transitions triggered by `start_date` / `end_date`.
+    /// Returns a list of transitions that occurred during the sweep.
+    pub fn sweep_lifecycle(&self) -> Vec<crate::store::lifecycle::LifecycleTransition> {
+        let mut transitions = Vec::new();
+        // Collect objects that need persistence outside the iterator to avoid
+        // holding DashMap shard locks during disk I/O.
+        let mut to_persist: Vec<crate::store::object::StoredObject> = Vec::new();
+
+        for entry in self.objects.iter() {
+            let mut obj = entry.value().write();
+            if let Some((old_state, new_state)) = obj.transition_lifecycle_if_needed() {
+                let label = String::from_utf8_lossy(&obj.label).to_string();
+                transitions.push(crate::store::lifecycle::LifecycleTransition {
+                    handle: obj.handle,
+                    label,
+                    old_state,
+                    new_state,
+                });
+                // Clone while still holding the write lock to prevent TOCTOU:
+                // no other thread can modify the object between transition and clone.
+                if obj.token_object {
+                    to_persist.push(obj.clone());
+                }
+            }
+            // Write lock is dropped here (end of loop iteration)
+        }
+
+        // Persist outside the DashMap iterator to avoid lock ordering issues
+        for obj_clone in to_persist {
+            self.persist_object(&obj_clone);
+        }
+
+        transitions
     }
 
     /// Export all objects as cloned StoredObjects (for backup).
