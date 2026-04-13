@@ -1171,6 +1171,13 @@ pub extern "C" fn C_GetAttributeValue(
         if p_template.is_null() {
             return CKR_ARGUMENTS_BAD;
         }
+        // Defense-in-depth: cap caller-supplied count before constructing a
+        // slice from raw parts. A bogus count (e.g. u32::MAX) would otherwise
+        // synthesise a slice spanning unrelated memory. Matches the bound
+        // enforced by parse_template() for C_GetAttributeValue's write path.
+        if (count as usize) > MAX_TEMPLATE_ATTRS {
+            return CKR_ARGUMENTS_BAD;
+        }
         let sess = match hsm.session_manager.get_session(session) {
             Ok(s) => s,
             Err(e) => return err_to_rv(e),
@@ -1187,8 +1194,9 @@ pub extern "C" fn C_GetAttributeValue(
             return CKR_USER_NOT_LOGGED_IN;
         }
 
-        // SAFETY: p_template non-null (checked above), caller provides count valid CK_ATTRIBUTEs.
-        // We write back value_len and optionally copy data into p_value buffers. (Pattern 2)
+        // SAFETY: p_template non-null, count ≤ MAX_TEMPLATE_ATTRS (checked above),
+        // caller provides count valid CK_ATTRIBUTEs. We write back value_len and
+        // optionally copy data into p_value buffers. (Pattern 2)
         let attrs = unsafe { slice::from_raw_parts_mut(p_template, count as usize) };
         let mut rv = CKR_OK;
 
