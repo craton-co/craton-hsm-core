@@ -20,7 +20,7 @@ pub struct HsmCore {
     pub(crate) slot_manager: SlotManager,
     pub(crate) session_manager: SessionManager,
     pub(crate) object_store: ObjectStore,
-    pub(crate) audit_log: AuditLog,
+    pub(crate) audit_log: Arc<AuditLog>,
     pub(crate) crypto_backend: Arc<dyn CryptoBackend>,
     /// SP 800-90A HMAC_DRBG instance for FIPS-compliant random number generation.
     pub(crate) drbg: parking_lot::Mutex<HmacDrbg>,
@@ -133,10 +133,15 @@ impl HsmCore {
             slot_manager: SlotManager::new_with_config(config),
             session_manager: SessionManager::new(),
             object_store: ObjectStore::new(),
-            audit_log: if config.audit.enabled {
-                AuditLog::new_with_path(config.audit.log_path.clone())?
-            } else {
-                AuditLog::new()
+            audit_log: {
+                let log = if config.audit.enabled {
+                    AuditLog::new_with_path(config.audit.log_path.clone())?
+                } else {
+                    AuditLog::new()
+                };
+                let log = Arc::new(log);
+                log.register_global_logger();
+                log
             },
             crypto_backend: Self::select_crypto_backend(config),
             drbg: parking_lot::Mutex::new(drbg),
@@ -170,10 +175,15 @@ impl HsmCore {
             slot_manager: SlotManager::new_with_config(config),
             session_manager: SessionManager::new(),
             object_store: ObjectStore::new(),
-            audit_log: if config.audit.enabled {
-                AuditLog::new_with_path(config.audit.log_path.clone())?
-            } else {
-                AuditLog::new()
+            audit_log: {
+                let log = if config.audit.enabled {
+                    AuditLog::new_with_path(config.audit.log_path.clone())?
+                } else {
+                    AuditLog::new()
+                };
+                let log = Arc::new(log);
+                log.register_global_logger();
+                log
             },
             crypto_backend: backend,
             drbg: parking_lot::Mutex::new(drbg),
@@ -213,7 +223,7 @@ impl HsmCore {
     }
 
     /// Returns a reference to the audit log.
-    pub fn audit_log(&self) -> &AuditLog {
+    pub fn audit_log(&self) -> &Arc<AuditLog> {
         &self.audit_log
     }
 

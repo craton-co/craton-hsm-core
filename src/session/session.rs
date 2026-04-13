@@ -54,43 +54,61 @@ impl SessionState {
 /// (FIPS 140-3 §7.7 — zeroization of intermediate CSPs).
 pub enum ActiveOperation {
     Encrypt {
+        /// Mechanism type (e.g., `CKM_AES_GCM`).
         mechanism: CK_MECHANISM_TYPE,
+        /// Handle to the key used for encryption.
         key_handle: CK_OBJECT_HANDLE,
-        /// Mechanism parameter (e.g., IV for CBC/CTR) — zeroized on drop
+        /// Mechanism parameter (e.g., IV for CBC/CTR) — zeroized on drop.
         mechanism_param: Zeroizing<Vec<u8>>,
-        /// Accumulated data for multi-part — zeroized on drop
+        /// Accumulated data for multi-part — zeroized on drop.
         data: Zeroizing<Vec<u8>>,
         /// Cached object reference from C_EncryptInit to avoid re-fetching from ObjectStore.
         cached_object: Option<Arc<parking_lot::RwLock<StoredObject>>>,
     },
+    /// Symmetric decryption operation.
     Decrypt {
+        /// Mechanism type.
         mechanism: CK_MECHANISM_TYPE,
+        /// Handle to the key used for decryption.
         key_handle: CK_OBJECT_HANDLE,
+        /// Mechanism parameter — zeroized on drop.
         mechanism_param: Zeroizing<Vec<u8>>,
+        /// Accumulated data for multi-part — zeroized on drop.
         data: Zeroizing<Vec<u8>>,
         /// Cached object reference from C_DecryptInit.
         cached_object: Option<Arc<parking_lot::RwLock<StoredObject>>>,
     },
+    /// Digital signature operation (RSA, ECDSA, EdDSA, PQC).
     Sign {
+        /// Mechanism type.
         mechanism: CK_MECHANISM_TYPE,
+        /// Handle to the key used for signing.
         key_handle: CK_OBJECT_HANDLE,
+        /// Accumulated data for single-shot or multi-part sign — zeroized on drop.
         data: Zeroizing<Vec<u8>>,
-        /// Hasher for multi-part sign operations (CKM_SHA*_RSA_PKCS, CKM_ECDSA_SHA*, etc.)
+        /// Hasher for multi-part sign operations (CKM_SHA*_RSA_PKCS, CKM_ECDSA_SHA*, etc.).
         hasher: Option<Box<dyn crate::crypto::digest::DigestAccumulator>>,
         /// Cached object reference from C_SignInit.
         cached_object: Option<Arc<parking_lot::RwLock<StoredObject>>>,
     },
+    /// Signature verification operation.
     Verify {
+        /// Mechanism type.
         mechanism: CK_MECHANISM_TYPE,
+        /// Handle to the key used for verification.
         key_handle: CK_OBJECT_HANDLE,
+        /// Accumulated data for single-shot or multi-part verify — zeroized on drop.
         data: Zeroizing<Vec<u8>>,
-        /// Hasher for multi-part verify operations
+        /// Hasher for multi-part verify operations.
         hasher: Option<Box<dyn crate::crypto::digest::DigestAccumulator>>,
         /// Cached object reference from C_VerifyInit.
         cached_object: Option<Arc<parking_lot::RwLock<StoredObject>>>,
     },
+    /// Message digest (hashing) operation.
     Digest {
+        /// Mechanism type.
         mechanism: CK_MECHANISM_TYPE,
+        /// Hasher for multi-part digest operations.
         hasher: Option<Box<dyn crate::crypto::digest::DigestAccumulator>>,
         /// Accumulated raw input for operation state save/restore.
         /// When C_GetOperationState is called, we serialize this data
@@ -117,7 +135,7 @@ const OP_STATE_MAX_DATA_LEN: usize = 4 * 1024 * 1024;
 
 impl ActiveOperation {
     /// Serialize the operation state into a portable blob.
-    /// Format: [1:type][8:mechanism][8:key_handle][4:param_len][N:param][4:data_len][M:data][32:hmac]
+    /// Format: \[1:type\]\[8:mechanism\]\[8:key_handle\]\[4:param_len\]\[N:param\]\[4:data_len\]\[M:data\]\[32:hmac\]
     ///
     /// Returns `Err` if param or data lengths exceed the deserialization
     /// limits (`OP_STATE_MAX_PARAM_LEN` / `OP_STATE_MAX_DATA_LEN`),
@@ -225,7 +243,7 @@ impl ActiveOperation {
     /// `Zeroizing` wrappers on param/data to ensure CSPs are zeroized on drop
     /// (FIPS 140-3 §7.7).
     ///
-    /// Header format: [1:type][8:mechanism][8:key_handle][4:param_len]...
+    /// Header format: \[1:type\]\[8:mechanism\]\[8:key_handle\]\[4:param_len\]...
     pub fn deserialize_state(
         blob: &[u8],
         state_hmac_key: &[u8; 32],
