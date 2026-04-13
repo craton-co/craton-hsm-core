@@ -86,10 +86,13 @@ impl Clone for RawKeyMaterial {
 impl Drop for RawKeyMaterial {
     fn drop(&mut self) {
         if !self.0.is_empty() {
+            let key_size = self.0.len();
             // Zeroize before unlocking, so swap never sees key bytes
             self.0.zeroize();
             // Unlock the (now-zeroed) pages
             let _ = mlock::munlock_buffer(self.0.as_ptr(), self.0.len());
+            // FIPS 140-3: emit zeroization attestation to audit log
+            crate::audit::log::record_zeroization(key_size);
         }
     }
 }

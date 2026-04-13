@@ -120,6 +120,11 @@ pub enum AuditOperation {
         result_count: u32,
     },
     GetAttributeValue,
+    /// FIPS 140-3 zeroization attestation.
+    Zeroize {
+        /// Number of bytes zeroized.
+        key_length: u32,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,6 +198,12 @@ pub struct AuditLog {
     /// Handle to the background worker thread that processes audit events.
     worker: Option<std::thread::JoinHandle<()>>,
 }
+
+/// Global weak reference to the active audit log, allowing `Drop` implementations
+/// (like `RawKeyMaterial`) to record zeroization events without holding a direct
+/// reference to the HSM core or audit log.
+static GLOBAL_AUDIT_LOG: parking_lot::RwLock<Option<std::sync::Weak<AuditLog>>> =
+    parking_lot::RwLock::new(None);
 
 impl Default for AuditLog {
     fn default() -> Self {
@@ -933,6 +944,12 @@ impl AuditLog {
         }
         Ok(state.entries.len())
     }
+
+    /// Register this `AuditLog` instance as the global logger for the crate.
+    /// Used by `record_zeroization()` and other free functions.
+    pub fn register_global_logger(self: &Arc<Self>) {
+        *GLOBAL_AUDIT_LOG.write() = Some(Arc::downgrade(self));
+    }
 }
 
 impl Drop for AuditLog {
@@ -1052,5 +1069,23 @@ fn format_operation_name(op: &AuditOperation) -> &'static str {
         AuditOperation::DeriveKey { .. } => "DeriveKey",
         AuditOperation::FindObjects { .. } => "FindObjects",
         AuditOperation::GetAttributeValue => "GetAttributeValue",
+        AuditOperation::Zeroize { .. } => "Zeroize",
+    }
+}
+
+/// Free function to record a zeroization event to the global audit log.
+/// Used by `RawKeyMaterial::drop()` to satisfy FIPS 140-3 requirements.
+pub fn record_zeroization(key_size: usize) {
+    if let Some(weak) = &*GLOBAL_AUDIT_LOG.read() {
+        if let Some(logger) = weak.upgrade() {
+            let _ = logger.record(
+                0, // System-level event (no session)
+                AuditOperation::Zeroize {
+                    key_length: key_size as u32,
+                },
+                AuditResult::Success,
+                None,
+            );
+        }
     }
 }

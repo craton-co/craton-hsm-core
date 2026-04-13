@@ -31,6 +31,18 @@ impl Default for KeyLifecycleState {
     }
 }
 
+impl fmt::Display for KeyLifecycleState {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            KeyLifecycleState::PreActivation => write!(f, "PreActivation"),
+            KeyLifecycleState::Active => write!(f, "Active"),
+            KeyLifecycleState::Deactivated => write!(f, "Deactivated"),
+            KeyLifecycleState::Compromised => write!(f, "Compromised"),
+            KeyLifecycleState::Destroyed => write!(f, "Destroyed"),
+        }
+    }
+}
+
 /// Serde default helper for boolean fields that default to true.
 fn default_true() -> bool {
     true
@@ -144,6 +156,12 @@ impl StoredObject {
                 .unwrap_or_default()
                 .as_secs(),
         }
+    }
+
+    /// Create a minimal object for unit testing.
+    #[cfg(test)]
+    pub fn default_for_test() -> Self {
+        Self::new(1, 0)
     }
 
     /// Check if a template matches this object (partial template matching per PKCS#11).
@@ -340,6 +358,100 @@ impl StoredObject {
 
         KeyLifecycleState::Active
     }
+
+    /// Check if the effective lifecycle state differs from the stored state
+    /// and, if so, persist the transition by updating `self.lifecycle_state`.
+    ///
+    /// Returns `Some((old_state, new_state))` when a transition occurred,
+    /// `None` when the stored state already matches the effective state.
+    ///
+    /// This method extends the logic of `effective_lifecycle_state()` to also
+    /// handle re-evaluation of date-derived states (`PreActivation`,
+    /// `Deactivated`) that were previously persisted by an earlier sweep.
+    /// Terminal states (`Compromised`, `Destroyed`) are never overridden.
+    pub fn transition_lifecycle_if_needed(
+        &mut self,
+    ) -> Option<(KeyLifecycleState, KeyLifecycleState)> {
+        // Terminal states are never overridden by date logic
+        if matches!(
+            self.lifecycle_state,
+            KeyLifecycleState::Compromised | KeyLifecycleState::Destroyed
+        ) {
+            return None;
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let new_state = self.compute_date_based_state(now);
+
+        if new_state != self.lifecycle_state {
+            let old = self.lifecycle_state;
+            self.lifecycle_state = new_state;
+            Some((old, new_state))
+        } else {
+            None
+        }
+    }
+
+    /// Compute the lifecycle state purely from date fields.
+    ///
+    /// Unlike `effective_lifecycle_state()` which only checks dates when
+    /// `lifecycle_state == Active`, this method evaluates dates regardless
+    /// of the current stored state (caller must filter terminal states).
+    fn compute_date_based_state(&self, now: u64) -> KeyLifecycleState {
+        // Check start_date: if in the future, key is pre-activation
+        if let Some(start) = &self.start_date {
+            if let Some(start_epoch) = ck_date_to_epoch(start) {
+                if now < start_epoch {
+                    return KeyLifecycleState::PreActivation;
+                }
+            }
+        }
+
+        // Check end_date: if in the past, key is deactivated
+        if let Some(end) = &self.end_date {
+            if let Some(end_epoch) = ck_date_to_epoch(end) {
+                if now > end_epoch {
+                    return KeyLifecycleState::Deactivated;
+                }
+            }
+        }
+
+        KeyLifecycleState::Active
+    }
+
+    /// Manually mark this key as compromised (SP 800-57).
+    ///
+    /// This is a one-way transition — once compromised, the key cannot
+    /// return to any other state except Destroyed. Returns the previous
+    /// state, or `None` if the key was already Compromised or Destroyed.
+    pub fn set_compromised(&mut self) -> Option<KeyLifecycleState> {
+        match self.lifecycle_state {
+            KeyLifecycleState::Compromised | KeyLifecycleState::Destroyed => None,
+            other => {
+                self.lifecycle_state = KeyLifecycleState::Compromised;
+                Some(other)
+            }
+        }
+    }
+
+    /// Manually mark this key as destroyed (SP 800-57).
+    ///
+    /// This is a terminal transition — a destroyed key cannot return to
+    /// any other state. Returns the previous state, or `None` if the key
+    /// was already Destroyed.
+    pub fn set_destroyed(&mut self) -> Option<KeyLifecycleState> {
+        if self.lifecycle_state == KeyLifecycleState::Destroyed {
+            None
+        } else {
+            let old = self.lifecycle_state;
+            self.lifecycle_state = KeyLifecycleState::Destroyed;
+            Some(old)
+        }
+    }
 }
 
 /// Convert a CK_DATE (YYYYMMDD, 8 ASCII bytes) to a Unix epoch timestamp.
@@ -422,4 +534,193 @@ fn read_ck_ulong(bytes: &[u8]) -> Option<CK_ULONG> {
     let mut buf = [0u8; 8];
     buf[..size].copy_from_slice(&bytes[..size]);
     Some(CK_ULONG::from_ne_bytes(buf[..size].try_into().ok()?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: build a date string N days from now (positive = future, negative = past).
+    fn date_offset_days(days: i64) -> [u8; 8] {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let target = (now as i64 + days * 86400) as u64;
+        // Convert epoch seconds back to YYYYMMDD
+        epoch_to_ck_date(target)
+    }
+
+    fn epoch_to_ck_date(epoch: u64) -> [u8; 8] {
+        // Simple conversion: days since 1970-01-01
+        let total_days = epoch / 86400;
+        // Compute year/month/day from days since epoch
+        let mut y = 1970u64;
+        let mut remaining = total_days;
+        loop {
+            let days_in_year = if is_leap_year(y) { 366 } else { 365 };
+            if remaining < days_in_year {
+                break;
+            }
+            remaining -= days_in_year;
+            y += 1;
+        }
+        let leap = is_leap_year(y);
+        let month_days: [u64; 12] = [
+            31,
+            if leap { 29 } else { 28 },
+            31,
+            30,
+            31,
+            30,
+            31,
+            31,
+            30,
+            31,
+            30,
+            31,
+        ];
+        let mut m = 1u64;
+        for &md in &month_days {
+            if remaining < md {
+                break;
+            }
+            remaining -= md;
+            m += 1;
+        }
+        let d = remaining + 1;
+        let s = format!("{:04}{:02}{:02}", y, m, d);
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(s.as_bytes());
+        buf
+    }
+
+    #[test]
+    fn transition_preactivation_to_active() {
+        let mut obj = StoredObject::default_for_test();
+        // Set start_date in the past so effective state is Active
+        obj.start_date = Some(date_offset_days(-10));
+        obj.lifecycle_state = KeyLifecycleState::PreActivation;
+
+        let result = obj.transition_lifecycle_if_needed();
+        assert!(result.is_some());
+        let (old, new) = result.unwrap();
+        assert_eq!(old, KeyLifecycleState::PreActivation);
+        assert_eq!(new, KeyLifecycleState::Active);
+        assert_eq!(obj.lifecycle_state, KeyLifecycleState::Active);
+    }
+
+    #[test]
+    fn transition_active_to_deactivated_by_date() {
+        let mut obj = StoredObject::default_for_test();
+        obj.lifecycle_state = KeyLifecycleState::Active;
+        // end_date in the past triggers deactivation
+        obj.end_date = Some(date_offset_days(-5));
+
+        let result = obj.transition_lifecycle_if_needed();
+        assert!(result.is_some());
+        let (old, new) = result.unwrap();
+        assert_eq!(old, KeyLifecycleState::Active);
+        assert_eq!(new, KeyLifecycleState::Deactivated);
+        assert_eq!(obj.lifecycle_state, KeyLifecycleState::Deactivated);
+    }
+
+    #[test]
+    fn transition_returns_none_when_no_change() {
+        let mut obj = StoredObject::default_for_test();
+        obj.lifecycle_state = KeyLifecycleState::Active;
+        // No dates set — effective state is Active, same as stored
+        let result = obj.transition_lifecycle_if_needed();
+        assert!(result.is_none());
+        assert_eq!(obj.lifecycle_state, KeyLifecycleState::Active);
+    }
+
+    #[test]
+    fn compromised_not_overridden_by_dates() {
+        let mut obj = StoredObject::default_for_test();
+        obj.lifecycle_state = KeyLifecycleState::Compromised;
+        // Even with valid dates, Compromised must stick
+        obj.start_date = Some(date_offset_days(-30));
+        obj.end_date = Some(date_offset_days(30));
+
+        let result = obj.transition_lifecycle_if_needed();
+        assert!(result.is_none());
+        assert_eq!(obj.lifecycle_state, KeyLifecycleState::Compromised);
+    }
+
+    #[test]
+    fn destroyed_not_overridden_by_dates() {
+        let mut obj = StoredObject::default_for_test();
+        obj.lifecycle_state = KeyLifecycleState::Destroyed;
+        obj.start_date = Some(date_offset_days(-30));
+        obj.end_date = Some(date_offset_days(30));
+
+        let result = obj.transition_lifecycle_if_needed();
+        assert!(result.is_none());
+        assert_eq!(obj.lifecycle_state, KeyLifecycleState::Destroyed);
+    }
+
+    #[test]
+    fn set_compromised_from_active() {
+        let mut obj = StoredObject::default_for_test();
+        obj.lifecycle_state = KeyLifecycleState::Active;
+        let prev = obj.set_compromised();
+        assert_eq!(prev, Some(KeyLifecycleState::Active));
+        assert_eq!(obj.lifecycle_state, KeyLifecycleState::Compromised);
+    }
+
+    #[test]
+    fn set_compromised_idempotent() {
+        let mut obj = StoredObject::default_for_test();
+        obj.lifecycle_state = KeyLifecycleState::Compromised;
+        let prev = obj.set_compromised();
+        assert!(prev.is_none());
+    }
+
+    #[test]
+    fn set_compromised_blocked_when_destroyed() {
+        let mut obj = StoredObject::default_for_test();
+        obj.lifecycle_state = KeyLifecycleState::Destroyed;
+        let prev = obj.set_compromised();
+        assert!(prev.is_none());
+        assert_eq!(obj.lifecycle_state, KeyLifecycleState::Destroyed);
+    }
+
+    #[test]
+    fn set_destroyed_from_active() {
+        let mut obj = StoredObject::default_for_test();
+        obj.lifecycle_state = KeyLifecycleState::Active;
+        let prev = obj.set_destroyed();
+        assert_eq!(prev, Some(KeyLifecycleState::Active));
+        assert_eq!(obj.lifecycle_state, KeyLifecycleState::Destroyed);
+    }
+
+    #[test]
+    fn set_destroyed_from_compromised() {
+        let mut obj = StoredObject::default_for_test();
+        obj.lifecycle_state = KeyLifecycleState::Compromised;
+        let prev = obj.set_destroyed();
+        assert_eq!(prev, Some(KeyLifecycleState::Compromised));
+        assert_eq!(obj.lifecycle_state, KeyLifecycleState::Destroyed);
+    }
+
+    #[test]
+    fn set_destroyed_idempotent() {
+        let mut obj = StoredObject::default_for_test();
+        obj.lifecycle_state = KeyLifecycleState::Destroyed;
+        let prev = obj.set_destroyed();
+        assert!(prev.is_none());
+    }
+
+    #[test]
+    fn display_lifecycle_states() {
+        assert_eq!(
+            format!("{}", KeyLifecycleState::PreActivation),
+            "PreActivation"
+        );
+        assert_eq!(format!("{}", KeyLifecycleState::Active), "Active");
+        assert_eq!(format!("{}", KeyLifecycleState::Deactivated), "Deactivated");
+        assert_eq!(format!("{}", KeyLifecycleState::Compromised), "Compromised");
+        assert_eq!(format!("{}", KeyLifecycleState::Destroyed), "Destroyed");
+    }
 }

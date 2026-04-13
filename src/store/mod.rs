@@ -10,5 +10,6 @@ pub mod attributes;
 pub mod backup;
 pub mod encrypted_store;
 pub mod key_material;
+pub mod lifecycle;
 pub mod lockout_store;
 pub mod object;
