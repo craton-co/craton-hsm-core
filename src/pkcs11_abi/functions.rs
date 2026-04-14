@@ -3425,6 +3425,13 @@ pub extern "C" fn C_SetOperationState(
         if pOperationState.is_null() || ulOperationStateLen == 0 {
             return CKR_ARGUMENTS_BAD;
         }
+        // Defense-in-depth: cap caller-supplied length before constructing a
+        // slice from raw parts. MAX_SINGLE_BUFFER mirrors the bound used by
+        // encrypt/decrypt/sign/verify entry points; a serialized operation
+        // state is far smaller than this in any realistic workload.
+        if (ulOperationStateLen as usize) > MAX_SINGLE_BUFFER {
+            return CKR_SAVED_STATE_INVALID;
+        }
 
         let blob = unsafe { slice::from_raw_parts(pOperationState, ulOperationStateLen as usize) };
 
