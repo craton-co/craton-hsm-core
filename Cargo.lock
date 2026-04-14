@@ -590,12 +590,62 @@ dependencies = [
 ]
 
 [[package]]
+name = "craton-hsm"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "225cf46b45f7060f240fb03f40ba826d6b31d9709faaa75fffd8fc6e80012369"
+dependencies = [
+ "aes",
+ "aes-gcm",
+ "aes-kw",
+ "cbc",
+ "cipher 0.5.1",
+ "ctr",
+ "dashmap",
+ "ecdsa",
+ "ed25519-dalek",
+ "elliptic-curve",
+ "fs2",
+ "getrandom 0.4.2",
+ "hex",
+ "hkdf",
+ "hmac 0.12.1",
+ "libc",
+ "ml-dsa",
+ "ml-kem",
+ "p256",
+ "p384",
+ "parking_lot",
+ "pbkdf2",
+ "rand",
+ "rand_core 0.10.0",
+ "rand_core 0.6.4",
+ "redb",
+ "rsa",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2 0.10.9",
+ "sha3 0.10.8",
+ "slh-dsa",
+ "subtle",
+ "thiserror",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "windows-sys 0.61.2",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
 name = "craton-hsm-admin"
 version = "0.3.0"
 dependencies = [
  "clap",
  "comfy-table",
- "craton-hsm",
+ "craton-hsm 0.9.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "rpassword",
  "serde_json",
  "zeroize",
@@ -606,7 +656,7 @@ name = "craton-hsm-daemon"
 version = "0.3.0"
 dependencies = [
  "async-stream",
- "craton-hsm",
+ "craton-hsm 0.9.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "prost",
  "rustls",
  "rustls-pemfile",
