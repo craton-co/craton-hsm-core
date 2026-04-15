@@ -102,6 +102,12 @@ const MAX_TEMPLATE_ATTRS: usize = 256;
 /// realistic PKCS#11 attribute (RSA-4096 modulus is 512 bytes, PQC
 /// keys are a few KiB).
 const MAX_ATTR_VALUE_LEN: usize = 64 * 1024;
+/// Maximum number of object handles returned in a single C_FindObjects call.
+/// Defense-in-depth bound to prevent `slice::from_raw_parts_mut` with a
+/// caller-supplied max_count that exceeds the actual allocation, and to
+/// avoid u64→usize truncation surprises on 32-bit targets. Callers needing
+/// more results can simply call C_FindObjects again.
+const MAX_FIND_OBJECTS_PER_CALL: usize = 65_536;
 /// Operation type tags for C_GetOperationState / C_SetOperationState serialization.
 const OP_TYPE_ENCRYPT: u8 = 0;
 const OP_TYPE_DECRYPT: u8 = 1;
@@ -1362,6 +1368,11 @@ pub extern "C" fn C_FindObjects(
         if ph_object.is_null() || pul_count.is_null() {
             return CKR_ARGUMENTS_BAD;
         }
+        // Defense-in-depth: clamp caller-supplied max_count. Also guards against
+        // u64→usize truncation on 32-bit targets, where casting a value above
+        // usize::MAX would silently wrap rather than fail. Callers requesting
+        // more handles than the cap can simply call C_FindObjects again.
+        let max_count_usize = (max_count as u64).min(MAX_FIND_OBJECTS_PER_CALL as u64) as usize;
 
         let sess = match hsm.session_manager.get_session(session) {
             Ok(s) => s,
@@ -1375,7 +1386,9 @@ pub extern "C" fn C_FindObjects(
         };
 
         let remaining = ctx.results.len() - ctx.position;
-        let to_return = remaining.min(max_count as usize);
+        let to_return = remaining.min(max_count_usize);
+        // SAFETY: ph_object non-null (checked above); to_return ≤ max_count_usize
+        // ≤ caller's buffer (PKCS#11 contract) and ≤ MAX_FIND_OBJECTS_PER_CALL.
         let out = unsafe { slice::from_raw_parts_mut(ph_object, to_return) };
 
         for i in 0..to_return {
