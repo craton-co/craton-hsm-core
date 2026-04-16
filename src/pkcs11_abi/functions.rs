@@ -3934,6 +3934,7 @@ pub extern "C" fn C_EncryptFinal(
         // Pre-check: verify the caller's buffer can hold the conservative
         // estimate BEFORE consuming accumulated data, so the operation is
         // preserved on CKR_BUFFER_TOO_SMALL (PKCS#11 spec compliant).
+        let buf_len = unsafe { *pul_last_encrypted_part_len } as usize;
         {
             let (mech, data_ref) = match &sess.active_operation {
                 Some(ActiveOperation::Encrypt {
@@ -3946,7 +3947,6 @@ pub extern "C" fn C_EncryptFinal(
                 return CKR_MECHANISM_INVALID;
             }
             let estimated = data_ref.len() + 16; // CBC-PAD may add one block
-            let buf_len = unsafe { *pul_last_encrypted_part_len } as usize;
             if buf_len < estimated {
                 unsafe {
                     *pul_last_encrypted_part_len = estimated as CK_ULONG;
@@ -4019,6 +4019,23 @@ pub extern "C" fn C_EncryptFinal(
 
         match result {
             Ok(encrypted) => {
+                // Defense-in-depth: verify the crypto backend's actual output
+                // did not exceed the caller's buffer. The pre-check bounds this
+                // by `data.len() + 16`, which is a correct upper bound for every
+                // multipart-capable encrypt mechanism currently dispatched above
+                // (AES-CBC/CBC-PAD adds ≤ one block; AES-CTR preserves length).
+                // This check ensures that assumption cannot be silently violated
+                // by a future mechanism addition.
+                if encrypted.len() > buf_len {
+                    unsafe {
+                        *pul_last_encrypted_part_len = encrypted.len() as CK_ULONG;
+                    }
+                    sess.active_operation = None;
+                    return CKR_BUFFER_TOO_SMALL;
+                }
+                // SAFETY: p_last_encrypted_part non-null (checked at function
+                // entry); encrypted.len() ≤ buf_len (just verified) ≤ caller's
+                // allocation (PKCS#11 contract).
                 let out =
                     unsafe { slice::from_raw_parts_mut(p_last_encrypted_part, encrypted.len()) };
                 out.copy_from_slice(&encrypted);
