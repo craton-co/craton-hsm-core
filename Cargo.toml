@@ -92,6 +92,7 @@ hex = "0.4"
 # Optional FIPS-validated backend
 aws-lc-rs = { version = "1", features = ["fips"], optional = true }
 
+
 # Unix process ID for fork detection
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
