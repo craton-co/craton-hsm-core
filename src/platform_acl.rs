@@ -31,8 +31,8 @@ pub(crate) fn restrict_file_to_owner(path: &Path) -> Result<(), String> {
         use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
         use windows_sys::Win32::Security::Authorization::SetNamedSecurityInfoW;
         use windows_sys::Win32::Security::{
-            AddAccessAllowedAce, GetLengthSid, GetTokenInformation, InitializeAcl, ACL as WIN_ACL,
-            TOKEN_USER,
+            AddAccessAllowedAce, GetLengthSid, GetTokenInformation, InitializeAcl,
+            ACCESS_ALLOWED_ACE, ACL as WIN_ACL, ACL_REVISION, TOKEN_USER,
         };
         use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -96,19 +96,33 @@ pub(crate) fn restrict_file_to_owner(path: &Path) -> Result<(), String> {
         if sid_length == 0 || sid_length > 256 {
             return Err(format!("unexpected SID length {}", sid_length));
         }
-        // ACL header (8) + ACCESS_ALLOWED_ACE minus SidStart (8) + SID bytes.
-        let acl_size: u32 = 8u32.saturating_add(8).saturating_add(sid_length);
+        // ACE size formula per Microsoft docs:
+        //   sizeof(ACCESS_ALLOWED_ACE) - sizeof(DWORD) + GetLengthSid(pSid)
+        // The struct embeds the first DWORD of the SID inline (`SidStart`), so we
+        // subtract one DWORD to avoid double-counting before adding the full SID.
+        // Total ACL buffer = ACL header + the single ACE.
+        let acl_header_size = std::mem::size_of::<WIN_ACL>();
+        let ace_size = std::mem::size_of::<ACCESS_ALLOWED_ACE>()
+            .checked_sub(std::mem::size_of::<u32>())
+            .and_then(|n| n.checked_add(sid_length as usize))
+            .ok_or_else(|| "ACE size computation overflowed".to_string())?;
+        let acl_size_usize = acl_header_size
+            .checked_add(ace_size)
+            .ok_or_else(|| "ACL size computation overflowed".to_string())?;
+        let acl_size: u32 = u32::try_from(acl_size_usize)
+            .map_err(|_| format!("ACL size {} exceeds u32::MAX", acl_size_usize))?;
+
         let mut acl_buf: Vec<u8> = vec![0u8; acl_size as usize];
         let acl_ptr = acl_buf.as_mut_ptr() as *mut WIN_ACL;
 
-        if InitializeAcl(acl_ptr, acl_size, 2 /* ACL_REVISION */) == 0 {
+        if InitializeAcl(acl_ptr, acl_size, ACL_REVISION as u32) == 0 {
             let err = GetLastError();
             return Err(format!("InitializeAcl failed (error {})", err));
         }
 
         // GENERIC_READ | GENERIC_WRITE
         let access_mask: u32 = 0x80000000 | 0x40000000;
-        if AddAccessAllowedAce(acl_ptr, 2, access_mask, user_sid) == 0 {
+        if AddAccessAllowedAce(acl_ptr, ACL_REVISION as u32, access_mask, user_sid) == 0 {
             let err = GetLastError();
             return Err(format!("AddAccessAllowedAce failed (error {})", err));
         }
@@ -121,7 +135,7 @@ pub(crate) fn restrict_file_to_owner(path: &Path) -> Result<(), String> {
             0x00000004 | 0x80000000,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            acl_ptr as *const _ as *const WIN_ACL,
+            acl_ptr as *const WIN_ACL,
             std::ptr::null_mut(),
         );
         if result != 0 {
