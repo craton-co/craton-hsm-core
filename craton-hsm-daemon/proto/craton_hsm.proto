@@ -20,6 +20,16 @@ service HsmService {
   rpc FindObjects(FindObjectsRequest) returns (FindObjectsResponse);
   rpc GetAttributeValue(GetAttributeValueRequest) returns (GetAttributeValueResponse);
 
+  // Key wrapping
+  rpc WrapKey(WrapKeyRequest) returns (WrapKeyResponse);
+  rpc UnwrapKey(UnwrapKeyRequest) returns (UnwrapKeyResponse);
+  rpc DeriveKey(DeriveKeyRequest) returns (DeriveKeyResponse);
+  rpc CopyObject(CopyObjectRequest) returns (CopyObjectResponse);
+
+  // PIN management
+  rpc InitPIN(InitPINRequest) returns (InitPINResponse);
+  rpc SetPIN(SetPINRequest) returns (SetPINResponse);
+
   // Cryptographic operations
   rpc Sign(SignRequest) returns (SignResponse);
   rpc Verify(VerifyRequest) returns (VerifyResponse);
@@ -27,6 +37,9 @@ service HsmService {
   rpc Decrypt(DecryptRequest) returns (DecryptResponse);
   rpc Digest(DigestRequest) returns (DigestResponse);
   rpc GenerateRandom(GenerateRandomRequest) returns (GenerateRandomResponse);
+
+  // Health and monitoring
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
 }
 
 // ── Common types ─────────────────────────────────────────────────────────────
@@ -151,6 +164,69 @@ message GetAttributeValueResponse {
   repeated Attribute attributes = 1;
 }
 
+// ── Key Wrapping ─────────────────────────────────────────────────────────────
+
+message WrapKeyRequest {
+  uint64 session_handle = 1;
+  Mechanism mechanism = 2;
+  uint64 wrapping_key_handle = 3;
+  uint64 key_handle = 4;
+}
+
+message WrapKeyResponse {
+  bytes wrapped_key = 1;
+}
+
+message UnwrapKeyRequest {
+  uint64 session_handle = 1;
+  Mechanism mechanism = 2;
+  uint64 unwrapping_key_handle = 3;
+  bytes wrapped_key = 4;
+  repeated Attribute template = 5;
+}
+
+message UnwrapKeyResponse {
+  uint64 key_handle = 1;
+}
+
+message DeriveKeyRequest {
+  uint64 session_handle = 1;
+  Mechanism mechanism = 2;
+  uint64 base_key_handle = 3;
+  repeated Attribute template = 4;
+}
+
+message DeriveKeyResponse {
+  uint64 key_handle = 1;
+}
+
+message CopyObjectRequest {
+  uint64 session_handle = 1;
+  uint64 object_handle = 2;
+  repeated Attribute template = 3;
+}
+
+message CopyObjectResponse {
+  uint64 new_object_handle = 1;
+}
+
+// ── PIN Management ───────────────────────────────────────────────────────────
+
+message InitPINRequest {
+  uint64 session_handle = 1;
+  bytes pin = 2;            // bytes, not string — caller must zeroize after use
+}
+
+message InitPINResponse {}
+
+message SetPINRequest {
+  uint64 session_handle = 1;
+  bytes old_pin = 2;        // bytes, not string — caller must zeroize after use
+  bytes new_pin = 3;        // bytes, not string — caller must zeroize after use
+}
+
+message SetPINResponse {}
+
 // ── Crypto Operations ────────────────────────────────────────────────────────
 
 message SignRequest {
@@ -215,4 +291,18 @@ message GenerateRandomRequest {
 
 message GenerateRandomResponse {
   bytes random_data = 1;
+}
+
+// ── Health and Monitoring ────────────────────────────────────────────────────
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  bool healthy = 1;
+  string version = 2;
+  uint64 uptime_secs = 3;
+  uint64 active_sessions = 4;
+  uint64 total_objects = 5;
+  string crypto_backend = 6;
+  bool fips_mode = 7;
 }
