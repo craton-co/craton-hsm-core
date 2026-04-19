@@ -145,3 +145,105 @@ pub(crate) fn restrict_file_to_owner(path: &Path) -> Result<(), String> {
 
     Ok(())
 }
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    /// Smoke test: on a freshly created file, restrict_file_to_owner must
+    /// succeed. Any miscalculated ACL buffer size would cause InitializeAcl
+    /// or AddAccessAllowedAce to fail with ERROR_INSUFFICIENT_BUFFER and
+    /// surface here as Err.
+    #[test]
+    fn restrict_file_to_owner_succeeds_on_temp_file() {
+        let mut f = NamedTempFile::new().expect("create temp file");
+        writeln!(f, "hsm-test").expect("write temp file");
+
+        let path = f.path().to_path_buf();
+        restrict_file_to_owner(&path)
+            .unwrap_or_else(|e| panic!("restrict_file_to_owner failed: {e}"));
+    }
+
+    /// Readback test: after restrict_file_to_owner succeeds, the file's DACL
+    /// must parse cleanly and contain exactly one ACE at the expected
+    /// revision. This catches bugs where the ACL buffer is the wrong size
+    /// but InitializeAcl doesn't reject it (e.g. oversized buffer leaves
+    /// garbage past the ACE the OS may or may not tolerate).
+    #[test]
+    fn restricted_dacl_has_single_ace_at_expected_revision() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Security::Authorization::{
+            GetNamedSecurityInfoW, SE_FILE_OBJECT,
+        };
+        use windows_sys::Win32::Security::{
+            GetAclInformation, ACL as WIN_ACL, ACL_INFORMATION_CLASS, ACL_REVISION,
+            ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION,
+        };
+
+        let mut f = NamedTempFile::new().expect("create temp file");
+        writeln!(f, "hsm-test").expect("write temp file");
+        let path = f.path().to_path_buf();
+        restrict_file_to_owner(&path).expect("restrict_file_to_owner");
+
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        // SAFETY: we own the path, pass correctly-typed out-pointers, and
+        // free the returned security descriptor via LocalFree per docs.
+        unsafe {
+            let mut dacl: *mut WIN_ACL = std::ptr::null_mut();
+            let mut sd: *mut core::ffi::c_void = std::ptr::null_mut();
+            let rv = GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut sd,
+            );
+            assert_eq!(rv, 0, "GetNamedSecurityInfoW failed: {}", rv);
+            assert!(!dacl.is_null(), "DACL pointer was null");
+
+            // AclRevision is u8, check against the constant we used.
+            assert_eq!(
+                (*dacl).AclRevision,
+                ACL_REVISION as u8,
+                "unexpected ACL revision",
+            );
+
+            // Exactly one ACE — the owner grant we installed.
+            const ACL_SIZE_INFO: ACL_INFORMATION_CLASS = 2;
+            let mut info = ACL_SIZE_INFORMATION {
+                AceCount: 0,
+                AclBytesInUse: 0,
+                AclBytesFree: 0,
+            };
+            let ok = GetAclInformation(
+                dacl,
+                (&mut info) as *mut _ as *mut core::ffi::c_void,
+                std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                ACL_SIZE_INFO,
+            );
+            assert_ne!(ok, 0, "GetAclInformation failed");
+            assert_eq!(info.AceCount, 1, "expected exactly one ACE, got {}", info.AceCount);
+            assert_eq!(
+                info.AclBytesFree, 0,
+                "ACL buffer was oversized by {} bytes — indicates miscalculated size",
+                info.AclBytesFree,
+            );
+
+            // Note: GetNamedSecurityInfoW allocates `sd` and the caller must
+            // LocalFree it. We intentionally leak it here — the test process
+            // exits immediately after, and avoiding LocalFree means we don't
+            // need to add a windows-sys feature for it just to run a test.
+            let _ = sd;
+        }
+    }
+}
