@@ -365,8 +365,10 @@ impl PersistentReplayGuard {
                     HsmError::GeneralError
                 })?;
 
-            // Set restrictive permissions on first creation
-            crate::store::encrypted_store::set_restrictive_permissions(path);
+            // Set restrictive permissions on first creation. Failure is fatal:
+            // the replay guard records consumed backup IDs and must not be
+            // readable by other local users.
+            crate::store::encrypted_store::set_restrictive_permissions(path)?;
 
             // Acquire exclusive lock to prevent TOCTOU race between
             // is_consumed() check and record() in concurrent processes.

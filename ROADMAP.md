@@ -58,9 +58,18 @@ Audit log export (JSON, NDJSON, syslog RFC 5424), audit chain verification, admi
   - *Lock contention & concurrency (P4–P5: ~5-10%)*
     - [ ] **TLS session cache**: Cache `Arc<RwLock<Session>>` in thread-local alongside `CACHED_HSM` to skip DashMap shard lock on every C_* call
     - [ ] **Simplify `get_hsm()` TLS path**: Avoid `Arc::clone` on cache hit; use pinned reference or `RefCell` borrow
+    - [ ] **Drop persist lock before disk I/O**: `store/attributes.rs:183-219` holds the per-object Mutex across `serde_json::to_vec` + redb `store_encrypted`; clone the 32-byte wrap key, release the lock, then do I/O so concurrent sessions don't serialize on the disk path
+    - [ ] **O(1) `logout_all` via per-slot session index**: `session/manager.rs:341-356` iterates the entire DashMap under shard read-locks just to find sessions for one slot; maintain a `HashMap<CK_SLOT_ID, Vec<Handle>>` side index
   - *Allocation reduction (P6: ~3-5%)*
     - [ ] **Stack-allocate signature buffers**: ECDSA/Ed25519 signatures fit in ≤144 bytes; use `ArrayVec<u8, 512>` instead of heap `Vec<u8>` in sign functions
     - [ ] **Pass output buffer from C ABI to backend**: PKCS#11 callers already provide output buffers; thread them through to crypto backend to eliminate intermediate allocations
+    - [ ] **Eliminate `.as_bytes().to_vec()` in sign/wrap hot paths**: `pkcs11_abi/functions.rs:1094, 4454, 5061, 5085, 5181, 5333` copy full key material per call before invoking crypto; thread `&[u8]` borrows through the crypto API instead
+    - [ ] **Defer label conversion in lifecycle sweep**: `store/attributes.rs:413, 423` always materializes `String::from_utf8_lossy(...).to_string()` even when no debug logging fires; keep the `Cow` and only allocate at the log call site
+    - [ ] **Binary serialization for `StoredObject`**: `store/attributes.rs:140-145` documents `serde_json`'s unzeroized intermediate buffers as a residual risk; switching to `bincode` / `postcard` removes both the per-persist perf cost and the residual key-fragment exposure
+  - *Storage & lookup*
+    - [ ] **Secondary attribute index for `C_FindObjectsInit`**: `store/attributes.rs:387-396` read-locks every object on every template match; add a `HashMap<(CKA_CLASS, CKA_KEY_TYPE), Vec<Handle>>` so highly selective templates skip non-matching objects entirely instead of scanning the full map
+    - [ ] **Smarter cache eviction in `sign.rs`**: `evict_one_if_full` (`crypto/sign.rs:62-69`) uses `iter().next() + clone` under a DashMap shard lock — switch to `DashMap::retain` or a small LRU to avoid the runtime clone-per-eviction
+    - [ ] **Optional batched commits in encrypted store**: `redb` fsyncs every `C_CreateObject` / `C_DestroyObject`; expose a config flag for bulk-provisioning workloads where `C_Finalize` (or an explicit flush threshold) is the natural sync point
   - *Build & CI*
     - [x] **CI test split**: Parallel-safe crypto tests (92 tests, `--test-threads=8`) vs serial PKCS#11 ABI tests (625 tests, `--test-threads=1`)
     - [ ] **`cargo-nextest` evaluation**: Per-process test isolation would eliminate `--test-threads=1` requirement entirely

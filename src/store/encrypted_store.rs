@@ -68,7 +68,8 @@ impl EncryptedStore {
 
                 // Set restrictive permissions on the lock file to prevent
                 // other users from observing HSM operation timing.
-                set_restrictive_permissions(&lock_path);
+                // Failure here is fatal — see set_restrictive_permissions docs.
+                set_restrictive_permissions(&lock_path)?;
 
                 use fs2::FileExt;
                 lock_file.try_lock_exclusive().map_err(|e| {
@@ -82,7 +83,8 @@ impl EncryptedStore {
                 })?;
 
                 // Set restrictive permissions on the database file itself.
-                set_restrictive_permissions(&PathBuf::from(p));
+                // Failure here is fatal — refuse to open a world-readable HSM DB.
+                set_restrictive_permissions(&PathBuf::from(p))?;
 
                 Ok(Self {
                     db: Some(db),
@@ -283,29 +285,71 @@ impl EncryptedStore {
 /// Set restrictive file permissions (owner-only read/write) on a path.
 /// On Unix, sets mode 0o600. On Windows, sets a DACL granting only the
 /// current user GENERIC_ALL access (removing inherited ACEs).
-pub fn set_restrictive_permissions(path: &std::path::Path) {
+///
+/// Failures are treated as **fatal**: a permission setting that silently
+/// no-ops would leave HSM-managed files (database, lock, replay guard)
+/// readable to other local users — exactly the threat this function
+/// exists to defend against. Callers that need to tolerate environments
+/// where permission changes cannot succeed (e.g., constrained containers,
+/// network filesystems without ACL support) should explicitly opt into
+/// the permissive path via [`set_restrictive_permissions_or_warn`].
+pub fn set_restrictive_permissions(path: &std::path::Path) -> HsmResult<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
-            tracing::warn!(
-                "Failed to set restrictive permissions on '{}': {}",
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+            tracing::error!(
+                "Failed to set restrictive permissions on '{}': {} — refusing to continue with \
+                 a potentially world-readable HSM file. Set explicit permissive mode if your \
+                 environment cannot honor 0o600.",
                 path.display(),
                 e
             );
-        }
+            HsmError::GeneralError
+        })?;
+        Ok(())
     }
     #[cfg(windows)]
     {
-        set_restrictive_permissions_windows(path);
+        set_restrictive_permissions_windows(path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        // No supported permission model on this target; refuse rather than
+        // silently leave the file world-accessible.
+        tracing::error!(
+            "No restrictive-permission backend for this target; cannot protect '{}'",
+            path.display()
+        );
+        Err(HsmError::GeneralError)
+    }
+}
+
+/// Permissive variant of [`set_restrictive_permissions`]. Logs a warning
+/// on failure and continues. Use **only** when the caller has made an
+/// informed choice that running with potentially loose permissions is
+/// acceptable (e.g., test harnesses, opt-in deployment configurations).
+#[allow(dead_code)]
+pub fn set_restrictive_permissions_or_warn(path: &std::path::Path) {
+    if let Err(_e) = set_restrictive_permissions(path) {
+        tracing::warn!(
+            "Continuing despite failure to restrict permissions on '{}' — file may be \
+             accessible to other local users",
+            path.display()
+        );
     }
 }
 
 /// Windows implementation: set a DACL that grants only the current user
 /// GENERIC_ALL, removing any inherited permissions from parent directories.
+///
+/// Returns `Err(HsmError::GeneralError)` on any FFI failure — silently
+/// succeeding here would leave the file with whatever inherited ACEs the
+/// parent directory has, which on a multi-user Windows host can include
+/// `Users` or `Authenticated Users` reads.
 #[cfg(windows)]
 #[allow(unsafe_code)]
-fn set_restrictive_permissions_windows(path: &std::path::Path) {
+fn set_restrictive_permissions_windows(path: &std::path::Path) -> HsmResult<()> {
     use std::os::windows::ffi::OsStrExt;
 
     // Convert path to null-terminated wide string
@@ -332,11 +376,11 @@ fn set_restrictive_permissions_windows(path: &std::path::Path) {
         // Get current user's SID from the process token
         let mut token_handle = std::ptr::null_mut();
         if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token_handle) == 0 {
-            tracing::warn!(
+            tracing::error!(
                 "Failed to open process token for ACL setup on '{}'",
                 path.display()
             );
-            return;
+            return Err(HsmError::GeneralError);
         }
 
         // Query token user info size
@@ -350,8 +394,8 @@ fn set_restrictive_permissions_windows(path: &std::path::Path) {
         );
         if needed == 0 {
             CloseHandle(token_handle);
-            tracing::warn!("Failed to query token user size for '{}'", path.display());
-            return;
+            tracing::error!("Failed to query token user size for '{}'", path.display());
+            return Err(HsmError::GeneralError);
         }
 
         let mut token_buf: Vec<u8> = vec![0u8; needed as usize];
@@ -364,8 +408,8 @@ fn set_restrictive_permissions_windows(path: &std::path::Path) {
         ) == 0
         {
             CloseHandle(token_handle);
-            tracing::warn!("Failed to get token user info for '{}'", path.display());
-            return;
+            tracing::error!("Failed to get token user info for '{}'", path.display());
+            return Err(HsmError::GeneralError);
         }
         CloseHandle(token_handle);
 
@@ -389,12 +433,12 @@ fn set_restrictive_permissions_windows(path: &std::path::Path) {
         let mut new_acl: *mut ACL = std::ptr::null_mut();
         let result = SetEntriesInAclW(1, &ea, std::ptr::null(), &mut new_acl);
         if result != 0 {
-            tracing::warn!(
+            tracing::error!(
                 "SetEntriesInAclW failed ({}) for '{}'",
                 result,
                 path.display()
             );
-            return;
+            return Err(HsmError::GeneralError);
         }
 
         // Apply the DACL to the file with PROTECTED flag to block inheritance
@@ -407,16 +451,24 @@ fn set_restrictive_permissions_windows(path: &std::path::Path) {
             new_acl,
             std::ptr::null_mut(),
         );
-        if result != 0 {
-            tracing::warn!(
+        let apply_err = if result != 0 {
+            tracing::error!(
                 "SetNamedSecurityInfoW failed ({}) for '{}'",
                 result,
                 path.display()
             );
-        }
+            Some(HsmError::GeneralError)
+        } else {
+            None
+        };
 
         if !new_acl.is_null() {
             LocalFree(new_acl as *mut _);
+        }
+
+        match apply_err {
+            Some(e) => Err(e),
+            None => Ok(()),
         }
     }
 }
