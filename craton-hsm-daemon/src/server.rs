@@ -51,6 +51,8 @@ pub struct HsmServiceImpl {
     init_token_attempts: std::sync::Mutex<HashMap<CK_ULONG, LoginThrottle>>,
     max_login_attempts: u32,
     login_cooldown: std::time::Duration,
+    /// Timestamp when the daemon was started, used for HealthCheck uptime reporting.
+    started_at: Instant,
 }
 
 impl HsmServiceImpl {
@@ -75,6 +77,7 @@ impl HsmServiceImpl {
             init_token_attempts: std::sync::Mutex::new(HashMap::new()),
             max_login_attempts,
             login_cooldown: std::time::Duration::from_secs(login_cooldown_secs),
+            started_at: Instant::now(),
         }
     }
 
@@ -1627,6 +1630,580 @@ impl HsmService for HsmServiceImpl {
 
         Ok(Response::new(GenerateRandomResponse { random_data: buf }))
     }
+
+    async fn wrap_key(
+        &self,
+        request: Request<WrapKeyRequest>,
+    ) -> Result<Response<WrapKeyResponse>, Status> {
+        let req = request.into_inner();
+        let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
+
+        let mech = req
+            .mechanism
+            .ok_or_else(|| Status::invalid_argument("mechanism required"))?;
+        let mech_type = to_ck_ulong(mech.mechanism_type, "mechanism_type")?;
+
+        if !craton_hsm::crypto::mechanisms::is_wrap_mechanism(mech_type) {
+            return Err(Status::invalid_argument("Unsupported wrapping mechanism"));
+        }
+
+        craton_hsm::crypto::mechanisms::validate_mechanism_for_policy(
+            mech_type,
+            self.hsm.algorithm_config(),
+            false,
+        )
+        .map_err(|_| Status::permission_denied("Mechanism blocked by algorithm policy"))?;
+
+        let fips_mode = self.hsm.algorithm_config().fips_approved_only;
+        let fips_approved = craton_hsm::crypto::mechanisms::is_fips_approved(mech_type);
+
+        let wrapping_handle = to_ck_ulong(req.wrapping_key_handle, "wrapping_key_handle")?;
+        let key_handle = to_ck_ulong(req.key_handle, "key_handle")?;
+
+        // Get wrapping key
+        let wrap_obj = self
+            .hsm
+            .object_store()
+            .get_object(wrapping_handle)
+            .map_err(hsm_err_to_status)?;
+        let wrap_key = wrap_obj.read();
+        if wrap_key.slot_id != slot_id {
+            return Err(Status::not_found("Wrapping key not found"));
+        }
+        if !wrap_key.can_wrap {
+            return Err(Status::permission_denied("Key cannot be used for wrapping"));
+        }
+
+        // Get key to wrap
+        let target_obj = self
+            .hsm
+            .object_store()
+            .get_object(key_handle)
+            .map_err(hsm_err_to_status)?;
+        let target_key = target_obj.read();
+        if target_key.slot_id != slot_id {
+            return Err(Status::not_found("Key not found"));
+        }
+        if !target_key.extractable {
+            return Err(Status::permission_denied(
+                "Key is not extractable — cannot wrap",
+            ));
+        }
+
+        let wrapping_material = wrap_key
+            .key_material
+            .as_ref()
+            .ok_or_else(|| Status::internal("Wrapping key has no material"))?
+            .as_bytes();
+        let key_material = target_key
+            .key_material
+            .as_ref()
+            .ok_or_else(|| Status::internal("Key has no material"))?
+            .as_bytes();
+
+        let wrapped_key = match mech_type {
+            CKM_AES_KEY_WRAP | CKM_AES_KEY_WRAP_KWP => {
+                craton_hsm::crypto::wrap::aes_key_wrap(wrapping_material, key_material, fips_mode)
+                    .map_err(hsm_err_to_status)?
+            }
+            _ => return Err(Status::invalid_argument("Unsupported wrapping mechanism")),
+        };
+
+        drop(wrap_key);
+        drop(target_key);
+
+        self.audit(
+            req.session_handle,
+            AuditOperation::WrapKey {
+                mechanism: mech_type as u64,
+                fips_approved,
+            },
+            AuditResult::Success,
+            Some(format!(
+                "wrapping_key={}, wrapped_key={}",
+                req.wrapping_key_handle, req.key_handle
+            )),
+        )?;
+
+        Ok(Response::new(WrapKeyResponse { wrapped_key }))
+    }
+
+    async fn unwrap_key(
+        &self,
+        request: Request<UnwrapKeyRequest>,
+    ) -> Result<Response<UnwrapKeyResponse>, Status> {
+        let req = request.into_inner();
+        let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
+
+        let mech = req
+            .mechanism
+            .ok_or_else(|| Status::invalid_argument("mechanism required"))?;
+        let mech_type = to_ck_ulong(mech.mechanism_type, "mechanism_type")?;
+
+        if !craton_hsm::crypto::mechanisms::is_wrap_mechanism(mech_type) {
+            return Err(Status::invalid_argument("Unsupported unwrapping mechanism"));
+        }
+
+        craton_hsm::crypto::mechanisms::validate_mechanism_for_policy(
+            mech_type,
+            self.hsm.algorithm_config(),
+            false,
+        )
+        .map_err(|_| Status::permission_denied("Mechanism blocked by algorithm policy"))?;
+
+        let fips_mode = self.hsm.algorithm_config().fips_approved_only;
+        let fips_approved = craton_hsm::crypto::mechanisms::is_fips_approved(mech_type);
+
+        let unwrapping_handle = to_ck_ulong(req.unwrapping_key_handle, "unwrapping_key_handle")?;
+
+        // Get unwrapping key
+        let unwrap_obj = self
+            .hsm
+            .object_store()
+            .get_object(unwrapping_handle)
+            .map_err(hsm_err_to_status)?;
+        let unwrap_key = unwrap_obj.read();
+        if unwrap_key.slot_id != slot_id {
+            return Err(Status::not_found("Unwrapping key not found"));
+        }
+        if !unwrap_key.can_unwrap {
+            return Err(Status::permission_denied(
+                "Key cannot be used for unwrapping",
+            ));
+        }
+
+        let unwrapping_material = unwrap_key
+            .key_material
+            .as_ref()
+            .ok_or_else(|| Status::internal("Unwrapping key has no material"))?
+            .as_bytes();
+
+        let key_material = match mech_type {
+            CKM_AES_KEY_WRAP | CKM_AES_KEY_WRAP_KWP => craton_hsm::crypto::wrap::aes_key_unwrap(
+                unwrapping_material,
+                &req.wrapped_key,
+                fips_mode,
+            )
+            .map_err(hsm_err_to_status)?,
+            _ => return Err(Status::invalid_argument("Unsupported unwrapping mechanism")),
+        };
+
+        drop(unwrap_key);
+
+        // Build a new secret key object from the unwrapped material
+        let template = proto_attrs_to_template(&req.template)?;
+        let handle = self
+            .hsm
+            .object_store()
+            .next_handle()
+            .map_err(hsm_err_to_status)?;
+
+        let mut obj = craton_hsm::store::object::StoredObject::new(handle, CKO_SECRET_KEY);
+        obj.slot_id = slot_id;
+        // Use key type from template if specified, default to CKK_GENERIC_SECRET
+        let key_type = template
+            .iter()
+            .find(|(attr_type, _)| *attr_type == CKA_KEY_TYPE)
+            .and_then(|(_, value)| {
+                if value.len() >= std::mem::size_of::<CK_ULONG>() {
+                    Some(CK_ULONG::from_ne_bytes(
+                        value[..std::mem::size_of::<CK_ULONG>()].try_into().ok()?,
+                    ))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(CKK_GENERIC_SECRET);
+        obj.key_type = Some(key_type);
+        obj.value_len = Some(key_material.len() as CK_ULONG);
+        obj.key_material = Some(craton_hsm::store::key_material::RawKeyMaterial::new(
+            key_material,
+        ));
+        obj.sensitive = true;
+        obj.extractable = false;
+
+        // Apply template attributes
+        for (attr_type, value) in &template {
+            craton_hsm::store::attributes::apply_attribute(&mut obj, *attr_type, value)
+                .map_err(hsm_err_to_status)?;
+        }
+
+        let new_handle = self
+            .hsm
+            .object_store()
+            .insert_object(obj)
+            .map_err(hsm_err_to_status)?;
+
+        self.audit(
+            req.session_handle,
+            AuditOperation::UnwrapKey {
+                mechanism: mech_type as u64,
+                fips_approved,
+            },
+            AuditResult::Success,
+            Some(format!(
+                "unwrapping_key={}, new_key={}",
+                req.unwrapping_key_handle, new_handle
+            )),
+        )?;
+
+        Ok(Response::new(UnwrapKeyResponse {
+            key_handle: new_handle as u64,
+        }))
+    }
+
+    async fn derive_key(
+        &self,
+        request: Request<DeriveKeyRequest>,
+    ) -> Result<Response<DeriveKeyResponse>, Status> {
+        let req = request.into_inner();
+        let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
+
+        let mech = req
+            .mechanism
+            .ok_or_else(|| Status::invalid_argument("mechanism required"))?;
+        let mech_type = to_ck_ulong(mech.mechanism_type, "mechanism_type")?;
+
+        if !craton_hsm::crypto::mechanisms::is_derive_mechanism(mech_type) {
+            return Err(Status::invalid_argument("Unsupported derivation mechanism"));
+        }
+
+        craton_hsm::crypto::mechanisms::validate_mechanism_for_policy(
+            mech_type,
+            self.hsm.algorithm_config(),
+            false,
+        )
+        .map_err(|_| Status::permission_denied("Mechanism blocked by algorithm policy"))?;
+
+        let fips_approved = craton_hsm::crypto::mechanisms::is_fips_approved(mech_type);
+
+        let base_handle = to_ck_ulong(req.base_key_handle, "base_key_handle")?;
+
+        // Get base key
+        let base_obj = self
+            .hsm
+            .object_store()
+            .get_object(base_handle)
+            .map_err(hsm_err_to_status)?;
+        let base_key = base_obj.read();
+        if base_key.slot_id != slot_id {
+            return Err(Status::not_found("Base key not found"));
+        }
+        if !base_key.can_derive {
+            return Err(Status::permission_denied(
+                "Key cannot be used for derivation",
+            ));
+        }
+
+        let base_material = base_key
+            .key_material
+            .as_ref()
+            .ok_or_else(|| Status::internal("Base key has no material"))?
+            .as_bytes();
+
+        // The mechanism parameter carries the peer public key for ECDH
+        let peer_public_key = &mech.parameter;
+        if peer_public_key.is_empty() {
+            return Err(Status::invalid_argument(
+                "Mechanism parameter must contain the peer public key",
+            ));
+        }
+
+        // Parse CKA_VALUE_LEN from template for desired derived key length
+        let template = proto_attrs_to_template(&req.template)?;
+        let derived_len = template
+            .iter()
+            .find(|(t, _)| *t == CKA_VALUE_LEN)
+            .and_then(|(_, v)| craton_hsm::store::attributes::read_ck_ulong(v));
+
+        let derived_material = match mech_type {
+            CKM_ECDH1_DERIVE | CKM_ECDH1_COFACTOR_DERIVE => {
+                let ec_params = base_key.ec_params.as_deref().unwrap_or(&[]);
+                if is_p384_ec_params(ec_params) {
+                    craton_hsm::crypto::derive::ecdh_p384(
+                        base_material,
+                        peer_public_key,
+                        derived_len.map(|v| v as usize),
+                    )
+                    .map_err(hsm_err_to_status)?
+                } else if is_p256_ec_params(ec_params) {
+                    craton_hsm::crypto::derive::ecdh_p256(
+                        base_material,
+                        peer_public_key,
+                        derived_len.map(|v| v as usize),
+                    )
+                    .map_err(hsm_err_to_status)?
+                } else {
+                    return Err(Status::invalid_argument(
+                        "Unsupported EC parameters — only P-256 and P-384 are supported",
+                    ));
+                }
+            }
+            _ => return Err(Status::invalid_argument("Unsupported derivation mechanism")),
+        };
+
+        drop(base_key);
+
+        // Build new derived key object
+        let handle = self
+            .hsm
+            .object_store()
+            .next_handle()
+            .map_err(hsm_err_to_status)?;
+
+        let derived_len_actual = derived_material.as_bytes().len();
+        let mut obj = craton_hsm::store::object::StoredObject::new(handle, CKO_SECRET_KEY);
+        obj.slot_id = slot_id;
+        obj.key_type = Some(CKK_GENERIC_SECRET);
+        obj.value_len = Some(derived_len_actual as CK_ULONG);
+        obj.key_material = Some(derived_material);
+        obj.sensitive = true;
+        obj.extractable = false;
+
+        // Apply template attributes (label, CKA_ENCRYPT, etc.)
+        for (attr_type, value) in &template {
+            if *attr_type == CKA_VALUE_LEN {
+                continue; // already handled
+            }
+            craton_hsm::store::attributes::apply_attribute(&mut obj, *attr_type, value)
+                .map_err(hsm_err_to_status)?;
+        }
+
+        let new_handle = self
+            .hsm
+            .object_store()
+            .insert_object(obj)
+            .map_err(hsm_err_to_status)?;
+
+        self.audit(
+            req.session_handle,
+            AuditOperation::DeriveKey {
+                mechanism: mech_type as u64,
+                fips_approved,
+            },
+            AuditResult::Success,
+            Some(format!(
+                "base_key={}, derived_key={}",
+                req.base_key_handle, new_handle
+            )),
+        )?;
+
+        Ok(Response::new(DeriveKeyResponse {
+            key_handle: new_handle as u64,
+        }))
+    }
+
+    async fn copy_object(
+        &self,
+        request: Request<CopyObjectRequest>,
+    ) -> Result<Response<CopyObjectResponse>, Status> {
+        let req = request.into_inner();
+        let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
+
+        let object_handle = to_ck_ulong(req.object_handle, "object_handle")?;
+
+        // Get the source object
+        let src_obj = self
+            .hsm
+            .object_store()
+            .get_object(object_handle)
+            .map_err(hsm_err_to_status)?;
+        let src = src_obj.read();
+
+        if src.slot_id != slot_id {
+            return Err(Status::not_found("Object not found"));
+        }
+
+        // Clone the object
+        let new_handle_val = self
+            .hsm
+            .object_store()
+            .next_handle()
+            .map_err(hsm_err_to_status)?;
+
+        // PKCS#11: CKA_COPYABLE must be true to allow copying
+        if !src.copyable {
+            return Err(Status::permission_denied("Object is not copyable"));
+        }
+
+        let mut new_obj = craton_hsm::store::object::StoredObject::new(new_handle_val, src.class);
+        new_obj.slot_id = slot_id;
+        new_obj.key_type = src.key_type;
+        new_obj.value_len = src.value_len;
+        new_obj.key_material = src.key_material.clone();
+        new_obj.modulus = src.modulus.clone();
+        new_obj.modulus_bits = src.modulus_bits;
+        new_obj.public_exponent = src.public_exponent.clone();
+        new_obj.ec_params = src.ec_params.clone();
+        new_obj.ec_point = src.ec_point.clone();
+        new_obj.can_encrypt = src.can_encrypt;
+        new_obj.can_decrypt = src.can_decrypt;
+        new_obj.can_sign = src.can_sign;
+        new_obj.can_verify = src.can_verify;
+        new_obj.can_wrap = src.can_wrap;
+        new_obj.can_unwrap = src.can_unwrap;
+        new_obj.can_derive = src.can_derive;
+        new_obj.sensitive = src.sensitive;
+        new_obj.extractable = src.extractable;
+        new_obj.private = src.private;
+        new_obj.label = src.label.clone();
+        new_obj.token_object = src.token_object;
+        new_obj.id = src.id.clone();
+
+        // Save source security attributes before releasing the read lock
+        let src_sensitive = src.sensitive;
+        let src_extractable = src.extractable;
+
+        drop(src);
+
+        // Apply template overrides
+        let template = proto_attrs_to_template(&req.template)?;
+        for (attr_type, value) in &template {
+            craton_hsm::store::attributes::apply_attribute(&mut new_obj, *attr_type, value)
+                .map_err(hsm_err_to_status)?;
+        }
+
+        // PKCS#11 §5.7: CKA_SENSITIVE can only be set to TRUE, never weakened
+        if src_sensitive && !new_obj.sensitive {
+            return Err(Status::permission_denied(
+                "Cannot weaken CKA_SENSITIVE on copy",
+            ));
+        }
+        // PKCS#11 §5.7: CKA_EXTRACTABLE can only be set to FALSE, never weakened
+        if !src_extractable && new_obj.extractable {
+            return Err(Status::permission_denied(
+                "Cannot weaken CKA_EXTRACTABLE on copy",
+            ));
+        }
+
+        let inserted_handle = self
+            .hsm
+            .object_store()
+            .insert_object(new_obj)
+            .map_err(hsm_err_to_status)?;
+
+        self.audit(
+            req.session_handle,
+            AuditOperation::CreateObject,
+            AuditResult::Success,
+            Some(format!(
+                "copied from={}, new={}",
+                req.object_handle, inserted_handle
+            )),
+        )?;
+
+        Ok(Response::new(CopyObjectResponse {
+            new_object_handle: inserted_handle as u64,
+        }))
+    }
+
+    async fn init_pin(
+        &self,
+        request: Request<InitPinRequest>,
+    ) -> Result<Response<InitPinResponse>, Status> {
+        let mut req = request.into_inner();
+
+        // InitPIN requires SO to be logged in — the session must exist and be authenticated
+        let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
+
+        // C_InitPIN requires SO login — verify session state
+        let session = self
+            .hsm
+            .session_manager()
+            .get_session(
+                req.session_handle
+                    .try_into()
+                    .map_err(|_| Status::invalid_argument("bad handle"))?,
+            )
+            .map_err(hsm_err_to_status)?;
+        {
+            let s = session.read();
+            if !s.state.is_so() {
+                return Err(Status::permission_denied("C_InitPIN requires SO login"));
+            }
+        }
+
+        let token = self
+            .hsm
+            .slot_manager()
+            .get_token(slot_id)
+            .map_err(hsm_err_to_status)?;
+
+        let result = token.init_pin(&req.pin);
+
+        // Zeroize PIN material immediately after use, regardless of outcome
+        req.pin.zeroize();
+
+        result.map_err(hsm_err_to_status)?;
+
+        self.audit(
+            req.session_handle,
+            AuditOperation::InitPIN {
+                slot_id: slot_id as u64,
+            },
+            AuditResult::Success,
+            None,
+        )?;
+
+        Ok(Response::new(InitPinResponse {}))
+    }
+
+    async fn set_pin(
+        &self,
+        request: Request<SetPinRequest>,
+    ) -> Result<Response<SetPinResponse>, Status> {
+        let mut req = request.into_inner();
+
+        // SetPIN requires the user (or SO) to be logged in
+        let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
+
+        let token = self
+            .hsm
+            .slot_manager()
+            .get_token(slot_id)
+            .map_err(hsm_err_to_status)?;
+
+        let result = token.set_pin(&req.old_pin, &req.new_pin);
+
+        // Zeroize PIN material immediately after use, regardless of outcome
+        req.old_pin.zeroize();
+        req.new_pin.zeroize();
+
+        result.map_err(hsm_err_to_status)?;
+
+        self.audit(
+            req.session_handle,
+            AuditOperation::SetPIN,
+            AuditResult::Success,
+            Some("set_pin".to_string()),
+        )?;
+
+        Ok(Response::new(SetPinResponse {}))
+    }
+
+    async fn health_check(
+        &self,
+        _request: Request<HealthCheckRequest>,
+    ) -> Result<Response<HealthCheckResponse>, Status> {
+        // health_check is intentionally unauthenticated for load balancer probes.
+        // Only expose non-sensitive information (healthy status, version, uptime).
+        // Operational state (active_sessions, total_objects) is set to 0 to avoid
+        // leaking internal state to unauthenticated callers.
+        let uptime = self.started_at.elapsed().as_secs();
+
+        // Use actual crypto backend from configuration instead of hardcoded string
+        let crypto_backend = self.hsm.algorithm_config().crypto_backend.clone();
+
+        Ok(Response::new(HealthCheckResponse {
+            healthy: true,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            uptime_secs: uptime,
+            active_sessions: 0,
+            total_objects: 0,
+            crypto_backend,
+            fips_mode: false,
+        }))
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -1672,6 +2249,13 @@ fn evict_expired_throttle_entries(map: &mut HashMap<CK_ULONG, LoginThrottle>) {
             break;
         }
     }
+}
+
+/// Check if EC params correspond to P-256 (secp256r1 / prime256v1).
+/// OID for secp256r1: 1.2.840.10045.3.1.7 = 06 08 2A 86 48 CE 3D 03 01 07
+fn is_p256_ec_params(ec_params: &[u8]) -> bool {
+    const P256_OID: &[u8] = &[0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07];
+    ec_params == P256_OID || ec_params.windows(P256_OID.len()).any(|w| w == P256_OID)
 }
 
 /// Check if EC params correspond to P-384 (secp384r1).
@@ -1790,5 +2374,7 @@ fn hsm_err_to_status(e: craton_hsm::error::HsmError) -> Status {
         | HsmError::DeviceMemory
         | HsmError::ConfigError(_)
         | HsmError::AuditChainBroken(_) => Status::internal("Internal error"),
+
+        HsmError::SessionClosed => Status::aborted("Session closed"),
     }
 }
