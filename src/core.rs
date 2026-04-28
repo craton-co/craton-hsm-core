@@ -7,7 +7,10 @@ use std::sync::Arc;
 use crate::audit::log::AuditLog;
 use crate::config::{AlgorithmConfig, HsmConfig};
 use crate::crypto::backend::CryptoBackend;
+use crate::crypto::conditional_test::ConditionalSelfTest;
 use crate::crypto::drbg::HmacDrbg;
+use crate::crypto::metrics::MetricsCollector;
+use crate::crypto::rate_limit::RateLimiter;
 #[cfg(feature = "rustcrypto-backend")]
 use crate::crypto::rustcrypto_backend::RustCryptoBackend;
 use crate::session::manager::SessionManager;
@@ -34,6 +37,13 @@ pub struct HsmCore {
     /// time to prevent callers from tampering with saved state (e.g., swapping
     /// key handles or mechanisms).
     pub(crate) state_hmac_key: Zeroizing<[u8; 32]>,
+    /// FIPS 140-3 conditional self-test tracker. Ensures each algorithm family
+    /// passes a KAT before first use.
+    pub(crate) conditional_self_test: ConditionalSelfTest,
+    /// Lock-free metrics collector for operation observability.
+    pub(crate) metrics: MetricsCollector,
+    /// Per-session and global rate limiter for crypto operations.
+    pub(crate) rate_limiter: RateLimiter,
 }
 
 impl HsmCore {
@@ -79,7 +89,8 @@ impl HsmCore {
 
             other => {
                 tracing::warn!(
-                    "Unknown crypto_backend '{}' in config; using default",
+                    "Unknown crypto_backend '{}' in config; use HsmCore::new_with_backend() \
+                     to inject enterprise backends (openssl, cng, pkcs11-passthrough)",
                     other
                 );
             }
@@ -129,6 +140,13 @@ impl HsmCore {
     /// seeded (e.g., OS entropy source unavailable).
     pub fn try_new(config: &HsmConfig) -> Result<Self, crate::error::HsmError> {
         let drbg = HmacDrbg::new().map_err(|_| crate::error::HsmError::GeneralError)?;
+        let audit_log = if config.audit.enabled {
+            AuditLog::new_with_path(config.audit.log_path.clone())?
+        } else {
+            AuditLog::new()
+        };
+        // Install global zeroization audit sink
+        crate::audit::log::set_zeroization_audit_sink(&audit_log);
         Ok(Self {
             slot_manager: SlotManager::new_with_config(config),
             session_manager: SessionManager::new(),
@@ -148,6 +166,9 @@ impl HsmCore {
             algorithm_config: config.algorithms.clone(),
             serial_number: Self::make_serial(config),
             state_hmac_key: Self::generate_state_hmac_key(),
+            conditional_self_test: ConditionalSelfTest::new(),
+            metrics: MetricsCollector::new(true),
+            rate_limiter: RateLimiter::new(&config.rate_limit),
         })
     }
 
@@ -171,6 +192,12 @@ impl HsmCore {
         backend: Arc<dyn CryptoBackend>,
     ) -> Result<Self, crate::error::HsmError> {
         let drbg = HmacDrbg::new().map_err(|_| crate::error::HsmError::GeneralError)?;
+        let audit_log = if config.audit.enabled {
+            AuditLog::new_with_path(config.audit.log_path.clone())?
+        } else {
+            AuditLog::new()
+        };
+        crate::audit::log::set_zeroization_audit_sink(&audit_log);
         Ok(Self {
             slot_manager: SlotManager::new_with_config(config),
             session_manager: SessionManager::new(),
@@ -190,6 +217,9 @@ impl HsmCore {
             algorithm_config: config.algorithms.clone(),
             serial_number: Self::make_serial(config),
             state_hmac_key: Self::generate_state_hmac_key(),
+            conditional_self_test: ConditionalSelfTest::new(),
+            metrics: MetricsCollector::new(true),
+            rate_limiter: RateLimiter::new(&config.rate_limit),
         })
     }
 
@@ -240,5 +270,10 @@ impl HsmCore {
     /// Returns a reference to the HMAC_DRBG instance (SP 800-90A).
     pub fn drbg(&self) -> &parking_lot::Mutex<HmacDrbg> {
         &self.drbg
+    }
+
+    /// Returns a reference to the metrics collector.
+    pub fn metrics(&self) -> &MetricsCollector {
+        &self.metrics
     }
 }
