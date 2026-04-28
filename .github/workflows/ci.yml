@@ -354,7 +354,7 @@ jobs:
         uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2
 
       - name: Install cargo-tarpaulin
-        uses: taiki-e/install-action@d858f8113943481093e02986a7586a4819a3bfd6 # v2
+        uses: taiki-e/install-action@481c34c1cf3a84c68b5e46f4eccfc82af798415a # v2
         with:
           tool: cargo-tarpaulin
 
