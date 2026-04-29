@@ -19,7 +19,7 @@ fn test_extended_pkcs11_compliance() {
     assert!(rv == CKR_OK || rv == CKR_CRYPTOKI_ALREADY_INITIALIZED);
 
     // Init token with SO PIN
-    let so_pin = b"extpin12";
+    let so_pin = b"sopin123";
     let mut label = [b' '; 32];
     label[..12].copy_from_slice(b"ExtTestToken");
     let rv = C_InitToken(
@@ -323,7 +323,7 @@ fn test_extended_pkcs11_compliance() {
     // ========================================================================
     // Test 10: PIN change via C_SetPIN
     // ========================================================================
-    let new_pin = b"newuserpin";
+    let new_pin = b"newuser1pin";
     let rv = C_SetPIN(
         rw_session,
         user_pin.as_ptr() as *mut _,
