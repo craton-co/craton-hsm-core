@@ -437,12 +437,8 @@ fn test_fips_post_passes() {
     assert!(result.is_ok(), "FIPS POST should pass: {:?}", result.err());
 }
 
-#[test]
-fn test_fips_post_individual_kats() {
-    // Run POST and verify it doesn't panic
-    let result = self_test::run_post();
-    assert!(result.is_ok());
-}
+// test_fips_post_individual_kats removed — identical to test_fips_post_passes
+// and run_post() resets global IV trackers, causing races under --test-threads=8.
 
 // ============================================================================
 // StoredObject unit tests (lifecycle, size, matching)

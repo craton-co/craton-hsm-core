@@ -1182,11 +1182,11 @@ fn test_config_pbkdf2_iterations_floor() {
     use craton_hsm::config::HsmConfig;
 
     let mut config = HsmConfig::default();
-    config.security.pbkdf2_iterations = 1000; // Below 100_000 minimum
+    config.security.pbkdf2_iterations = 0; // Below minimum (1 debug, 100 000 release)
     let result = config.validate();
     assert!(
         result.is_err(),
-        "PBKDF2 iterations below 100k should be rejected"
+        "PBKDF2 iterations below minimum should be rejected"
     );
 }
 
