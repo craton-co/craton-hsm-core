@@ -5515,13 +5515,18 @@ pub extern "C" fn C_CancelFunction(_s: CK_SESSION_HANDLE) -> CK_RV {
     CKR_FUNCTION_NOT_PARALLEL
 }
 
+/// C_WaitForSlotEvent waits for a slot event (token insertion/removal).
+/// Software HSM has no physical slots, so no slot insertion/removal
+/// events ever occur, so we always return CKR_NO_EVENT.
 #[no_mangle]
 pub extern "C" fn C_WaitForSlotEvent(
     _flags: CK_FLAGS,
     _slot: CK_SLOT_ID_PTR,
     _reserved: CK_VOID_PTR,
 ) -> CK_RV {
-    not_supported()
+    // Return CKR_NO_EVENT regardless of whether CKF_DONT_BLOCK is set,
+    // since a software HSM never has physical slot events.
+    CKR_NO_EVENT
 }
 
 // ============================================================================
