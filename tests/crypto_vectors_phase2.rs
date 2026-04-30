@@ -850,7 +850,12 @@ fn test_config_defaults() {
     assert_eq!(config.security.pin_min_length, 8);
     assert_eq!(config.security.pin_max_length, 64);
     assert_eq!(config.security.max_failed_logins, 10);
-    assert_eq!(config.security.pbkdf2_iterations, 600_000);
+    // Debug builds use 1 iteration for dev speed; release builds use 600 000.
+    if cfg!(debug_assertions) {
+        assert_eq!(config.security.pbkdf2_iterations, 1);
+    } else {
+        assert_eq!(config.security.pbkdf2_iterations, 600_000);
+    }
     assert!(!config.algorithms.allow_weak_rsa);
     assert!(!config.algorithms.allow_sha1_signing);
     assert!(config.algorithms.enable_pqc);

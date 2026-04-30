@@ -28,7 +28,7 @@ fn setup_session() -> CK_SESSION_HANDLE {
     assert!(rv == CKR_OK || rv == CKR_CRYPTOKI_ALREADY_INITIALIZED);
 
     // Init token
-    let so_pin = b"12345678";
+    let so_pin = b"sopin123";
     let mut label = [b' '; 32];
     label[..9].copy_from_slice(b"TestToken");
     let rv = C_InitToken(
