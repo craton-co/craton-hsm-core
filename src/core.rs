@@ -145,22 +145,13 @@ impl HsmCore {
         } else {
             AuditLog::new()
         };
-        // Install global zeroization audit sink
-        crate::audit::log::set_zeroization_audit_sink(&audit_log);
+        let audit_log = Arc::new(audit_log);
+        audit_log.register_global_logger();
         Ok(Self {
             slot_manager: SlotManager::new_with_config(config),
             session_manager: SessionManager::new(),
             object_store: ObjectStore::new(),
-            audit_log: {
-                let log = if config.audit.enabled {
-                    AuditLog::new_with_path(config.audit.log_path.clone())?
-                } else {
-                    AuditLog::new()
-                };
-                let log = Arc::new(log);
-                log.register_global_logger();
-                log
-            },
+            audit_log,
             crypto_backend: Self::select_crypto_backend(config),
             drbg: parking_lot::Mutex::new(drbg),
             algorithm_config: config.algorithms.clone(),
@@ -168,7 +159,7 @@ impl HsmCore {
             state_hmac_key: Self::generate_state_hmac_key(),
             conditional_self_test: ConditionalSelfTest::new(),
             metrics: MetricsCollector::new(true),
-            rate_limiter: RateLimiter::new(&config.rate_limit),
+            rate_limiter: RateLimiter::disabled(),
         })
     }
 
@@ -197,21 +188,13 @@ impl HsmCore {
         } else {
             AuditLog::new()
         };
-        crate::audit::log::set_zeroization_audit_sink(&audit_log);
+        let audit_log = Arc::new(audit_log);
+        audit_log.register_global_logger();
         Ok(Self {
             slot_manager: SlotManager::new_with_config(config),
             session_manager: SessionManager::new(),
             object_store: ObjectStore::new(),
-            audit_log: {
-                let log = if config.audit.enabled {
-                    AuditLog::new_with_path(config.audit.log_path.clone())?
-                } else {
-                    AuditLog::new()
-                };
-                let log = Arc::new(log);
-                log.register_global_logger();
-                log
-            },
+            audit_log,
             crypto_backend: backend,
             drbg: parking_lot::Mutex::new(drbg),
             algorithm_config: config.algorithms.clone(),
@@ -219,7 +202,7 @@ impl HsmCore {
             state_hmac_key: Self::generate_state_hmac_key(),
             conditional_self_test: ConditionalSelfTest::new(),
             metrics: MetricsCollector::new(true),
-            rate_limiter: RateLimiter::new(&config.rate_limit),
+            rate_limiter: RateLimiter::disabled(),
         })
     }
 
