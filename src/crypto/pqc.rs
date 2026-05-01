@@ -7,7 +7,6 @@
 
 use crate::error::{HsmError, HsmResult};
 use crate::store::key_material::RawKeyMaterial;
-use ml_dsa::signature::Keypair;
 use ml_kem::KeyExport;
 
 /// DRBG-backed RNG adapter implementing rand_core 0.10 traits for PQC crates.
