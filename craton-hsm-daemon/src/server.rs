@@ -1149,15 +1149,33 @@ impl HsmService for HsmServiceImpl {
 
         let signature = match key.key_type {
             Some(CKK_RSA) => {
+                // Route through the handle-keyed cache so the daemon shares the
+                // parsed-key cache with the C ABI fast path. The (slot_id, handle)
+                // pair is stable for the lifetime of the object in the store, which
+                // matches the cache's eviction contract.
+                let cache_slot = slot_id as u64;
+                let cache_handle = key_handle as u64;
                 if craton_hsm::crypto::sign::is_pss_mechanism(mech_type) {
                     let hash_alg = craton_hsm::crypto::sign::pss_mechanism_to_hash(mech_type)
                         .map_err(hsm_err_to_status)?;
-                    craton_hsm::crypto::sign::rsa_pss_sign(key_bytes, &req.data, hash_alg)
-                        .map_err(hsm_err_to_status)?
+                    craton_hsm::crypto::sign::rsa_pss_sign_cached(
+                        cache_slot,
+                        cache_handle,
+                        key_bytes,
+                        &req.data,
+                        hash_alg,
+                    )
+                    .map_err(hsm_err_to_status)?
                 } else {
                     let hash_alg = craton_hsm::crypto::sign::mechanism_to_hash(mech_type);
-                    craton_hsm::crypto::sign::rsa_pkcs1v15_sign(key_bytes, &req.data, hash_alg)
-                        .map_err(hsm_err_to_status)?
+                    craton_hsm::crypto::sign::rsa_pkcs1v15_sign_cached(
+                        cache_slot,
+                        cache_handle,
+                        key_bytes,
+                        &req.data,
+                        hash_alg,
+                    )
+                    .map_err(hsm_err_to_status)?
                 }
             }
             Some(CKK_EC) => {
@@ -1250,10 +1268,16 @@ impl HsmService for HsmServiceImpl {
                     .as_ref()
                     .ok_or_else(|| Status::internal("RSA key missing public exponent"))?;
 
+                // Use the handle-keyed cache so the parsed RsaPublicKey is
+                // shared with the C ABI on subsequent verify calls.
+                let cache_slot = slot_id as u64;
+                let cache_handle = key_handle as u64;
                 if craton_hsm::crypto::sign::is_pss_mechanism(mech_type) {
                     let hash_alg = craton_hsm::crypto::sign::pss_mechanism_to_hash(mech_type)
                         .map_err(hsm_err_to_status)?;
-                    craton_hsm::crypto::sign::rsa_pss_verify(
+                    craton_hsm::crypto::sign::rsa_pss_verify_cached(
+                        cache_slot,
+                        cache_handle,
                         modulus,
                         pub_exp,
                         &req.data,
@@ -1263,7 +1287,9 @@ impl HsmService for HsmServiceImpl {
                     .map_err(hsm_err_to_status)?
                 } else {
                     let hash_alg = craton_hsm::crypto::sign::mechanism_to_hash(mech_type);
-                    craton_hsm::crypto::sign::rsa_pkcs1v15_verify(
+                    craton_hsm::crypto::sign::rsa_pkcs1v15_verify_cached(
+                        cache_slot,
+                        cache_handle,
                         modulus,
                         pub_exp,
                         &req.data,
@@ -1408,7 +1434,10 @@ impl HsmService for HsmServiceImpl {
                     .public_exponent
                     .as_ref()
                     .ok_or_else(|| Status::internal("RSA key missing public exponent"))?;
-                craton_hsm::crypto::sign::rsa_oaep_encrypt(
+                // Share the public-key cache with the C ABI fast path.
+                craton_hsm::crypto::sign::rsa_oaep_encrypt_cached(
+                    slot_id as u64,
+                    key_handle as u64,
                     modulus,
                     pub_exp,
                     &req.data,
@@ -1524,7 +1553,10 @@ impl HsmService for HsmServiceImpl {
                     .as_ref()
                     .ok_or_else(|| Status::internal("Key has no material"))?
                     .as_bytes();
-                craton_hsm::crypto::sign::rsa_oaep_decrypt(
+                // Share the private-key cache with the C ABI fast path.
+                craton_hsm::crypto::sign::rsa_oaep_decrypt_cached(
+                    slot_id as u64,
+                    key_handle as u64,
                     key_bytes,
                     &req.encrypted_data,
                     craton_hsm::crypto::sign::OaepHash::Sha256,
@@ -2376,5 +2408,173 @@ fn hsm_err_to_status(e: craton_hsm::error::HsmError) -> Status {
         | HsmError::AuditChainBroken(_) => Status::internal("Internal error"),
 
         HsmError::SessionClosed => Status::aborted("Session closed"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for daemon-side wiring of the handle-keyed RSA cache.
+    //!
+    //! These tests verify that the daemon shares the same `(slot_id, handle)`
+    //! cache the C ABI uses, so a second sign/verify on a previously-seen key
+    //! reuses the parsed `RsaPrivateKey` / `RsaPublicKey` instead of re-parsing
+    //! from DER / re-building from BigUint components.
+    use craton_hsm::crypto::keygen::generate_rsa_key_pair;
+    use craton_hsm::crypto::sign::{
+        get_cached_rsa_private_key, get_cached_rsa_public_key, rsa_pkcs1v15_sign_cached,
+        rsa_pkcs1v15_verify_cached, rsa_pss_sign_cached, HashAlg,
+    };
+
+    /// Pick a slot/handle pair that's unlikely to collide with any other test
+    /// running in the same process (the cache is a process-wide static).
+    fn unique_keys(tag: u64) -> (u64, u64) {
+        // Use a high bit + tag so we never alias real PKCS#11 handles in
+        // sibling tests.
+        (0xD000_0000_0000_0000 | tag, 0xD000_0000_0000_0000 | tag)
+    }
+
+    #[test]
+    fn daemon_sign_path_populates_handle_cache_on_first_call() {
+        let (slot_id, handle) = unique_keys(0x01);
+        let (priv_key, _modulus, _pub_exp) = generate_rsa_key_pair(2048, false).unwrap();
+
+        // Cache must be empty before the first sign.
+        assert!(
+            get_cached_rsa_private_key(slot_id, handle).is_none(),
+            "private key cache should be empty before first sign"
+        );
+
+        let sig = rsa_pkcs1v15_sign_cached(
+            slot_id,
+            handle,
+            priv_key.as_bytes(),
+            b"daemon test payload",
+            Some(HashAlg::Sha256),
+        )
+        .expect("first sign succeeds");
+        assert!(!sig.is_empty());
+
+        // After the first sign, the cache must be populated — proving the
+        // daemon will hit the cache on the next call.
+        assert!(
+            get_cached_rsa_private_key(slot_id, handle).is_some(),
+            "rsa_pkcs1v15_sign_cached did not populate the handle cache"
+        );
+    }
+
+    #[test]
+    fn daemon_repeat_sign_reuses_cached_private_key() {
+        let (slot_id, handle) = unique_keys(0x02);
+        let (priv_key, _modulus, _pub_exp) = generate_rsa_key_pair(2048, false).unwrap();
+
+        // First sign — populates cache.
+        rsa_pkcs1v15_sign_cached(
+            slot_id,
+            handle,
+            priv_key.as_bytes(),
+            b"first",
+            Some(HashAlg::Sha256),
+        )
+        .expect("first sign succeeds");
+
+        let cached_after_first = get_cached_rsa_private_key(slot_id, handle)
+            .expect("cache populated after first sign");
+
+        // Second sign — must hit the cache. We assert that the Arc<RsaPrivateKey>
+        // pointer identity is preserved, which is only true if the second call
+        // pulled from the cache rather than re-parsing PKCS#8 DER.
+        rsa_pkcs1v15_sign_cached(
+            slot_id,
+            handle,
+            priv_key.as_bytes(),
+            b"second",
+            Some(HashAlg::Sha256),
+        )
+        .expect("second sign succeeds");
+
+        let cached_after_second = get_cached_rsa_private_key(slot_id, handle)
+            .expect("cache still populated after second sign");
+
+        assert!(
+            std::sync::Arc::ptr_eq(&cached_after_first, &cached_after_second),
+            "second sign re-parsed the key instead of hitting the cache"
+        );
+    }
+
+    #[test]
+    fn daemon_pss_sign_shares_private_key_cache_with_pkcs1v15() {
+        let (slot_id, handle) = unique_keys(0x03);
+        let (priv_key, _modulus, _pub_exp) = generate_rsa_key_pair(2048, false).unwrap();
+
+        // PKCS#1 v1.5 sign populates the private-key cache first.
+        rsa_pkcs1v15_sign_cached(
+            slot_id,
+            handle,
+            priv_key.as_bytes(),
+            b"pkcs1v15",
+            Some(HashAlg::Sha256),
+        )
+        .expect("pkcs1v15 sign succeeds");
+
+        let cached_pkcs1 = get_cached_rsa_private_key(slot_id, handle)
+            .expect("cache populated by pkcs1v15 sign");
+
+        // A subsequent PSS sign on the same handle must share the same Arc — the
+        // cache is keyed on (slot_id, handle), not on padding scheme.
+        rsa_pss_sign_cached(
+            slot_id,
+            handle,
+            priv_key.as_bytes(),
+            b"pss",
+            HashAlg::Sha256,
+        )
+        .expect("pss sign succeeds");
+
+        let cached_pss = get_cached_rsa_private_key(slot_id, handle)
+            .expect("cache still populated after pss sign");
+
+        assert!(
+            std::sync::Arc::ptr_eq(&cached_pkcs1, &cached_pss),
+            "PSS sign did not reuse the PKCS#1 v1.5 cache entry"
+        );
+    }
+
+    #[test]
+    fn daemon_verify_path_populates_public_key_cache_on_first_call() {
+        let (slot_id, handle) = unique_keys(0x04);
+        let (priv_key, modulus, pub_exp) = generate_rsa_key_pair(2048, false).unwrap();
+
+        // Produce a real signature so verify can return Ok(true).
+        let sig = rsa_pkcs1v15_sign_cached(
+            slot_id,
+            handle.wrapping_add(1), // use a different handle so the public-key
+            // cache slot we're testing is empty.
+            priv_key.as_bytes(),
+            b"verify payload",
+            Some(HashAlg::Sha256),
+        )
+        .expect("sign succeeds");
+
+        assert!(
+            get_cached_rsa_public_key(slot_id, handle).is_none(),
+            "public key cache should be empty before first verify"
+        );
+
+        let valid = rsa_pkcs1v15_verify_cached(
+            slot_id,
+            handle,
+            &modulus,
+            &pub_exp,
+            b"verify payload",
+            &sig,
+            Some(HashAlg::Sha256),
+        )
+        .expect("verify succeeds");
+        assert!(valid, "signature must verify");
+
+        assert!(
+            get_cached_rsa_public_key(slot_id, handle).is_some(),
+            "rsa_pkcs1v15_verify_cached did not populate the public-key cache"
+        );
     }
 }
