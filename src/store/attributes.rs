@@ -137,13 +137,16 @@ impl ObjectStore {
             if let Some(data) = store.load_encrypted(&store_key, key)? {
                 // `data` is Zeroizing<Vec<u8>> — automatically zeroized on drop.
                 //
-                // KNOWN RESIDUAL RISK: serde_json internally allocates temporary
-                // buffers during parsing (e.g., for string unescaping). These
-                // intermediate allocations may contain key material fragments and
-                // are not zeroized when freed. This is inherent to serde_json's
-                // design and cannot be fixed without a custom binary deserializer.
-                // Mitigated by mlock on RawKeyMaterial post-deserialization.
-                let result = serde_json::from_slice::<StoredObject>(&data);
+                // RESIDUAL RISK (reduced from prior serde_json design):
+                // postcard's intermediate parsing buffers are still allocator-
+                // owned and not zeroized on free, but the format is a compact
+                // binary length-prefixed encoding. Unlike serde_json there are
+                // no string-unescape allocations (no UTF-8 decode of escaped
+                // sequences into fresh `String` buffers), so the residual
+                // surface area is materially smaller. Key bytes still pass
+                // through `Vec<u8>::deserialize` once before being mlocked
+                // inside `RawKeyMaterial::new`.
+                let result = postcard::from_bytes::<StoredObject>(&data);
                 match result {
                     Ok(obj) => {
                         // Defense-in-depth: verify critical security invariants
@@ -217,7 +220,13 @@ impl ObjectStore {
         }
         .unwrap_or_else(|| self.generate_store_key(obj.handle));
 
-        match serde_json::to_vec(obj) {
+        // Use postcard (compact binary serde format) instead of serde_json:
+        // — removes the per-persist serde_json overhead (key/value formatting,
+        //   string escaping, base64-style number encoding) on the hot path.
+        // — eliminates the string-unescape allocation paths that previously
+        //   left key fragments in unzeroized intermediate buffers.
+        // The output `Vec<u8>` is still zeroized before drop.
+        match postcard::to_allocvec(obj) {
             Ok(mut data) => {
                 let result = store.store_encrypted(&store_key, &data, &*key_copy);
                 // Zeroize serialized plaintext containing key material before dropping
