@@ -2113,6 +2113,56 @@ pub extern "C" fn C_Sign(
             return CKR_OK;
         }
 
+        // Fast path: for ECDSA/EdDSA, write the signature directly into the
+        // caller's PKCS#11 output buffer to eliminate the intermediate Vec
+        // allocation in `sign_single_shot`.  We only enter this path when
+        // p_signature is non-null (length-query case is handled above) and
+        // the mechanism has an `_into_buf` variant.
+        let buf_len = unsafe { *pul_signature_len } as usize;
+        let out_slice = unsafe { slice::from_raw_parts_mut(p_signature, buf_len) };
+        match sign_single_shot_into_buf(mechanism, key_bytes, data, &obj, out_slice) {
+            Ok(Some(n)) => {
+                unsafe {
+                    *pul_signature_len = n as CK_ULONG;
+                }
+                let _ = hsm.audit_log.record(
+                    session as u64,
+                    AuditOperation::Sign {
+                        mechanism: mechanism as u64,
+                        fips_approved: mechanisms::is_fips_approved(mechanism),
+                    },
+                    AuditResult::Success,
+                    None,
+                );
+                sess.active_operation = None;
+                return CKR_OK;
+            }
+            Ok(None) => {
+                // No fast path for this mechanism — fall through to the
+                // legacy Vec<u8>-returning path below.
+            }
+            Err(HsmError::BufferTooSmall) => {
+                // We need to report the required length.  Fall through so the
+                // legacy path (which produces the signature in a Vec) computes
+                // it precisely.  ECDSA signatures vary in DER length per call,
+                // so we cannot safely return a fixed estimate here.
+            }
+            Err(e) => {
+                let rv = err_to_rv(e);
+                let _ = hsm.audit_log.record(
+                    session as u64,
+                    AuditOperation::Sign {
+                        mechanism: mechanism as u64,
+                        fips_approved: mechanisms::is_fips_approved(mechanism),
+                    },
+                    AuditResult::Failure(rv as u64),
+                    None,
+                );
+                sess.active_operation = None;
+                return rv;
+            }
+        }
+
         let result = sign_single_shot(&*hsm.crypto_backend, mechanism, key_bytes, data, &obj);
 
         match result {
@@ -2214,6 +2264,44 @@ fn sign_single_shot(
         // RSA PKCS#1 v1.5
         let hash_alg = sign::mechanism_to_hash(mechanism);
         backend.rsa_pkcs1v15_sign(key_bytes, data, hash_alg)
+    }
+}
+
+/// Try to perform a single-shot sign that writes directly into the
+/// caller-provided output buffer, eliminating an intermediate `Vec<u8>`
+/// allocation.  Returns `Ok(Some(n))` with the byte count on success,
+/// `Ok(None)` if the mechanism does not have an `_into_buf` fast path
+/// (caller should fall back to [`sign_single_shot`]), or `Err` on any
+/// crypto failure (including `BufferTooSmall`).
+///
+/// Currently supports CKM_ECDSA(_SHAxxx) and CKM_EDDSA.  RSA goes through the
+/// `rsa` crate, which always allocates internally, so there's nothing to gain
+/// by adding it here.  PQC variants likewise allocate inside their backends.
+fn sign_single_shot_into_buf(
+    mechanism: CK_MECHANISM_TYPE,
+    key_bytes: &[u8],
+    data: &[u8],
+    obj: &crate::store::object::StoredObject,
+    out: &mut [u8],
+) -> HsmResult<Option<usize>> {
+    if sign::is_ecdsa_mechanism(mechanism) {
+        let key_type = obj.key_type.unwrap_or(0);
+        if key_type != CKK_EC {
+            return Err(HsmError::KeyTypeInconsistent);
+        }
+        let ec_params = obj.ec_params.as_deref().unwrap_or(&[]);
+        let n = if is_p384_params(ec_params) {
+            sign::ecdsa_p384_sign_into_buf(key_bytes, data, out)?
+        } else {
+            sign::ecdsa_p256_sign_into_buf(key_bytes, data, out)?
+        };
+        Ok(Some(n))
+    } else if sign::is_eddsa_mechanism(mechanism) {
+        let n = sign::ed25519_sign_into_buf(key_bytes, data, out)?;
+        Ok(Some(n))
+    } else {
+        // RSA / PSS / PQC / hybrid: no into_buf fast path — caller falls back.
+        Ok(None)
     }
 }
 
