@@ -126,3 +126,14 @@ strip = "symbols"
 [profile.bench]
 lto = "thin"
 codegen-units = 4
+
+# Test profile: bump opt-level so crypto-heavy tests (RSA keygen, PQC, AES-GCM)
+# don't dominate the wall-clock spent running the suite. opt-level=1 is the
+# documented sweet spot — most LLVM passes that matter for arithmetic loops
+# kick in at level 1, and we keep debug assertions / overflow checks (which
+# are independent of opt-level) so the test signal is unchanged.
+#
+# Build-only deps stay at the workspace default; only the test binaries
+# themselves benefit from the bump.
+[profile.test]
+opt-level = 1
