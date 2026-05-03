@@ -28,6 +28,8 @@ use crate::pkcs11_abi::types::CK_MECHANISM_TYPE;
 // When either cache is full (64 entries), a single arbitrary entry is evicted
 // instead of clearing the entire map, avoiding thundering-herd repopulation.
 
+use parking_lot::Mutex;
+use std::collections::VecDeque;
 use std::sync::{Arc, LazyLock};
 use zeroize::Zeroize;
 
@@ -56,23 +58,60 @@ static RSA_PRIV_CACHE: LazyLock<dashmap::DashMap<(u64, u64), Arc<RsaPrivateKey>>
 static RSA_PUB_CACHE: LazyLock<dashmap::DashMap<(u64, u64), Arc<RsaPublicKey>>> =
     LazyLock::new(|| dashmap::DashMap::with_capacity(RSA_KEY_CACHE_MAX));
 
-/// Evict one arbitrary entry from a `DashMap` when it is at capacity.
-/// This avoids clearing the entire cache (thundering herd) while keeping
-/// the implementation simple (no LRU metadata overhead).
-fn evict_one_if_full<K: std::hash::Hash + Eq + Clone, V>(map: &dashmap::DashMap<K, V>) {
-    if map.len() >= RSA_KEY_CACHE_MAX {
-        if let Some(entry) = map.iter().next() {
-            let key = entry.key().clone();
-            drop(entry); // release the read guard before removing
-            map.remove(&key);
+/// FIFO insertion-order queue for the handle caches.
+///
+/// Eviction pops the oldest entry from the front instead of doing
+/// `iter().next()` on the DashMap (which acquires a shard read lock and
+/// returns the first physically-stored key).  The Mutex is held only for
+/// the queue mutation, so it never overlaps with DashMap operations.
+///
+/// Holds a tag identifying which cache the key belongs to so a single
+/// queue can serve both RSA_PRIV_CACHE and RSA_PUB_CACHE without
+/// duplicating bookkeeping logic.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum HandleCacheTag {
+    Priv,
+    Pub,
+}
+
+static HANDLE_CACHE_FIFO: LazyLock<Mutex<VecDeque<(HandleCacheTag, (u64, u64))>>> =
+    LazyLock::new(|| Mutex::new(VecDeque::with_capacity(RSA_KEY_CACHE_MAX * 2)));
+
+/// Pop the oldest entry that still belongs to one of the two caches and
+/// remove it.  Stale queue entries (already removed via `evict_cached_keys`
+/// or `clear_rsa_key_cache`) are silently skipped.
+fn evict_oldest_handle_cache_entry() {
+    // Bound the linear skip in case the queue accumulates stale entries
+    // due to many explicit evictions.  Two full cache lengths is a safe
+    // upper bound -- past that we'd have churned more than the cache
+    // itself can hold.
+    const MAX_SKIPS: usize = RSA_KEY_CACHE_MAX * 2;
+
+    let mut fifo = HANDLE_CACHE_FIFO.lock();
+    for _ in 0..MAX_SKIPS {
+        let Some((tag, key)) = fifo.pop_front() else {
+            return;
+        };
+        let removed = match tag {
+            HandleCacheTag::Priv => RSA_PRIV_CACHE.remove(&key).is_some(),
+            HandleCacheTag::Pub => RSA_PUB_CACHE.remove(&key).is_some(),
+        };
+        if removed {
+            return;
         }
+        // Otherwise the entry was already gone -- keep popping.
     }
 }
 
 /// Cache an already-parsed RSA private key by (slot_id, handle).
 pub fn cache_rsa_private_key(slot_id: u64, handle: u64, key: Arc<RsaPrivateKey>) {
-    evict_one_if_full(&RSA_PRIV_CACHE);
+    if RSA_PRIV_CACHE.len() >= RSA_KEY_CACHE_MAX {
+        evict_oldest_handle_cache_entry();
+    }
     RSA_PRIV_CACHE.insert((slot_id, handle), key);
+    HANDLE_CACHE_FIFO
+        .lock()
+        .push_back((HandleCacheTag::Priv, (slot_id, handle)));
 }
 
 /// Get a cached RSA private key by (slot_id, handle). Returns `None` on miss.
@@ -84,8 +123,13 @@ pub fn get_cached_rsa_private_key(slot_id: u64, handle: u64) -> Option<Arc<RsaPr
 
 /// Cache an already-parsed RSA public key by (slot_id, handle).
 pub fn cache_rsa_public_key(slot_id: u64, handle: u64, key: Arc<RsaPublicKey>) {
-    evict_one_if_full(&RSA_PUB_CACHE);
+    if RSA_PUB_CACHE.len() >= RSA_KEY_CACHE_MAX {
+        evict_oldest_handle_cache_entry();
+    }
     RSA_PUB_CACHE.insert((slot_id, handle), key);
+    HANDLE_CACHE_FIFO
+        .lock()
+        .push_back((HandleCacheTag::Pub, (slot_id, handle)));
 }
 
 /// Get a cached RSA public key by (slot_id, handle). Returns `None` on miss.
@@ -96,6 +140,9 @@ pub fn get_cached_rsa_public_key(slot_id: u64, handle: u64) -> Option<Arc<RsaPub
 }
 
 /// Evict all cached keys for a given (slot_id, handle) pair (call on C_DestroyObject).
+///
+/// Stale queue entries are tolerated by `evict_oldest_handle_cache_entry`,
+/// so we don't rebuild the FIFO here.
 pub fn evict_cached_keys(slot_id: u64, handle: u64) {
     RSA_PRIV_CACHE.remove(&(slot_id, handle));
     RSA_PUB_CACHE.remove(&(slot_id, handle));
@@ -178,6 +225,85 @@ fn parse_rsa_private_key(der: &[u8]) -> HsmResult<RsaPrivateKey> {
     Ok(private_key)
 }
 
+#[cfg(test)]
+mod handle_cache_eviction_tests {
+    use super::*;
+
+    fn fresh_priv_key() -> Arc<RsaPrivateKey> {
+        // Cheap dummy used only to populate the cache slot -- never signed with.
+        use rsa::BigUint;
+        Arc::new(
+            RsaPrivateKey::from_components(
+                BigUint::from(15u32),     // n
+                BigUint::from(3u32),      // e
+                BigUint::from(3u32),      // d
+                vec![BigUint::from(5u32), BigUint::from(3u32)],
+            )
+            .expect("dummy key"),
+        )
+    }
+
+    /// Each test has to reset both caches because they are process-global
+    /// statics shared across the whole test binary.
+    fn reset_caches() {
+        clear_rsa_key_cache();
+    }
+
+    #[test]
+    fn fifo_pops_oldest_when_full() {
+        reset_caches();
+        let slot = 0xfeed;
+        // Fill the cache to the cap with predictable handles.
+        for handle in 0..(RSA_KEY_CACHE_MAX as u64) {
+            cache_rsa_private_key(slot, handle, fresh_priv_key());
+        }
+        assert_eq!(RSA_PRIV_CACHE.len(), RSA_KEY_CACHE_MAX);
+        assert!(get_cached_rsa_private_key(slot, 0).is_some());
+
+        // Inserting one more must evict handle 0 (the oldest), not some
+        // arbitrary entry chosen by iter().
+        cache_rsa_private_key(slot, 9999, fresh_priv_key());
+        assert_eq!(RSA_PRIV_CACHE.len(), RSA_KEY_CACHE_MAX);
+        assert!(
+            get_cached_rsa_private_key(slot, 0).is_none(),
+            "oldest entry (handle=0) should have been evicted by FIFO"
+        );
+        assert!(
+            get_cached_rsa_private_key(slot, 9999).is_some(),
+            "newest entry should be present"
+        );
+        reset_caches();
+    }
+
+    #[test]
+    fn fifo_skips_already_evicted_entries() {
+        reset_caches();
+        let slot = 0xbeef;
+
+        // Insert one, evict it explicitly, then fill the cache. The FIFO
+        // queue still has the stale entry at the front; the next eviction
+        // must skip it and pop the actually-oldest live entry.
+        cache_rsa_private_key(slot, 1, fresh_priv_key());
+        evict_cached_keys(slot, 1);
+
+        for handle in 100..(100 + RSA_KEY_CACHE_MAX as u64) {
+            cache_rsa_private_key(slot, handle, fresh_priv_key());
+        }
+        assert_eq!(RSA_PRIV_CACHE.len(), RSA_KEY_CACHE_MAX);
+
+        // One more triggers eviction.  The FIFO still has the stale
+        // (Priv, (slot, 1)) at the front; that must be skipped and
+        // (Priv, (slot, 100)) -- the actual oldest live entry -- evicted.
+        cache_rsa_private_key(slot, 9000, fresh_priv_key());
+        assert_eq!(RSA_PRIV_CACHE.len(), RSA_KEY_CACHE_MAX);
+        assert!(
+            get_cached_rsa_private_key(slot, 100).is_none(),
+            "FIFO must skip the stale entry and evict the real oldest"
+        );
+        reset_caches();
+    }
+}
+
 /// Single-entry eviction for the ZeroizingRsaKey DER-hash cache.
 fn evict_one_if_full_zeroizing(map: &dashmap::DashMap<[u8; 32], ZeroizingRsaKey>) {
     if map.len() >= RSA_KEY_CACHE_MAX {
@@ -196,6 +322,7 @@ pub fn clear_rsa_key_cache() {
     RSA_KEY_CACHE.clear();
     RSA_PRIV_CACHE.clear();
     RSA_PUB_CACHE.clear();
+    HANDLE_CACHE_FIFO.lock().clear();
 }
 
 /// Minimum RSA modulus size in bits. Keys below this threshold are rejected
