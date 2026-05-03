@@ -1,0 +1,60 @@
+name: Nextest (Evaluation)
+
+# ── cargo-nextest evaluation workflow ──
+#
+# Roadmap "Near-Term / Build & CI": evaluate whether `cargo-nextest`'s
+# per-process test isolation can replace the `--test-threads=1` requirement
+# imposed on PKCS#11 ABI tests by the spec's one-C_Initialize/C_Finalize-
+# per-process rule.
+#
+# Status: EVALUATION ONLY. The job is non-blocking (`continue-on-error: true`)
+# so it does not gate merges while we collect signal on:
+#   * runtime vs. the existing sharded `cargo test` matrix in ci.yml
+#   * stability across the ABI tests that previously relied on serial execution
+#   * Windows / macOS parity once Linux signal stabilises
+#
+# If/when the evaluation succeeds, the existing `test-abi-shard{1,2}` jobs
+# in ci.yml can drop their `--test-threads=1` flags or be replaced entirely.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  nextest:
+    name: Nextest (workspace, per-process isolation)
+    runs-on: ubuntu-latest
+    continue-on-error: true  # evaluation — non-blocking
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@d858f8113943481093e02986a7586a4819a3bfd6 # v2
+        with:
+          tool: cargo-nextest
+
+      # nextest spawns a fresh process per test binary, so the PKCS#11 §5.10
+      # one-C_Initialize-per-process constraint is satisfied without
+      # `--test-threads=1`. We deliberately omit that flag here.
+      - name: Run workspace tests via nextest
+        run: cargo nextest run --workspace --no-fail-fast
