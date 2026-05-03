@@ -7,17 +7,15 @@
 // fixed-size buffer (≤144 bytes — see `SIG_STACK_BUF_SIZE`). The
 // `*_sign_into_buf` variants below write directly into a caller-owned
 // `[u8; SIG_STACK_BUF_SIZE]` and return the byte length, avoiding the
-// `Vec<u8>` allocation done by `*_sign`.
+// `Vec<u8>` allocation done by `*_sign`. They are wired end-to-end via
+// `CryptoBackend::{ecdsa_p256,ecdsa_p384,ed25519}_sign_into_buf`, so
+// dispatcher code can request a stack signature through the trait surface
+// rather than reaching into the free functions directly.
 //
 // RSA signatures (256–512 bytes) come out of the `rsa` crate as
 // heap-allocated `Vec<u8>` and intentionally bypass this path. ML-DSA /
 // SLH-DSA and hybrid PQC signatures (multi-KB) are far too large for a
 // stack buffer and also stay on the heap.
-//
-// TODO(perf): wire C ABI callers (functions.rs `C_Sign` / `C_SignFinal`)
-// to the `*_into_buf` variants for ECDSA and Ed25519 mechanisms. Today the
-// callers still go through the `Vec<u8>`-returning entry points; only the
-// crypto primitives are stack-buffer ready.
 
 use rsa::pkcs8::DecodePrivateKey;
 use rsa::{Pkcs1v15Sign, RsaPrivateKey, RsaPublicKey};
