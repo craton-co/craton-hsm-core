@@ -5,7 +5,7 @@
 
 use super::backend::CryptoBackend;
 use super::digest::DigestAccumulator;
-use super::sign::HashAlg;
+use super::sign::{HashAlg, SIG_STACK_BUF_SIZE};
 use crate::error::HsmResult;
 use crate::pkcs11_abi::types::CK_MECHANISM_TYPE;
 use crate::store::key_material::RawKeyMaterial;
@@ -95,6 +95,38 @@ impl CryptoBackend for RustCryptoBackend {
         signature_bytes: &[u8],
     ) -> HsmResult<bool> {
         super::sign::ed25519_verify(public_key_bytes, data, signature_bytes)
+    }
+
+    // ========================================================================
+    // Stack-buffer signing — direct delegation to the primitive `*_into_buf`
+    // free functions, skipping the `Vec<u8>` allocation in the default impl.
+    // ========================================================================
+
+    fn ecdsa_p256_sign_into_buf(
+        &self,
+        private_key_bytes: &[u8],
+        data: &[u8],
+        out: &mut [u8; SIG_STACK_BUF_SIZE],
+    ) -> HsmResult<usize> {
+        super::sign::ecdsa_p256_sign_into_buf(private_key_bytes, data, out)
+    }
+
+    fn ecdsa_p384_sign_into_buf(
+        &self,
+        private_key_bytes: &[u8],
+        data: &[u8],
+        out: &mut [u8; SIG_STACK_BUF_SIZE],
+    ) -> HsmResult<usize> {
+        super::sign::ecdsa_p384_sign_into_buf(private_key_bytes, data, out)
+    }
+
+    fn ed25519_sign_into_buf(
+        &self,
+        private_key_bytes: &[u8],
+        data: &[u8],
+        out: &mut [u8; SIG_STACK_BUF_SIZE],
+    ) -> HsmResult<usize> {
+        super::sign::ed25519_sign_into_buf(private_key_bytes, data, out)
     }
 
     // ========================================================================
