@@ -83,8 +83,15 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 # Error handling
 thiserror = "2"
 
-# Serialization for store objects
+# Serialization for store objects.
+# StoredObject persistence uses postcard (a compact, no-std-friendly binary
+# serde format) instead of serde_json so that serialization avoids the
+# string-unescape allocation paths that historically left key fragments in
+# unzeroized intermediate buffers. serde_json is retained for any non-key-
+# bearing call sites (e.g., diagnostic exports) — but is no longer on the
+# token-object persist path.
 serde_json = "1"
+postcard = { version = "1", features = ["use-std"] }
 
 # Hex encoding (used by integrity test)
 hex = "0.4"
