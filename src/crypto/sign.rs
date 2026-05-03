@@ -994,6 +994,39 @@ pub fn ecdsa_p256_verify(
     Ok(verifying_key.verify(data, &signature).is_ok())
 }
 
+/// ECDSA P-256 sign — write directly into a caller-provided output buffer.
+///
+/// Returns the number of bytes written on success, or `HsmError::BufferTooSmall`
+/// if `out` is not large enough for the signature.  This avoids the
+/// intermediate `Vec<u8>` allocation that `ecdsa_p256_sign` produces, allowing
+/// the C ABI to thread the PKCS#11-caller-provided output buffer all the way
+/// down to the crypto backend.
+///
+/// The DER encoding of an ECDSA P-256 signature is at most 72 bytes; callers
+/// should size the buffer accordingly.
+pub fn ecdsa_p256_sign_into_buf(
+    private_key_bytes: &[u8],
+    data: &[u8],
+    out: &mut [u8],
+) -> HsmResult<usize> {
+    use crate::crypto::drbg::DrbgRng;
+    use p256::ecdsa::signature::RandomizedSigner;
+    use p256::ecdsa::SigningKey;
+
+    validate_data_size(data)?;
+    let signing_key =
+        SigningKey::from_slice(private_key_bytes).map_err(|_| HsmError::KeyHandleInvalid)?;
+    let mut rng = DrbgRng::new()?;
+    let signature: p256::ecdsa::Signature = signing_key.sign_with_rng(&mut rng, data);
+    let der = signature.to_der();
+    let der_bytes = der.as_bytes();
+    if out.len() < der_bytes.len() {
+        return Err(HsmError::BufferTooSmall);
+    }
+    out[..der_bytes.len()].copy_from_slice(der_bytes);
+    Ok(der_bytes.len())
+}
+
 // ============================================================================
 // ECDSA P-384
 // ============================================================================
@@ -1032,6 +1065,33 @@ pub fn ecdsa_p384_verify(
     Ok(verifying_key.verify(data, &signature).is_ok())
 }
 
+/// ECDSA P-384 sign — write directly into a caller-provided output buffer.
+///
+/// See [`ecdsa_p256_sign_into_buf`] for the rationale.  The DER encoding of an
+/// ECDSA P-384 signature is at most 104 bytes.
+pub fn ecdsa_p384_sign_into_buf(
+    private_key_bytes: &[u8],
+    data: &[u8],
+    out: &mut [u8],
+) -> HsmResult<usize> {
+    use crate::crypto::drbg::DrbgRng;
+    use p384::ecdsa::signature::RandomizedSigner;
+    use p384::ecdsa::SigningKey;
+
+    validate_data_size(data)?;
+    let signing_key =
+        SigningKey::from_slice(private_key_bytes).map_err(|_| HsmError::KeyHandleInvalid)?;
+    let mut rng = DrbgRng::new()?;
+    let signature: p384::ecdsa::Signature = signing_key.sign_with_rng(&mut rng, data);
+    let der = signature.to_der();
+    let der_bytes = der.as_bytes();
+    if out.len() < der_bytes.len() {
+        return Err(HsmError::BufferTooSmall);
+    }
+    out[..der_bytes.len()].copy_from_slice(der_bytes);
+    Ok(der_bytes.len())
+}
+
 // ============================================================================
 // Ed25519 EdDSA
 // ============================================================================
@@ -1064,6 +1124,39 @@ pub fn ed25519_sign(private_key_bytes: &[u8], data: &[u8]) -> HsmResult<Vec<u8>>
     let signing_key = SigningKey::from_bytes(&key_array);
     let signature = signing_key.sign(data);
     Ok(signature.to_bytes().to_vec())
+}
+
+/// Ed25519 sign — write directly into a caller-provided output buffer.
+///
+/// Ed25519 signatures are always 64 bytes (`SIGNATURE_LENGTH`), so the
+/// returned `usize` is always 64 on success.  See [`ecdsa_p256_sign_into_buf`]
+/// for the rationale of avoiding the intermediate `Vec<u8>` allocation.
+pub fn ed25519_sign_into_buf(
+    private_key_bytes: &[u8],
+    data: &[u8],
+    out: &mut [u8],
+) -> HsmResult<usize> {
+    use ed25519_dalek::Signer;
+    use ed25519_dalek::SigningKey;
+    use ed25519_dalek::SIGNATURE_LENGTH;
+    use zeroize::Zeroizing;
+
+    validate_data_size(data)?;
+    if private_key_bytes.len() != 32 {
+        return Err(HsmError::KeyHandleInvalid);
+    }
+    if out.len() < SIGNATURE_LENGTH {
+        return Err(HsmError::BufferTooSmall);
+    }
+    let mut key_array = Zeroizing::new([0u8; 32]);
+    key_array.copy_from_slice(private_key_bytes);
+    // SigningKey implements ZeroizeOnDrop — key material is scrubbed when
+    // `signing_key` goes out of scope at the end of this function.
+    let signing_key = SigningKey::from_bytes(&key_array);
+    let signature = signing_key.sign(data);
+    let sig_bytes = signature.to_bytes();
+    out[..SIGNATURE_LENGTH].copy_from_slice(&sig_bytes);
+    Ok(SIGNATURE_LENGTH)
 }
 
 /// Ed25519 verify
@@ -1541,6 +1634,9 @@ pub(crate) fn ecdsa_p384_verify_prehashed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::keygen::{
+        generate_ec_p256_key_pair, generate_ec_p384_key_pair, generate_ed25519_key_pair,
+    };
 
     /// Use a per-test slot id derived from a counter so that tests run in
     /// parallel without colliding on cache slots.  Handle ids are picked the
@@ -1775,5 +1871,70 @@ mod tests {
             get_cached_rsa_public_key(slot, handle).is_none(),
             "evict_cached_keys must drop the public-key entry"
         );
+    // ---- output-buffer-threading _into_buf tests ----
+
+    /// `ecdsa_p256_sign_into_buf` writes the same DER signature bytes as
+    /// `ecdsa_p256_sign` and returns the matching length.
+    #[test]
+    fn ecdsa_p256_sign_into_buf_matches_vec_variant() {
+        let (priv_km, pub_sec1) = generate_ec_p256_key_pair().expect("keygen");
+        let data = b"perf/output-buffer-threading test message";
+        let mut buf = [0u8; 80];
+        let n = ecdsa_p256_sign_into_buf(priv_km.as_bytes(), data, &mut buf).expect("sign");
+        // ECDSA P-256 DER signatures are at most 72 bytes; never zero.
+        assert!(n > 0 && n <= 72, "unexpected signature length {n}");
+        // The signature must verify against the public key.
+        assert!(
+            ecdsa_p256_verify(&pub_sec1, data, &buf[..n]).expect("verify"),
+            "into_buf signature did not verify"
+        );
+    }
+
+    /// `ecdsa_p256_sign_into_buf` returns `BufferTooSmall` when the output
+    /// buffer cannot hold the signature.
+    #[test]
+    fn ecdsa_p256_sign_into_buf_buffer_too_small() {
+        let (priv_km, _pub_sec1) = generate_ec_p256_key_pair().expect("keygen");
+        let mut tiny = [0u8; 8];
+        let err = ecdsa_p256_sign_into_buf(priv_km.as_bytes(), b"data", &mut tiny);
+        assert!(matches!(err, Err(HsmError::BufferTooSmall)));
+    }
+
+    /// `ecdsa_p384_sign_into_buf` writes a verifiable signature.
+    #[test]
+    fn ecdsa_p384_sign_into_buf_roundtrip() {
+        let (priv_km, pub_sec1) = generate_ec_p384_key_pair().expect("keygen");
+        let data = b"perf/output-buffer-threading p384 test";
+        let mut buf = [0u8; 110];
+        let n = ecdsa_p384_sign_into_buf(priv_km.as_bytes(), data, &mut buf).expect("sign");
+        assert!(n > 0 && n <= 104, "unexpected signature length {n}");
+        assert!(
+            ecdsa_p384_verify(&pub_sec1, data, &buf[..n]).expect("verify"),
+            "into_buf signature did not verify"
+        );
+    }
+
+    /// `ed25519_sign_into_buf` writes exactly 64 bytes and the signature
+    /// verifies against the public key.
+    #[test]
+    fn ed25519_sign_into_buf_roundtrip() {
+        let (priv_km, pub_bytes) = generate_ed25519_key_pair().expect("keygen");
+        let data = b"perf/output-buffer-threading ed25519 test";
+        let mut buf = [0u8; 64];
+        let n = ed25519_sign_into_buf(priv_km.as_bytes(), data, &mut buf).expect("sign");
+        assert_eq!(n, 64, "Ed25519 signatures are always 64 bytes");
+        assert!(
+            ed25519_verify(&pub_bytes, data, &buf[..n]).expect("verify"),
+            "into_buf signature did not verify"
+        );
+    }
+
+    /// `ed25519_sign_into_buf` rejects too-small buffers up-front.
+    #[test]
+    fn ed25519_sign_into_buf_buffer_too_small() {
+        let (priv_km, _pub_bytes) = generate_ed25519_key_pair().expect("keygen");
+        let mut tiny = [0u8; 32];
+        let err = ed25519_sign_into_buf(priv_km.as_bytes(), b"data", &mut tiny);
+        assert!(matches!(err, Err(HsmError::BufferTooSmall)));
     }
 }
