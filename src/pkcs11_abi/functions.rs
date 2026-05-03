@@ -193,6 +193,74 @@ fn get_hsm() -> Result<Arc<HsmCore>, CK_RV> {
     Ok(hsm)
 }
 
+/// Callback-based HSM accessor that avoids the `Arc::clone` (atomic refcount
+/// increment) that [`get_hsm`] performs on every cache hit.
+///
+/// On the fast path the closure receives a borrowed `&HsmCore` taken directly
+/// from the thread-local `RefCell`-cached `Arc<HsmCore>` — no atomic
+/// operations, just a deref.  The closure must not stash the reference
+/// anywhere that would outlive the call.
+///
+/// On error (POST failed, fork detected, not initialized) the closure receives
+/// `Err(rv)` and is expected to propagate it.
+///
+/// Use this for the hottest C_* paths (C_Sign, C_Verify, C_GetSessionInfo, …)
+/// that consume the HSM immediately and never need to retain ownership.  Call
+/// sites that *do* retain `Arc<HsmCore>` (e.g. spawn a task, pass it across a
+/// scope boundary) should keep using [`get_hsm`].
+fn with_hsm<R>(f: impl FnOnce(Result<&HsmCore, CK_RV>) -> R) -> R {
+    if POST_FAILED.load(Ordering::Acquire) {
+        return f(Err(CKR_GENERAL_ERROR));
+    }
+
+    let init_pid = INIT_PID.load(Ordering::Acquire);
+    if init_pid != 0 && init_pid != current_pid() {
+        CACHED_HSM.with(|c| *c.borrow_mut() = None);
+        tracing::error!(
+            "Fork detected: initialized in PID {} but running in PID {}. \
+             The child process must call C_Initialize.",
+            init_pid,
+            current_pid()
+        );
+        return f(Err(CKR_CRYPTOKI_NOT_INITIALIZED));
+    }
+
+    // Ensure the TLS cache is populated for the current generation.  If the
+    // cache hits we touch nothing; if it misses we lock the global mutex once
+    // and copy the Arc into TLS.  This is a no-op (compared to `get_hsm`) on
+    // the steady-state hot path.
+    let current_gen = HSM_GENERATION.load(Ordering::Acquire);
+    let cache_ok = CACHED_HSM.with(|c| {
+        let borrow = c.borrow();
+        matches!(*borrow, Some((_, g)) if g == current_gen)
+    });
+    if !cache_ok {
+        let guard = HSM.lock();
+        match guard.as_ref().cloned() {
+            Some(hsm) => {
+                CACHED_HSM.with(|c| *c.borrow_mut() = Some((hsm, current_gen)));
+            }
+            None => return f(Err(CKR_CRYPTOKI_NOT_INITIALIZED)),
+        }
+    }
+
+    // Fast path: borrow the cached Arc, deref to `&HsmCore`, invoke the
+    // closure.  No `Arc::clone` (no atomic increment).  The `Ref` guard from
+    // `RefCell::borrow` lives only for the duration of the closure call,
+    // which is a strictly nested scope inside this thread-local access — the
+    // borrow is sound.
+    CACHED_HSM.with(|c| {
+        let borrow = c.borrow();
+        // Safety net: the cache was just populated above; if a concurrent
+        // C_Finalize cleared the cell between the `cache_ok` check and here,
+        // we degrade gracefully rather than panicking.
+        match *borrow {
+            Some((ref arc, _)) => f(Ok(arc.as_ref())),
+            None => f(Err(CKR_CRYPTOKI_NOT_INITIALIZED)),
+        }
+    })
+}
+
 /// Helper: convert HsmError to CK_RV
 fn err_to_rv(e: HsmError) -> CK_RV {
     e.into()
@@ -874,23 +942,27 @@ pub extern "C" fn C_GetSessionInfo(
     p_info: CK_SESSION_INFO_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
-            Ok(h) => h,
-            Err(rv) => return rv,
-        };
-        if p_info.is_null() {
-            return CKR_ARGUMENTS_BAD;
-        }
+        // Hot, read-only PKCS#11 path — use the borrowing `with_hsm` to skip
+        // the Arc::clone atomic increment that `get_hsm` performs on cache hit.
+        with_hsm(|hsm_res| {
+            let hsm = match hsm_res {
+                Ok(h) => h,
+                Err(rv) => return rv,
+            };
+            if p_info.is_null() {
+                return CKR_ARGUMENTS_BAD;
+            }
 
-        let sess = match hsm.session_manager.get_session(session) {
-            Ok(s) => s,
-            Err(e) => return err_to_rv(e),
-        };
+            let sess = match hsm.session_manager.get_session(session) {
+                Ok(s) => s,
+                Err(e) => return err_to_rv(e),
+            };
 
-        unsafe {
-            *p_info = sess.read().get_info();
-        }
-        CKR_OK
+            unsafe {
+                *p_info = sess.read().get_info();
+            }
+            CKR_OK
+        })
     })
     .unwrap_or(CKR_GENERAL_ERROR)
 }
@@ -2050,8 +2122,8 @@ pub extern "C" fn C_Sign(
     p_signature: CK_BYTE_PTR,
     pul_signature_len: CK_ULONG_PTR,
 ) -> CK_RV {
-    catch_unwind(|| {
-        let hsm = match get_hsm() {
+    catch_unwind(|| with_hsm(|hsm_res| {
+        let hsm = match hsm_res {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -2159,7 +2231,7 @@ pub extern "C" fn C_Sign(
                 rv
             }
         }
-    })
+    }))
     .unwrap_or(CKR_GENERAL_ERROR)
 }
 
@@ -2434,8 +2506,8 @@ pub extern "C" fn C_Verify(
     p_signature: CK_BYTE_PTR,
     signature_len: CK_ULONG,
 ) -> CK_RV {
-    catch_unwind(|| {
-        let hsm = match get_hsm() {
+    catch_unwind(|| with_hsm(|hsm_res| {
+        let hsm = match hsm_res {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -2517,7 +2589,7 @@ pub extern "C" fn C_Verify(
                 rv
             }
         }
-    })
+    }))
     .unwrap_or(CKR_GENERAL_ERROR)
 }
 
