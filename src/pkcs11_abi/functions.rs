@@ -1166,21 +1166,21 @@ pub extern "C" fn C_DestroyObject(session: CK_SESSION_HANDLE, object: CK_OBJECT_
         if !obj_read.destroyable {
             return CKR_ATTRIBUTE_READ_ONLY;
         }
-        // Capture key material reference for GCM counter cleanup
-        let key_bytes: Option<Vec<u8>> = obj_read
-            .key_material
-            .as_ref()
-            .map(|km| km.as_bytes().to_vec());
+        // Clean up per-key GCM/IV counters before destroying the object —
+        // borrow the key bytes directly from RawKeyMaterial to avoid the
+        // `.as_bytes().to_vec()` heap allocation that this hot path used to
+        // perform on every destroy.
+        if let Some(km) = obj_read.key_material.as_ref() {
+            crate::crypto::encrypt::remove_gcm_counter(km.as_bytes());
+        }
         drop(obj_read);
         drop(obj);
 
         let slot_id = sess.read().slot_id;
         match hsm.object_store.destroy_object(object) {
             Ok(()) => {
-                // Clean up per-key GCM/IV counters now that the key is destroyed
-                if let Some(ref kb) = key_bytes {
-                    crate::crypto::encrypt::remove_gcm_counter(kb);
-                }
+                // GCM/IV counters were already cleaned up before destroy_object
+                // via the borrow-only path above (perf/key-material-borrow-hot-paths).
                 // Evict any cached parsed RSA keys for this handle so the
                 // cache does not retain key material past destruction.
                 crate::crypto::sign::evict_cached_keys(slot_id as u64, object as u64);
@@ -4690,12 +4690,19 @@ pub extern "C" fn C_DigestKey(session: CK_SESSION_HANDLE, key: CK_OBJECT_HANDLE)
             return CKR_KEY_INDIGESTIBLE;
         }
 
-        // Get key material bytes
+        // Get key material bytes.
+        //
+        // NOTE: This `.as_bytes().to_vec()` copy is intentional — we cannot
+        // borrow into the SecretBox here because we need to acquire the
+        // session write lock below, and another thread may hold the session
+        // write lock while attempting to acquire this object's write lock.
+        // Holding the object read guard across the session write acquisition
+        // would risk a lock-ordering deadlock.
         let key_bytes = match &key_obj.key_material {
             Some(km) => km.as_bytes().to_vec(),
             None => return CKR_KEY_INDIGESTIBLE,
         };
-        drop(key_obj); // Release read lock
+        drop(key_obj); // Release read lock before acquiring session write
 
         // Feed key bytes into active digest operation
         let mut sess = sess.write();
@@ -5328,11 +5335,11 @@ pub extern "C" fn C_WrapKey(
         }
 
         // Get wrapping key material
-        let wk_obj = match hsm.object_store.get_object(wrapping_key) {
+        let wk_arc = match hsm.object_store.get_object(wrapping_key) {
             Ok(o) => o,
             Err(e) => return err_to_rv(e),
         };
-        let wk_obj = wk_obj.read();
+        let wk_obj = wk_arc.read();
         // Private wrapping keys require login
         if wk_obj.private && !is_logged_in {
             return CKR_USER_NOT_LOGGED_IN;
@@ -5346,18 +5353,18 @@ pub extern "C" fn C_WrapKey(
             .get(&CKA_TRUSTED)
             .map(|v| v.first().copied().unwrap_or(0) != 0)
             .unwrap_or(false);
-        let wk_bytes = match &wk_obj.key_material {
-            Some(km) => km.as_bytes().to_vec(),
+        let wk_bytes: &[u8] = match &wk_obj.key_material {
+            Some(km) => km.as_bytes(),
             None => return CKR_KEY_HANDLE_INVALID,
         };
-        drop(wk_obj);
 
-        // Get key to wrap
-        let key_obj = match hsm.object_store.get_object(key) {
+        // Get key to wrap (hold both read guards simultaneously — pure-compute
+        // crypto call below acquires no further locks, so no deadlock risk).
+        let key_arc = match hsm.object_store.get_object(key) {
             Ok(o) => o,
             Err(e) => return err_to_rv(e),
         };
-        let key_obj = key_obj.read();
+        let key_obj = key_arc.read();
         if !key_obj.extractable {
             return err_to_rv(HsmError::KeyFunctionNotPermitted);
         }
@@ -5370,20 +5377,21 @@ pub extern "C" fn C_WrapKey(
         if requires_trusted && !wk_is_trusted {
             return CKR_KEY_FUNCTION_NOT_PERMITTED;
         }
-        let key_bytes = match &key_obj.key_material {
-            Some(km) => km.as_bytes().to_vec(),
+        let key_bytes: &[u8] = match &key_obj.key_material {
+            Some(km) => km.as_bytes(),
             None => return CKR_KEY_HANDLE_INVALID,
         };
-        drop(key_obj);
 
         let wrapped = match hsm.crypto_backend.aes_key_wrap(
-            &wk_bytes,
-            &key_bytes,
+            wk_bytes,
+            key_bytes,
             hsm.algorithm_config.fips_approved_only,
         ) {
             Ok(w) => w,
             Err(e) => return err_to_rv(e),
         };
+        drop(key_obj);
+        drop(wk_obj);
 
         if p_wrapped_key.is_null() {
             unsafe {
@@ -5454,11 +5462,11 @@ pub extern "C" fn C_UnwrapKey(
         }
 
         // Get unwrapping key
-        let uk_obj = match hsm.object_store.get_object(unwrapping_key) {
+        let uk_arc = match hsm.object_store.get_object(unwrapping_key) {
             Ok(o) => o,
             Err(e) => return err_to_rv(e),
         };
-        let uk_obj = uk_obj.read();
+        let uk_obj = uk_arc.read();
         // Private unwrapping keys require login
         if uk_obj.private && !is_logged_in {
             return CKR_USER_NOT_LOGGED_IN;
@@ -5466,12 +5474,7 @@ pub extern "C" fn C_UnwrapKey(
         if !uk_obj.can_unwrap {
             return CKR_KEY_FUNCTION_NOT_PERMITTED;
         }
-        let uk_bytes = match &uk_obj.key_material {
-            Some(km) => km.as_bytes().to_vec(),
-            None => return CKR_KEY_HANDLE_INVALID,
-        };
         let uk_sensitive = uk_obj.sensitive;
-        drop(uk_obj);
 
         // Defense-in-depth: bound wrapped_key_len before slice construction
         if (wrapped_key_len as usize) > MAX_SINGLE_BUFFER {
@@ -5480,14 +5483,24 @@ pub extern "C" fn C_UnwrapKey(
         let wrapped_data =
             unsafe { slice::from_raw_parts(p_wrapped_key, wrapped_key_len as usize) };
 
+        // Borrow key bytes directly from the SecretBox-backed RawKeyMaterial,
+        // avoiding the prior `.as_bytes().to_vec()` heap allocation per call.
+        // The read guard `uk_obj` keeps the bytes alive for the duration of
+        // the (lock-free) crypto call below.
+        let uk_bytes: &[u8] = match &uk_obj.key_material {
+            Some(km) => km.as_bytes(),
+            None => return CKR_KEY_HANDLE_INVALID,
+        };
+
         let unwrapped = match hsm.crypto_backend.aes_key_unwrap(
-            &uk_bytes,
+            uk_bytes,
             wrapped_data,
             hsm.algorithm_config.fips_approved_only,
         ) {
             Ok(u) => u,
             Err(e) => return err_to_rv(e),
         };
+        drop(uk_obj);
 
         let template = if p_template.is_null() {
             vec![]
@@ -5610,21 +5623,15 @@ pub extern "C" fn C_DeriveKey(
         }
 
         // Get base key
-        let bk_obj = match hsm.object_store.get_object(base_key) {
+        let bk_arc = match hsm.object_store.get_object(base_key) {
             Ok(o) => o,
             Err(e) => return err_to_rv(e),
         };
-        let bk_obj = bk_obj.read();
+        let bk_obj = bk_arc.read();
         if !bk_obj.can_derive {
             return CKR_KEY_FUNCTION_NOT_PERMITTED;
         }
-        let bk_bytes = match &bk_obj.key_material {
-            Some(km) => km.as_bytes().to_vec(),
-            None => return CKR_KEY_HANDLE_INVALID,
-        };
-        let ec_params = bk_obj.ec_params.as_deref().unwrap_or(&[]).to_vec();
         let bk_sensitive = bk_obj.sensitive;
-        drop(bk_obj);
 
         // The mechanism parameter contains the peer public key (ECDH) or ciphertext (KEM)
         let mech_param = extract_mechanism_param(p_mechanism);
@@ -5652,19 +5659,29 @@ pub extern "C" fn C_DeriveKey(
             }
         }
 
+        // Borrow base key bytes and ec_params directly from the read guard,
+        // avoiding the prior `.as_bytes().to_vec()` and `.to_vec()` allocations.
+        // The `bk_obj` guard keeps the borrows alive across the (lock-free)
+        // crypto call below.
+        let bk_bytes: &[u8] = match &bk_obj.key_material {
+            Some(km) => km.as_bytes(),
+            None => return CKR_KEY_HANDLE_INVALID,
+        };
+        let ec_params: &[u8] = bk_obj.ec_params.as_deref().unwrap_or(&[]);
+
         let shared_secret = if let Some(variant) = pqc::mechanism_to_ml_kem_variant(mechanism) {
             // ML-KEM decapsulation: base key is dk seed, param is ciphertext
             match hsm
                 .crypto_backend
-                .ml_kem_decapsulate(&bk_bytes, &mech_param, variant)
+                .ml_kem_decapsulate(bk_bytes, &mech_param, variant)
             {
                 Ok(ss) => RawKeyMaterial::new(ss),
                 Err(e) => return err_to_rv(e),
             }
-        } else if is_p384_params(&ec_params) {
+        } else if is_p384_params(ec_params) {
             match hsm
                 .crypto_backend
-                .ecdh_p384(&bk_bytes, &mech_param, requested_len)
+                .ecdh_p384(bk_bytes, &mech_param, requested_len)
             {
                 Ok(s) => s,
                 Err(e) => return err_to_rv(e),
@@ -5672,12 +5689,13 @@ pub extern "C" fn C_DeriveKey(
         } else {
             match hsm
                 .crypto_backend
-                .ecdh_p256(&bk_bytes, &mech_param, requested_len)
+                .ecdh_p256(bk_bytes, &mech_param, requested_len)
             {
                 Ok(s) => s,
                 Err(e) => return err_to_rv(e),
             }
         };
+        drop(bk_obj);
 
         // Validate the derived secret is a valid AES key size
         let shared_secret = {
