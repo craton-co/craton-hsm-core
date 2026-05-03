@@ -56,6 +56,28 @@ pub trait CryptoBackend: Send + Sync {
         hash_alg: Option<HashAlg>,
     ) -> HsmResult<bool>;
 
+    /// RSA PKCS#1 v1.5 verify with a (slot_id, handle) hint that backends MAY use to
+    /// look up an already-parsed `RsaPublicKey` rather than re-build the BigUint
+    /// modulus + exponent on every call.  The default implementation ignores
+    /// the hint and falls back to `rsa_pkcs1v15_verify` so backends without a
+    /// handle cache (e.g. aws-lc-rs) inherit working behavior.
+    ///
+    /// Eliminates the BigUint reconstruction and `RsaPublicKey::new` work
+    /// (~500-1000 ns/verify, ~5-15 % of total verify latency) on cache hits.
+    /// See ROADMAP.md "Cache parsed RSA public keys".
+    fn rsa_pkcs1v15_verify_with_handle(
+        &self,
+        _slot_id: u64,
+        _handle: u64,
+        modulus: &[u8],
+        public_exponent: &[u8],
+        data: &[u8],
+        signature: &[u8],
+        hash_alg: Option<HashAlg>,
+    ) -> HsmResult<bool> {
+        self.rsa_pkcs1v15_verify(modulus, public_exponent, data, signature, hash_alg)
+    }
+
     fn rsa_pss_sign(
         &self,
         private_key_der: &[u8],
@@ -83,6 +105,20 @@ pub trait CryptoBackend: Send + Sync {
         signature: &[u8],
         hash_alg: HashAlg,
     ) -> HsmResult<bool>;
+
+    /// RSA-PSS verify with handle hint.  See `rsa_pkcs1v15_verify_with_handle`.
+    fn rsa_pss_verify_with_handle(
+        &self,
+        _slot_id: u64,
+        _handle: u64,
+        modulus: &[u8],
+        public_exponent: &[u8],
+        data: &[u8],
+        signature: &[u8],
+        hash_alg: HashAlg,
+    ) -> HsmResult<bool> {
+        self.rsa_pss_verify(modulus, public_exponent, data, signature, hash_alg)
+    }
 
     fn ecdsa_p256_sign(&self, private_key_bytes: &[u8], data: &[u8]) -> HsmResult<Vec<u8>>;
 
@@ -144,6 +180,21 @@ pub trait CryptoBackend: Send + Sync {
         hash_alg: HashAlg,
     ) -> HsmResult<bool>;
 
+    /// Prehashed RSA PKCS#1 v1.5 verify with handle hint.
+    /// See `rsa_pkcs1v15_verify_with_handle` for rationale.
+    fn rsa_pkcs1v15_verify_prehashed_with_handle(
+        &self,
+        _slot_id: u64,
+        _handle: u64,
+        modulus: &[u8],
+        public_exponent: &[u8],
+        digest: &[u8],
+        signature: &[u8],
+        hash_alg: HashAlg,
+    ) -> HsmResult<bool> {
+        self.rsa_pkcs1v15_verify_prehashed(modulus, public_exponent, digest, signature, hash_alg)
+    }
+
     fn rsa_pss_sign_prehashed(
         &self,
         private_key_der: &[u8],
@@ -172,6 +223,21 @@ pub trait CryptoBackend: Send + Sync {
         signature: &[u8],
         hash_alg: HashAlg,
     ) -> HsmResult<bool>;
+
+    /// Prehashed RSA-PSS verify with handle hint.
+    /// See `rsa_pkcs1v15_verify_with_handle` for rationale.
+    fn rsa_pss_verify_prehashed_with_handle(
+        &self,
+        _slot_id: u64,
+        _handle: u64,
+        modulus: &[u8],
+        public_exponent: &[u8],
+        digest: &[u8],
+        signature: &[u8],
+        hash_alg: HashAlg,
+    ) -> HsmResult<bool> {
+        self.rsa_pss_verify_prehashed(modulus, public_exponent, digest, signature, hash_alg)
+    }
 
     fn ecdsa_p256_sign_prehashed(
         &self,
@@ -217,6 +283,20 @@ pub trait CryptoBackend: Send + Sync {
         plaintext: &[u8],
         hash_alg: super::sign::OaepHash,
     ) -> HsmResult<Vec<u8>>;
+
+    /// RSA-OAEP encrypt with handle hint.
+    /// See `rsa_pkcs1v15_verify_with_handle` for rationale.
+    fn rsa_oaep_encrypt_with_handle(
+        &self,
+        _slot_id: u64,
+        _handle: u64,
+        modulus: &[u8],
+        public_exponent: &[u8],
+        plaintext: &[u8],
+        hash_alg: super::sign::OaepHash,
+    ) -> HsmResult<Vec<u8>> {
+        self.rsa_oaep_encrypt(modulus, public_exponent, plaintext, hash_alg)
+    }
 
     fn rsa_oaep_decrypt(
         &self,

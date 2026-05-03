@@ -1677,8 +1677,15 @@ pub extern "C" fn C_Encrypt(
                         return rv;
                     }
                 };
-                hsm.crypto_backend
-                    .rsa_oaep_encrypt(modulus, pub_exp, data, oaep_hash)
+                let slot_id = sess.slot_id;
+                hsm.crypto_backend.rsa_oaep_encrypt_with_handle(
+                    slot_id as u64,
+                    key_handle as u64,
+                    modulus,
+                    pub_exp,
+                    data,
+                    oaep_hash,
+                )
             }
             _ => {
                 sess.active_operation = None;
@@ -2283,9 +2290,17 @@ fn sign_prehashed(
     }
 }
 
-/// Single-shot verify: hash + verify in one step (used by C_Verify and C_VerifyFinal for non-hashed mechanisms)
+/// Single-shot verify: hash + verify in one step (used by C_Verify and C_VerifyFinal for non-hashed mechanisms).
+///
+/// `slot_id` and `key_handle` identify the PKCS#11 object backing the public
+/// key; for RSA mechanisms they are forwarded to `*_with_handle` backend
+/// methods so the backend can hit the handle-based RSA public-key cache and
+/// avoid rebuilding the BigUint modulus + exponent on every call (see
+/// ROADMAP.md "Cache parsed RSA public keys").
 fn verify_single_shot(
     backend: &dyn CryptoBackend,
+    slot_id: u64,
+    key_handle: u64,
     mechanism: CK_MECHANISM_TYPE,
     data: &[u8],
     signature: &[u8],
@@ -2298,7 +2313,9 @@ fn verify_single_shot(
             .as_deref()
             .ok_or(HsmError::KeyHandleInvalid)?;
         let hash = sign::pss_mechanism_to_hash(mechanism)?;
-        backend.rsa_pss_verify(modulus, pub_exp, data, signature, hash)
+        backend.rsa_pss_verify_with_handle(
+            slot_id, key_handle, modulus, pub_exp, data, signature, hash,
+        )
     } else if sign::is_ecdsa_mechanism(mechanism) {
         let ec_point = obj.ec_point.as_deref().ok_or(HsmError::KeyHandleInvalid)?;
         let ec_params = obj.ec_params.as_deref().unwrap_or(&[]);
@@ -2348,14 +2365,21 @@ fn verify_single_shot(
             .as_deref()
             .ok_or(HsmError::KeyHandleInvalid)?;
         let hash_alg = sign::mechanism_to_hash(mechanism);
-        backend.rsa_pkcs1v15_verify(modulus, pub_exp, data, signature, hash_alg)
+        backend.rsa_pkcs1v15_verify_with_handle(
+            slot_id, key_handle, modulus, pub_exp, data, signature, hash_alg,
+        )
     }
 }
 
 /// Prehashed verify: used by C_VerifyFinal when data was hashed via multi-part C_VerifyUpdate.
 /// The `digest` is the finalized hash output.
+///
+/// `slot_id` and `key_handle` are forwarded to `*_with_handle` backend methods
+/// for the RSA paths (see `verify_single_shot`).
 fn verify_prehashed(
     backend: &dyn CryptoBackend,
+    slot_id: u64,
+    key_handle: u64,
     mechanism: CK_MECHANISM_TYPE,
     digest: &[u8],
     signature: &[u8],
@@ -2368,7 +2392,9 @@ fn verify_prehashed(
             .as_deref()
             .ok_or(HsmError::KeyHandleInvalid)?;
         let hash = sign::pss_mechanism_to_hash(mechanism)?;
-        backend.rsa_pss_verify_prehashed(modulus, pub_exp, digest, signature, hash)
+        backend.rsa_pss_verify_prehashed_with_handle(
+            slot_id, key_handle, modulus, pub_exp, digest, signature, hash,
+        )
     } else if sign::is_ecdsa_mechanism(mechanism) {
         let ec_point = obj.ec_point.as_deref().ok_or(HsmError::KeyHandleInvalid)?;
         let ec_params = obj.ec_params.as_deref().unwrap_or(&[]);
@@ -2385,7 +2411,9 @@ fn verify_prehashed(
             .as_deref()
             .ok_or(HsmError::KeyHandleInvalid)?;
         let hash_alg = sign::mechanism_to_hash(mechanism).ok_or(HsmError::MechanismInvalid)?;
-        backend.rsa_pkcs1v15_verify_prehashed(modulus, pub_exp, digest, signature, hash_alg)
+        backend.rsa_pkcs1v15_verify_prehashed_with_handle(
+            slot_id, key_handle, modulus, pub_exp, digest, signature, hash_alg,
+        )
     }
 }
 
@@ -2508,7 +2536,16 @@ pub extern "C" fn C_Verify(
         };
         let obj = obj.read();
 
-        let result = verify_single_shot(&*hsm.crypto_backend, mechanism, data, signature, &obj);
+        let slot_id = sess.slot_id;
+        let result = verify_single_shot(
+            &*hsm.crypto_backend,
+            slot_id as u64,
+            key_handle as u64,
+            mechanism,
+            data,
+            signature,
+            &obj,
+        );
 
         sess.active_operation = None;
 
@@ -4981,13 +5018,30 @@ pub extern "C" fn C_VerifyFinal(
         };
         let obj = obj.read();
 
+        let slot_id = sess.slot_id;
         let result = if let Some(h) = hasher {
             // Multi-part with built-in hash: finalize hash, then prehash verify
             let digest = h.finalize();
-            verify_prehashed(&*hsm.crypto_backend, mechanism, &digest, signature, &obj)
+            verify_prehashed(
+                &*hsm.crypto_backend,
+                slot_id as u64,
+                key_handle as u64,
+                mechanism,
+                &digest,
+                signature,
+                &obj,
+            )
         } else {
             // Accumulated raw data: verify directly (same as C_Verify)
-            verify_single_shot(&*hsm.crypto_backend, mechanism, &data, signature, &obj)
+            verify_single_shot(
+                &*hsm.crypto_backend,
+                slot_id as u64,
+                key_handle as u64,
+                mechanism,
+                &data,
+                signature,
+                &obj,
+            )
         };
 
         sess.active_operation = None;
