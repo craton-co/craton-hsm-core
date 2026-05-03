@@ -433,3 +433,125 @@ pub trait CryptoBackend: Send + Sync {
         super::pqc::hybrid_kem_decapsulate(composite_dk, composite_ct, variant)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Trait-level coverage for the stack-buffer signing methods.
+    //!
+    //! These tests confirm that the `*_into_buf` overrides on
+    //! `RustCryptoBackend` produce the same byte count as the corresponding
+    //! `Vec<u8>`-returning trait methods. Exact equality of the bytes is not
+    //! checked because ECDSA hedged signing is randomized — only the length
+    //! is deterministic for Ed25519 (always 64 bytes) and bounded for ECDSA.
+
+    use super::*;
+    use crate::crypto::rustcrypto_backend::RustCryptoBackend;
+
+    fn message() -> &'static [u8] {
+        b"craton-hsm trait _into_buf round-trip"
+    }
+
+    #[test]
+    fn ecdsa_p256_sign_into_buf_matches_vec_len() {
+        let backend = RustCryptoBackend;
+        let (priv_key, _pub_key) = backend
+            .generate_ec_p256_key_pair()
+            .expect("generate p256 keypair");
+
+        let vec_sig = backend
+            .ecdsa_p256_sign(priv_key.as_bytes(), message())
+            .expect("ecdsa_p256_sign");
+
+        let mut buf = [0u8; SIG_STACK_BUF_SIZE];
+        let n = backend
+            .ecdsa_p256_sign_into_buf(priv_key.as_bytes(), message(), &mut buf)
+            .expect("ecdsa_p256_sign_into_buf");
+
+        // ECDSA DER signatures vary by 1-2 bytes per call because of
+        // leading-zero stripping in the integer encoding. Both lengths
+        // must land in the same valid DER-P256 range (~70-72 bytes) and
+        // fit inside SIG_STACK_BUF_SIZE.
+        assert!(
+            (70..=72).contains(&vec_sig.len()),
+            "vec sig len {} not in DER-P256 range",
+            vec_sig.len()
+        );
+        assert!(
+            (70..=72).contains(&n),
+            "stack sig len {} not in DER-P256 range",
+            n
+        );
+        assert!(n <= SIG_STACK_BUF_SIZE);
+
+        // Verify the stack-buffer signature round-trips.
+        let pub_sec1 = _pub_key;
+        let ok = backend
+            .ecdsa_p256_verify(&pub_sec1, message(), &buf[..n])
+            .expect("ecdsa_p256_verify");
+        assert!(ok, "stack-buffer signature must verify");
+    }
+
+    #[test]
+    fn ecdsa_p384_sign_into_buf_matches_vec_len() {
+        let backend = RustCryptoBackend;
+        let (priv_key, pub_sec1) = backend
+            .generate_ec_p384_key_pair()
+            .expect("generate p384 keypair");
+
+        let vec_sig = backend
+            .ecdsa_p384_sign(priv_key.as_bytes(), message())
+            .expect("ecdsa_p384_sign");
+
+        let mut buf = [0u8; SIG_STACK_BUF_SIZE];
+        let n = backend
+            .ecdsa_p384_sign_into_buf(priv_key.as_bytes(), message(), &mut buf)
+            .expect("ecdsa_p384_sign_into_buf");
+
+        // P-384 DER signatures fall in the ~100-104 byte range due to the
+        // same leading-zero-stripping variability as P-256.
+        assert!(
+            (100..=104).contains(&vec_sig.len()),
+            "vec sig len {} not in DER-P384 range",
+            vec_sig.len()
+        );
+        assert!(
+            (100..=104).contains(&n),
+            "stack sig len {} not in DER-P384 range",
+            n
+        );
+        assert!(n <= SIG_STACK_BUF_SIZE);
+
+        let ok = backend
+            .ecdsa_p384_verify(&pub_sec1, message(), &buf[..n])
+            .expect("ecdsa_p384_verify");
+        assert!(ok, "stack-buffer signature must verify");
+    }
+
+    #[test]
+    fn ed25519_sign_into_buf_matches_vec() {
+        let backend = RustCryptoBackend;
+        let (priv_key, pub_key) = backend
+            .generate_ed25519_key_pair()
+            .expect("generate ed25519 keypair");
+
+        let vec_sig = backend
+            .ed25519_sign(priv_key.as_bytes(), message())
+            .expect("ed25519_sign");
+
+        let mut buf = [0u8; SIG_STACK_BUF_SIZE];
+        let n = backend
+            .ed25519_sign_into_buf(priv_key.as_bytes(), message(), &mut buf)
+            .expect("ed25519_sign_into_buf");
+
+        // Ed25519 signing is fully deterministic (RFC 8032), so byte-for-byte
+        // equality holds and the length is always 64.
+        assert_eq!(n, vec_sig.len());
+        assert_eq!(n, 64);
+        assert_eq!(&buf[..n], vec_sig.as_slice());
+
+        let ok = backend
+            .ed25519_verify(&pub_key, message(), &buf[..n])
+            .expect("ed25519_verify");
+        assert!(ok, "stack-buffer signature must verify");
+    }
+}
