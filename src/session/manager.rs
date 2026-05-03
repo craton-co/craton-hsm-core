@@ -212,6 +212,11 @@ impl SessionManager {
     /// without DashMap lookup.  A generation mismatch (sessions were removed
     /// since the cache was filled) forces a DashMap re-lookup, preventing
     /// use-after-close races (H3).
+    ///
+    /// Roadmap Near-Term: TLS session cache — implemented via TLS_SESSION_CACHE
+    /// + generation counter.  Used by hot-path PKCS#11 entry points (C_Sign,
+    /// C_Verify, C_Encrypt, C_Decrypt, C_Digest, C_GetSessionInfo, C_FindObjects,
+    /// C_GenerateRandom) to skip the DashMap shard lock on repeated access.
     pub fn get_session_cached(&self, handle: CK_SESSION_HANDLE) -> HsmResult<Arc<RwLock<Session>>> {
         let current_gen = self.generation.load(Ordering::Acquire);
 

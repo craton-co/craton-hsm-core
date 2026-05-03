@@ -882,7 +882,8 @@ pub extern "C" fn C_GetSessionInfo(
             return CKR_ARGUMENTS_BAD;
         }
 
-        let sess = match hsm.session_manager.get_session(session) {
+        // Roadmap Near-Term: TLS session cache hot path.
+        let sess = match hsm.session_manager.get_session_cached(session) {
             Ok(s) => s,
             Err(e) => return err_to_rv(e),
         };
@@ -1374,7 +1375,8 @@ pub extern "C" fn C_FindObjects(
         // more handles than the cap can simply call C_FindObjects again.
         let max_count_usize = (max_count as u64).min(MAX_FIND_OBJECTS_PER_CALL as u64) as usize;
 
-        let sess = match hsm.session_manager.get_session(session) {
+        // Roadmap Near-Term: TLS session cache hot path.
+        let sess = match hsm.session_manager.get_session_cached(session) {
             Ok(s) => s,
             Err(e) => return err_to_rv(e),
         };
@@ -1559,7 +1561,8 @@ pub extern "C" fn C_Encrypt(
             return CKR_ARGUMENTS_BAD;
         }
 
-        let sess = match hsm.session_manager.get_session(session) {
+        // Roadmap Near-Term: TLS session cache hot path.
+        let sess = match hsm.session_manager.get_session_cached(session) {
             Ok(s) => s,
             Err(e) => return err_to_rv(e),
         };
@@ -1815,7 +1818,8 @@ pub extern "C" fn C_Decrypt(
             return CKR_ARGUMENTS_BAD;
         }
 
-        let sess = match hsm.session_manager.get_session(session) {
+        // Roadmap Near-Term: TLS session cache hot path.
+        let sess = match hsm.session_manager.get_session_cached(session) {
             Ok(s) => s,
             Err(e) => return err_to_rv(e),
         };
@@ -2059,7 +2063,8 @@ pub extern "C" fn C_Sign(
             return CKR_ARGUMENTS_BAD;
         }
 
-        let sess = match hsm.session_manager.get_session(session) {
+        // Roadmap Near-Term: TLS session cache hot path.
+        let sess = match hsm.session_manager.get_session_cached(session) {
             Ok(s) => s,
             Err(e) => return err_to_rv(e),
         };
@@ -2443,7 +2448,8 @@ pub extern "C" fn C_Verify(
             return CKR_ARGUMENTS_BAD;
         }
 
-        let sess = match hsm.session_manager.get_session(session) {
+        // Roadmap Near-Term: TLS session cache hot path.
+        let sess = match hsm.session_manager.get_session_cached(session) {
             Ok(s) => s,
             Err(e) => return err_to_rv(e),
         };
@@ -3317,7 +3323,8 @@ pub extern "C" fn C_GenerateRandom(
         if (random_len as usize) > MAX_SINGLE_BUFFER {
             return CKR_DATA_LEN_RANGE;
         }
-        let _ = match hsm.session_manager.get_session(session) {
+        // Roadmap Near-Term: TLS session cache hot path.
+        let _ = match hsm.session_manager.get_session_cached(session) {
             Ok(s) => s,
             Err(e) => return err_to_rv(e),
         };
@@ -4341,7 +4348,8 @@ pub extern "C" fn C_Digest(
             return CKR_ARGUMENTS_BAD;
         }
 
-        let sess = match hsm.session_manager.get_session(session) {
+        // Roadmap Near-Term: TLS session cache hot path.
+        let sess = match hsm.session_manager.get_session_cached(session) {
             Ok(s) => s,
             Err(e) => return err_to_rv(e),
         };
