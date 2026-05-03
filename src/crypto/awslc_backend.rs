@@ -16,7 +16,7 @@ use aws_lc_rs::{
 
 use crate::crypto::backend::CryptoBackend;
 use crate::crypto::digest::DigestAccumulator;
-use crate::crypto::sign::{HashAlg, OaepHash};
+use crate::crypto::sign::{HashAlg, OaepHash, SIG_STACK_BUF_SIZE};
 use crate::error::{HsmError, HsmResult};
 use crate::pkcs11_abi::constants::*;
 use crate::pkcs11_abi::types::CK_MECHANISM_TYPE;
@@ -198,6 +198,81 @@ impl CryptoBackend for AwsLcBackend {
         }
         let pub_key = signature::UnparsedPublicKey::new(&signature::ED25519, public_key_bytes);
         Ok(pub_key.verify(data, signature_bytes).is_ok())
+    }
+
+    // ========================================================================
+    // Stack-buffer signing — write the aws-lc-rs Signature directly into the
+    // caller buffer instead of allocating a `Vec<u8>` first.
+    // ========================================================================
+
+    fn ecdsa_p256_sign_into_buf(
+        &self,
+        private_key_bytes: &[u8],
+        data: &[u8],
+        out: &mut [u8; SIG_STACK_BUF_SIZE],
+    ) -> HsmResult<usize> {
+        let pub_key = derive_ec_public_key(private_key_bytes, &agreement::ECDH_P256)?;
+        let key_pair = EcdsaKeyPair::from_private_key_and_public_key(
+            &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+            private_key_bytes,
+            &pub_key,
+        )
+        .map_err(|_| HsmError::KeyHandleInvalid)?;
+
+        let rng = awslc_rand::SystemRandom::new();
+        let sig = key_pair
+            .sign(&rng, data)
+            .map_err(|_| HsmError::GeneralError)?;
+        let sig_bytes = sig.as_ref();
+        if sig_bytes.len() > out.len() {
+            return Err(HsmError::DataLenRange);
+        }
+        out[..sig_bytes.len()].copy_from_slice(sig_bytes);
+        Ok(sig_bytes.len())
+    }
+
+    fn ecdsa_p384_sign_into_buf(
+        &self,
+        private_key_bytes: &[u8],
+        data: &[u8],
+        out: &mut [u8; SIG_STACK_BUF_SIZE],
+    ) -> HsmResult<usize> {
+        let pub_key = derive_ec_public_key(private_key_bytes, &agreement::ECDH_P384)?;
+        let key_pair = EcdsaKeyPair::from_private_key_and_public_key(
+            &signature::ECDSA_P384_SHA384_ASN1_SIGNING,
+            private_key_bytes,
+            &pub_key,
+        )
+        .map_err(|_| HsmError::KeyHandleInvalid)?;
+
+        let rng = awslc_rand::SystemRandom::new();
+        let sig = key_pair
+            .sign(&rng, data)
+            .map_err(|_| HsmError::GeneralError)?;
+        let sig_bytes = sig.as_ref();
+        if sig_bytes.len() > out.len() {
+            return Err(HsmError::DataLenRange);
+        }
+        out[..sig_bytes.len()].copy_from_slice(sig_bytes);
+        Ok(sig_bytes.len())
+    }
+
+    fn ed25519_sign_into_buf(
+        &self,
+        private_key_bytes: &[u8],
+        data: &[u8],
+        out: &mut [u8; SIG_STACK_BUF_SIZE],
+    ) -> HsmResult<usize> {
+        if private_key_bytes.len() != 32 {
+            return Err(HsmError::KeyHandleInvalid);
+        }
+        let key_pair = Ed25519KeyPair::from_seed_unchecked(private_key_bytes)
+            .map_err(|_| HsmError::KeyHandleInvalid)?;
+        let sig = key_pair.sign(data);
+        let sig_bytes = sig.as_ref();
+        // Ed25519 signatures are always 64 bytes — well under SIG_STACK_BUF_SIZE.
+        out[..sig_bytes.len()].copy_from_slice(sig_bytes);
+        Ok(sig_bytes.len())
     }
 
     // ========================================================================

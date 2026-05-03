@@ -1,5 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Craton Software Company
+//
+// # Stack-allocated signature buffers (perf)
+//
+// ECDSA P-256 / P-384 and Ed25519 produce signatures that fit in a small
+// fixed-size buffer (≤144 bytes — see `SIG_STACK_BUF_SIZE`). The
+// `*_sign_into_buf` variants below write directly into a caller-owned
+// `[u8; SIG_STACK_BUF_SIZE]` and return the byte length, avoiding the
+// `Vec<u8>` allocation done by `*_sign`. They are wired end-to-end via
+// `CryptoBackend::{ecdsa_p256,ecdsa_p384,ed25519}_sign_into_buf`, so
+// dispatcher code can request a stack signature through the trait surface
+// rather than reaching into the free functions directly.
+//
+// RSA signatures (256–512 bytes) come out of the `rsa` crate as
+// heap-allocated `Vec<u8>` and intentionally bypass this path. ML-DSA /
+// SLH-DSA and hybrid PQC signatures (multi-KB) are far too large for a
+// stack buffer and also stay on the heap.
+
 use rsa::pkcs8::DecodePrivateKey;
 use rsa::{Pkcs1v15Sign, RsaPrivateKey, RsaPublicKey};
 #[allow(unused_imports)]
@@ -994,6 +1011,19 @@ pub fn ecdsa_p256_verify(
     Ok(verifying_key.verify(data, &signature).is_ok())
 }
 
+/// Maximum signature length (in bytes) covered by the stack-allocated
+/// signature buffer used by `*_into_buf` sign variants.
+///
+/// Sized for the largest ECDSA / EdDSA signature shape we produce:
+/// - Ed25519: 64 bytes
+/// - ECDSA P-256 raw `r||s`: 64 bytes; DER: up to ~72 bytes
+/// - ECDSA P-384 raw `r||s`: 96 bytes; DER: up to ~104 bytes
+///
+/// 144 leaves comfortable headroom and keeps the buffer cache-line friendly.
+/// RSA (256–512 byte signatures) and ML-DSA / SLH-DSA / hybrid signatures
+/// (multi-KB) intentionally bypass this path and continue to allocate.
+pub const SIG_STACK_BUF_SIZE: usize = 144;
+
 /// ECDSA P-256 sign — write directly into a caller-provided output buffer.
 ///
 /// Returns the number of bytes written on success, or `HsmError::BufferTooSmall`
@@ -1003,7 +1033,7 @@ pub fn ecdsa_p256_verify(
 /// down to the crypto backend.
 ///
 /// The DER encoding of an ECDSA P-256 signature is at most 72 bytes; callers
-/// should size the buffer accordingly.
+/// should size the buffer accordingly (or use a `SIG_STACK_BUF_SIZE` array).
 pub fn ecdsa_p256_sign_into_buf(
     private_key_bytes: &[u8],
     data: &[u8],
@@ -1871,6 +1901,8 @@ mod tests {
             get_cached_rsa_public_key(slot, handle).is_none(),
             "evict_cached_keys must drop the public-key entry"
         );
+    }
+
     // ---- output-buffer-threading _into_buf tests ----
 
     /// `ecdsa_p256_sign_into_buf` writes the same DER signature bytes as

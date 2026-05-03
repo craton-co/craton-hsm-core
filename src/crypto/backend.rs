@@ -10,8 +10,8 @@
 
 use super::digest::DigestAccumulator;
 use super::pqc::{HybridKemVariant, MlDsaVariant, MlKemVariant, SlhDsaVariant};
-use super::sign::HashAlg;
-use crate::error::HsmResult;
+use super::sign::{HashAlg, SIG_STACK_BUF_SIZE};
+use crate::error::{HsmError, HsmResult};
 use crate::pkcs11_abi::types::CK_MECHANISM_TYPE;
 use crate::store::key_material::RawKeyMaterial;
 
@@ -146,6 +146,66 @@ pub trait CryptoBackend: Send + Sync {
         data: &[u8],
         signature_bytes: &[u8],
     ) -> HsmResult<bool>;
+
+    // ========================================================================
+    // Stack-buffer signing (perf — avoids `Vec<u8>` allocation on the hot path)
+    // ========================================================================
+    //
+    // These mirror the `*_sign` methods above but write the signature into a
+    // caller-owned fixed-size buffer instead of returning a heap-allocated
+    // `Vec<u8>`. The default impls just delegate to the `Vec`-returning
+    // variants and copy the bytes in, so backends that do not override get
+    // correct behaviour with no perf gain. Backends that wrap a primitive
+    // capable of writing into a slice (RustCrypto, aws-lc-rs) override these
+    // to skip the intermediate `Vec` allocation.
+
+    /// ECDSA P-256 sign into a caller-supplied stack buffer. Returns the
+    /// number of bytes written. See `crypto::sign::ecdsa_p256_sign_into_buf`.
+    fn ecdsa_p256_sign_into_buf(
+        &self,
+        private_key_bytes: &[u8],
+        data: &[u8],
+        out: &mut [u8; SIG_STACK_BUF_SIZE],
+    ) -> HsmResult<usize> {
+        let sig = self.ecdsa_p256_sign(private_key_bytes, data)?;
+        if sig.len() > out.len() {
+            return Err(HsmError::DataLenRange);
+        }
+        out[..sig.len()].copy_from_slice(&sig);
+        Ok(sig.len())
+    }
+
+    /// ECDSA P-384 sign into a caller-supplied stack buffer. Returns the
+    /// number of bytes written. See `crypto::sign::ecdsa_p384_sign_into_buf`.
+    fn ecdsa_p384_sign_into_buf(
+        &self,
+        private_key_bytes: &[u8],
+        data: &[u8],
+        out: &mut [u8; SIG_STACK_BUF_SIZE],
+    ) -> HsmResult<usize> {
+        let sig = self.ecdsa_p384_sign(private_key_bytes, data)?;
+        if sig.len() > out.len() {
+            return Err(HsmError::DataLenRange);
+        }
+        out[..sig.len()].copy_from_slice(&sig);
+        Ok(sig.len())
+    }
+
+    /// Ed25519 sign into a caller-supplied stack buffer. Returns the
+    /// number of bytes written. See `crypto::sign::ed25519_sign_into_buf`.
+    fn ed25519_sign_into_buf(
+        &self,
+        private_key_bytes: &[u8],
+        data: &[u8],
+        out: &mut [u8; SIG_STACK_BUF_SIZE],
+    ) -> HsmResult<usize> {
+        let sig = self.ed25519_sign(private_key_bytes, data)?;
+        if sig.len() > out.len() {
+            return Err(HsmError::DataLenRange);
+        }
+        out[..sig.len()].copy_from_slice(&sig);
+        Ok(sig.len())
+    }
 
     // ========================================================================
     // Prehashed signing (for multi-part C_SignUpdate/C_SignFinal)

@@ -70,6 +70,11 @@ fs2 = "0.4"
 parking_lot = "0.12"
 dashmap = "6"
 
+# Stack-allocated bounded buffers for ECDSA/EdDSA signature output paths.
+# ECDSA P-256/P-384 (raw or DER) and Ed25519 all fit in <=144 bytes,
+# so a small inline buffer avoids heap allocation on the sign hot path.
+arrayvec = "0.7"
+
 # Config and logging
 toml = "1"
 serde = { version = "1", features = ["derive"] }
