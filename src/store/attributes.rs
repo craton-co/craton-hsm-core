@@ -4,6 +4,7 @@ use dashmap::DashMap;
 use parking_lot::RwLock;
 use rand::rngs::OsRng;
 use rand::RngCore;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use zeroize::Zeroize;
 
@@ -14,6 +15,12 @@ use crate::session::handle::ObjectHandleAllocator;
 use crate::store::encrypted_store::EncryptedStore;
 use crate::store::key_material::RawKeyMaterial;
 use crate::store::object::StoredObject;
+
+/// Sentinel value used in the secondary attribute index when an object has
+/// no `CKA_KEY_TYPE` (e.g., certificate or data objects). Uses `CK_ULONG::MAX`
+/// which is platform-portable (c_ulong is 32-bit on Windows, 64-bit on Linux)
+/// and well outside any real PKCS#11 key-type constant.
+const NO_KEY_TYPE: CK_ULONG = CK_ULONG::MAX;
 
 /// Maximum number of objects that can be stored simultaneously.
 /// Prevents resource exhaustion via unbounded object creation.
@@ -44,6 +51,16 @@ pub struct ObjectStore {
     /// Maps object handles to their opaque store keys (random hex strings).
     /// Prevents sequential handle enumeration in the persistent store.
     handle_to_store_key: parking_lot::Mutex<std::collections::HashMap<CK_OBJECT_HANDLE, String>>,
+    /// Secondary attribute index keyed by `(CKA_CLASS, CKA_KEY_TYPE)` mapping
+    /// to the set of object handles with that combination. Used as an
+    /// optimization hint inside `find_objects_for_slot` when the search
+    /// template is selective on both attributes — the iteration still visits
+    /// every object (constant-time invariant) but the per-object work is
+    /// reduced to a cheap `HashSet::contains` lookup for non-candidates.
+    ///
+    /// Use `NO_KEY_TYPE` as the second tuple element when an object has no
+    /// `CKA_KEY_TYPE` (e.g., certificate / data objects).
+    attr_index: parking_lot::RwLock<HashMap<(CK_ULONG, CK_ULONG), HashSet<CK_OBJECT_HANDLE>>>,
 }
 
 impl ObjectStore {
@@ -54,6 +71,7 @@ impl ObjectStore {
             persist_store: None,
             persist_key: parking_lot::Mutex::new(None),
             handle_to_store_key: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            attr_index: parking_lot::RwLock::new(HashMap::new()),
         }
     }
 
@@ -70,7 +88,40 @@ impl ObjectStore {
             persist_store: Some(store),
             persist_key: parking_lot::Mutex::new(None),
             handle_to_store_key: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            attr_index: parking_lot::RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Add a handle to the secondary `(class, key_type)` index.
+    ///
+    /// `key_type` should be `NO_KEY_TYPE` when the object has no `CKA_KEY_TYPE`.
+    fn index_insert(&self, class: CK_ULONG, key_type: CK_ULONG, handle: CK_OBJECT_HANDLE) {
+        self.attr_index
+            .write()
+            .entry((class, key_type))
+            .or_default()
+            .insert(handle);
+    }
+
+    /// Remove a handle from the secondary `(class, key_type)` index.
+    /// Cleans up empty buckets so the map doesn't grow unbounded.
+    fn index_remove(&self, handle: CK_OBJECT_HANDLE) {
+        let mut idx = self.attr_index.write();
+        let mut empty_keys = Vec::new();
+        for (k, set) in idx.iter_mut() {
+            set.remove(&handle);
+            if set.is_empty() {
+                empty_keys.push(*k);
+            }
+        }
+        for k in empty_keys {
+            idx.remove(&k);
+        }
+    }
+
+    /// Helper: derive the index tuple from a `StoredObject`.
+    fn index_key_for(obj: &StoredObject) -> (CK_ULONG, CK_ULONG) {
+        (obj.class, obj.key_type.unwrap_or(NO_KEY_TYPE))
     }
 
     /// Generate an opaque, random store key for a new object.
@@ -163,6 +214,9 @@ impl ObjectStore {
                         self.handle_to_store_key.lock().insert(handle, store_key);
                         // Ensure handle allocator is past this handle
                         self.handle_alloc.ensure_past(handle);
+                        // Maintain the (class, key_type) secondary index
+                        let (cls, kt) = Self::index_key_for(&obj);
+                        self.index_insert(cls, kt, handle);
                         self.objects.insert(handle, Arc::new(RwLock::new(obj)));
                         loaded += 1;
                     }
@@ -262,6 +316,10 @@ impl ObjectStore {
         // Persist if it's a token object
         self.persist_object(&obj);
 
+        // Maintain the (class, key_type) secondary index
+        let (cls, kt) = Self::index_key_for(&obj);
+        self.index_insert(cls, kt, handle);
+
         self.objects.insert(handle, Arc::new(RwLock::new(obj)));
         Ok(handle)
     }
@@ -280,6 +338,10 @@ impl ObjectStore {
 
         // Persist if it's a token object
         self.persist_object(&obj);
+
+        // Maintain the (class, key_type) secondary index
+        let (cls, kt) = Self::index_key_for(&obj);
+        self.index_insert(cls, kt, handle);
 
         self.objects.insert(handle, Arc::new(RwLock::new(obj)));
         Ok(handle)
@@ -305,6 +367,8 @@ impl ObjectStore {
             Some(_) => {
                 // Successfully removed a destroyable object
                 self.unpersist_object(handle);
+                // Drop the handle from the secondary attribute index.
+                self.index_remove(handle);
                 Ok(())
             }
             None => {
@@ -338,6 +402,7 @@ impl ObjectStore {
     pub fn clear(&self) {
         self.objects.clear();
         self.handle_to_store_key.lock().clear();
+        self.attr_index.write().clear();
 
         // Also clear the persistent store
         if let Some(ref store) = self.persist_store {
@@ -373,6 +438,20 @@ impl ObjectStore {
     /// deployments.
     ///
     /// Always iterates *all* objects to maintain constant-time behavior.
+    ///
+    /// **Performance hint**: when the template specifies *both* `CKA_CLASS`
+    /// and `CKA_KEY_TYPE` (the most-selective common case), the secondary
+    /// `attr_index` is consulted to obtain the candidate handle set. The
+    /// outer iteration still visits every object — including a read-lock
+    /// acquisition on its `RwLock` — so the timing-side-channel invariant
+    /// described above is preserved. Inside the inner check, however,
+    /// non-candidate handles short-circuit `matches_template` to a constant
+    /// "no match", avoiding the full attribute-by-attribute comparison.
+    /// This keeps the wall-clock cost of a highly-selective find roughly
+    /// proportional to the candidate count rather than the total object
+    /// count, while leaking no more information than the existing iteration
+    /// already does about the *count* of objects (which is itself derivable
+    /// from the pre-allocated `results` vector capacity).
     pub fn find_objects_for_slot(
         &self,
         template: &[(CK_ATTRIBUTE_TYPE, Vec<u8>)],
@@ -384,11 +463,58 @@ impl ObjectStore {
         // states from leaking information about private object counts.
         let total = self.objects.len();
         let mut results = Vec::with_capacity(total);
+
+        // Optimization hint: if the template fixes both CKA_CLASS and
+        // CKA_KEY_TYPE, look up the candidate set from the secondary index.
+        // We still iterate every object below, but inner short-circuiting
+        // becomes a cheap HashSet::contains check.
+        let mut tmpl_class: Option<CK_ULONG> = None;
+        let mut tmpl_key_type: Option<CK_ULONG> = None;
+        for (attr_type, value) in template {
+            match *attr_type {
+                CKA_CLASS => {
+                    if let Some(v) = read_ck_ulong(value) {
+                        tmpl_class = Some(v);
+                    }
+                }
+                CKA_KEY_TYPE => {
+                    if let Some(v) = read_ck_ulong(value) {
+                        tmpl_key_type = Some(v);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // `candidates` is `Some` only when both CKA_CLASS and CKA_KEY_TYPE
+        // were specified. In that case we *clone* the candidate handle set
+        // out of the index lock so the inner loop doesn't hold the index
+        // lock while taking per-object read locks (avoids lock-ordering
+        // issues with concurrent create/destroy callers).
+        let candidates: Option<HashSet<CK_OBJECT_HANDLE>> = match (tmpl_class, tmpl_key_type) {
+            (Some(cls), Some(kt)) => {
+                let idx = self.attr_index.read();
+                Some(idx.get(&(cls, kt)).cloned().unwrap_or_default())
+            }
+            _ => None,
+        };
+
         for entry in self.objects.iter() {
+            // Always touch the read lock and the slot bit so timing remains
+            // roughly constant per object regardless of whether the index
+            // says the candidate is interesting.
             let obj = entry.value().read();
-            let matches = obj.matches_template(template);
             let visible = !obj.private || is_logged_in;
             let slot_ok = slot_id.map_or(true, |sid| obj.slot_id == sid);
+
+            // Short-circuit `matches_template` only if the candidate set
+            // explicitly excludes this handle. Without the index the
+            // behavior is identical to the original implementation.
+            let matches = match &candidates {
+                Some(set) if !set.contains(entry.key()) => false,
+                _ => obj.matches_template(template),
+            };
+
             if matches && visible && slot_ok {
                 results.push(*entry.key());
             }
