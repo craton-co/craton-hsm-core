@@ -1,5 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Craton Software Company
+//
+// # Stack-allocated signature buffers (perf)
+//
+// ECDSA P-256 / P-384 and Ed25519 produce signatures that fit in a small
+// fixed-size buffer (≤144 bytes — see `SIG_STACK_BUF_SIZE`). The
+// `*_sign_into_buf` variants below write directly into a caller-owned
+// `[u8; SIG_STACK_BUF_SIZE]` and return the byte length, avoiding the
+// `Vec<u8>` allocation done by `*_sign`.
+//
+// RSA signatures (256–512 bytes) come out of the `rsa` crate as
+// heap-allocated `Vec<u8>` and intentionally bypass this path. ML-DSA /
+// SLH-DSA and hybrid PQC signatures (multi-KB) are far too large for a
+// stack buffer and also stay on the heap.
+//
+// TODO(perf): wire C ABI callers (functions.rs `C_Sign` / `C_SignFinal`)
+// to the `*_into_buf` variants for ECDSA and Ed25519 mechanisms. Today the
+// callers still go through the `Vec<u8>`-returning entry points; only the
+// crypto primitives are stack-buffer ready.
+
 use rsa::pkcs8::DecodePrivateKey;
 use rsa::{Pkcs1v15Sign, RsaPrivateKey, RsaPublicKey};
 #[allow(unused_imports)]
@@ -867,6 +886,52 @@ pub fn ecdsa_p256_verify(
     Ok(verifying_key.verify(data, &signature).is_ok())
 }
 
+/// Maximum signature length (in bytes) covered by the stack-allocated
+/// signature buffer used by `*_into_buf` sign variants.
+///
+/// Sized for the largest ECDSA / EdDSA signature shape we produce:
+/// - Ed25519: 64 bytes
+/// - ECDSA P-256 raw `r||s`: 64 bytes; DER: up to ~72 bytes
+/// - ECDSA P-384 raw `r||s`: 96 bytes; DER: up to ~104 bytes
+///
+/// 144 leaves comfortable headroom and keeps the buffer cache-line friendly.
+/// RSA (256–512 byte signatures) and ML-DSA / SLH-DSA / hybrid signatures
+/// (multi-KB) intentionally bypass this path and continue to allocate.
+pub const SIG_STACK_BUF_SIZE: usize = 144;
+
+/// ECDSA P-256 sign into a caller-supplied stack buffer.
+///
+/// Hedged signing — same crypto behavior as [`ecdsa_p256_sign`], just without
+/// the heap allocation for the output. Writes the DER-encoded signature into
+/// `out` and returns its length on success.
+///
+/// Returns `HsmError::DataLenRange` if the resulting DER signature would not
+/// fit in `SIG_STACK_BUF_SIZE` bytes. For valid P-256 keys this is unreachable
+/// — the maximum DER encoding is ~72 bytes — but the check is retained so the
+/// buffer size invariant is enforced rather than assumed.
+pub fn ecdsa_p256_sign_into_buf(
+    private_key_bytes: &[u8],
+    data: &[u8],
+    out: &mut [u8; SIG_STACK_BUF_SIZE],
+) -> HsmResult<usize> {
+    use crate::crypto::drbg::DrbgRng;
+    use p256::ecdsa::signature::RandomizedSigner;
+    use p256::ecdsa::SigningKey;
+
+    validate_data_size(data)?;
+    let signing_key =
+        SigningKey::from_slice(private_key_bytes).map_err(|_| HsmError::KeyHandleInvalid)?;
+    let mut rng = DrbgRng::new()?;
+    let signature: p256::ecdsa::Signature = signing_key.sign_with_rng(&mut rng, data);
+    let der = signature.to_der();
+    let der_bytes = der.as_bytes();
+    if der_bytes.len() > out.len() {
+        return Err(HsmError::DataLenRange);
+    }
+    out[..der_bytes.len()].copy_from_slice(der_bytes);
+    Ok(der_bytes.len())
+}
+
 // ============================================================================
 // ECDSA P-384
 // ============================================================================
@@ -905,6 +970,33 @@ pub fn ecdsa_p384_verify(
     Ok(verifying_key.verify(data, &signature).is_ok())
 }
 
+/// ECDSA P-384 sign into a caller-supplied stack buffer.
+///
+/// See [`ecdsa_p256_sign_into_buf`] for rationale. P-384 DER signatures are
+/// at most ~104 bytes, which fits comfortably in `SIG_STACK_BUF_SIZE`.
+pub fn ecdsa_p384_sign_into_buf(
+    private_key_bytes: &[u8],
+    data: &[u8],
+    out: &mut [u8; SIG_STACK_BUF_SIZE],
+) -> HsmResult<usize> {
+    use crate::crypto::drbg::DrbgRng;
+    use p384::ecdsa::signature::RandomizedSigner;
+    use p384::ecdsa::SigningKey;
+
+    validate_data_size(data)?;
+    let signing_key =
+        SigningKey::from_slice(private_key_bytes).map_err(|_| HsmError::KeyHandleInvalid)?;
+    let mut rng = DrbgRng::new()?;
+    let signature: p384::ecdsa::Signature = signing_key.sign_with_rng(&mut rng, data);
+    let der = signature.to_der();
+    let der_bytes = der.as_bytes();
+    if der_bytes.len() > out.len() {
+        return Err(HsmError::DataLenRange);
+    }
+    out[..der_bytes.len()].copy_from_slice(der_bytes);
+    Ok(der_bytes.len())
+}
+
 // ============================================================================
 // Ed25519 EdDSA
 // ============================================================================
@@ -937,6 +1029,38 @@ pub fn ed25519_sign(private_key_bytes: &[u8], data: &[u8]) -> HsmResult<Vec<u8>>
     let signing_key = SigningKey::from_bytes(&key_array);
     let signature = signing_key.sign(data);
     Ok(signature.to_bytes().to_vec())
+}
+
+/// Ed25519 sign into a caller-supplied stack buffer.
+///
+/// Same deterministic RFC 8032 signing as [`ed25519_sign`] but writes the
+/// 64-byte signature directly into `out` instead of returning a
+/// heap-allocated `Vec<u8>`. Always writes exactly 64 bytes on success.
+pub fn ed25519_sign_into_buf(
+    private_key_bytes: &[u8],
+    data: &[u8],
+    out: &mut [u8; SIG_STACK_BUF_SIZE],
+) -> HsmResult<usize> {
+    use ed25519_dalek::Signer;
+    use ed25519_dalek::SigningKey;
+    use zeroize::Zeroizing;
+
+    validate_data_size(data)?;
+    if private_key_bytes.len() != 32 {
+        return Err(HsmError::KeyHandleInvalid);
+    }
+    let mut key_array = Zeroizing::new([0u8; 32]);
+    key_array.copy_from_slice(private_key_bytes);
+    // SigningKey implements ZeroizeOnDrop — key material is scrubbed when
+    // `signing_key` goes out of scope at the end of this function.
+    let signing_key = SigningKey::from_bytes(&key_array);
+    let signature = signing_key.sign(data);
+    let sig_bytes = signature.to_bytes();
+    // Ed25519 signatures are always exactly 64 bytes, well within
+    // SIG_STACK_BUF_SIZE — no length check needed beyond the const-time
+    // bound enforced by the array slice.
+    out[..sig_bytes.len()].copy_from_slice(&sig_bytes);
+    Ok(sig_bytes.len())
 }
 
 /// Ed25519 verify
