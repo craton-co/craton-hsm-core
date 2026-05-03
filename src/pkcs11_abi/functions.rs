@@ -2059,12 +2059,19 @@ pub extern "C" fn C_Sign(
             return CKR_ARGUMENTS_BAD;
         }
 
-        let sess = match hsm.session_manager.get_session(session) {
+        // Use TLS-cached session lookup to skip the DashMap shard lock on the
+        // hot path (see SessionManager::get_session_cached — generation
+        // counter still respected, so closed sessions are detected).
+        let sess = match hsm.session_manager.get_session_cached(session) {
             Ok(s) => s,
             Err(e) => return err_to_rv(e),
         };
         let mut sess = sess.write();
 
+        // Length-query path (p_signature null) must preserve the operation
+        // state, so we only *peek* at the cached object here without taking
+        // it. The actual signing path below takes it (operation is cleared
+        // on completion either way).
         let (mechanism, key_handle) = match &sess.active_operation {
             Some(ActiveOperation::Sign {
                 mechanism,
@@ -2074,33 +2081,26 @@ pub extern "C" fn C_Sign(
             _ => return CKR_OPERATION_NOT_INITIALIZED,
         };
 
-        if (data_len as usize) > MAX_SINGLE_BUFFER {
-            sess.active_operation = None;
-            return CKR_DATA_LEN_RANGE;
-        }
-        let data = unsafe { slice::from_raw_parts(p_data, data_len as usize) };
-
-        let obj = match hsm.object_store.get_object(key_handle) {
-            Ok(o) => o,
-            Err(e) => {
-                sess.active_operation = None;
-                return err_to_rv(e);
-            }
-        };
-        let obj = obj.read();
-        let key_bytes = match &obj.key_material {
-            Some(km) => km.as_bytes(),
-            None => {
-                sess.active_operation = None;
-                return CKR_KEY_HANDLE_INVALID;
-            }
-        };
-
-        // Length query: estimate output size WITHOUT performing the actual
-        // signature, preserving the operation state and avoiding RNG waste
-        // (important for ECDSA which consumes a random nonce per signature).
+        // Length query: peek at cached object (or fall back to lookup) to
+        // estimate output size WITHOUT performing the actual signature,
+        // preserving operation state and avoiding RNG waste (important for
+        // ECDSA which consumes a random nonce per signature).
         if p_signature.is_null() {
-            let est = match estimated_signature_len(mechanism, &obj) {
+            let obj_arc = match &sess.active_operation {
+                Some(ActiveOperation::Sign {
+                    cached_object: Some(o),
+                    ..
+                }) => Arc::clone(o),
+                _ => match hsm.object_store.get_object(key_handle) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        sess.active_operation = None;
+                        return err_to_rv(e);
+                    }
+                },
+            };
+            let obj_read = obj_arc.read();
+            let est = match estimated_signature_len(mechanism, &obj_read) {
                 Some(n) => n,
                 None => {
                     sess.active_operation = None;
@@ -2112,6 +2112,40 @@ pub extern "C" fn C_Sign(
             }
             return CKR_OK;
         }
+
+        if (data_len as usize) > MAX_SINGLE_BUFFER {
+            sess.active_operation = None;
+            return CKR_DATA_LEN_RANGE;
+        }
+        let data = unsafe { slice::from_raw_parts(p_data, data_len as usize) };
+
+        // Take the cached object Arc captured by C_SignInit so we skip the
+        // ObjectStore DashMap lookup — one fewer lock per C_Sign call.
+        // Falls back to ObjectStore lookup if the cache is missing (e.g.,
+        // operation state restored via C_SetOperationState).
+        let cached_object = match &mut sess.active_operation {
+            Some(ActiveOperation::Sign { cached_object, .. }) => cached_object.take(),
+            _ => return CKR_OPERATION_NOT_INITIALIZED,
+        };
+        let obj = if let Some(cached) = cached_object {
+            cached
+        } else {
+            match hsm.object_store.get_object(key_handle) {
+                Ok(o) => o,
+                Err(e) => {
+                    sess.active_operation = None;
+                    return err_to_rv(e);
+                }
+            }
+        };
+        let obj = obj.read();
+        let key_bytes = match &obj.key_material {
+            Some(km) => km.as_bytes(),
+            None => {
+                sess.active_operation = None;
+                return CKR_KEY_HANDLE_INVALID;
+            }
+        };
 
         let result = sign_single_shot(&*hsm.crypto_backend, mechanism, key_bytes, data, &obj);
 
@@ -2443,18 +2477,25 @@ pub extern "C" fn C_Verify(
             return CKR_ARGUMENTS_BAD;
         }
 
-        let sess = match hsm.session_manager.get_session(session) {
+        // TLS-cached session lookup skips the DashMap shard lock on the hot
+        // path; the generation counter still detects closed sessions.
+        let sess = match hsm.session_manager.get_session_cached(session) {
             Ok(s) => s,
             Err(e) => return err_to_rv(e),
         };
         let mut sess = sess.write();
 
-        let (mechanism, key_handle) = match &sess.active_operation {
+        // Take cached_object captured by C_VerifyInit so we skip the
+        // ObjectStore DashMap lookup. Falls back to ObjectStore lookup if
+        // the cache is missing (e.g., operation state restored via
+        // C_SetOperationState).
+        let (mechanism, key_handle, cached_object) = match &mut sess.active_operation {
             Some(ActiveOperation::Verify {
                 mechanism,
                 key_handle,
+                cached_object,
                 ..
-            }) => (*mechanism, *key_handle),
+            }) => (*mechanism, *key_handle, cached_object.take()),
             _ => return CKR_OPERATION_NOT_INITIALIZED,
         };
 
@@ -2465,11 +2506,15 @@ pub extern "C" fn C_Verify(
         let data = unsafe { slice::from_raw_parts(p_data, data_len as usize) };
         let signature = unsafe { slice::from_raw_parts(p_signature, signature_len as usize) };
 
-        let obj = match hsm.object_store.get_object(key_handle) {
-            Ok(o) => o,
-            Err(e) => {
-                sess.active_operation = None;
-                return err_to_rv(e);
+        let obj = if let Some(cached) = cached_object {
+            cached
+        } else {
+            match hsm.object_store.get_object(key_handle) {
+                Ok(o) => o,
+                Err(e) => {
+                    sess.active_operation = None;
+                    return err_to_rv(e);
+                }
             }
         };
         let obj = obj.read();
@@ -4622,7 +4667,8 @@ pub extern "C" fn C_SignUpdate(
             return CKR_ARGUMENTS_BAD;
         }
 
-        let sess = match hsm.session_manager.get_session(session) {
+        // TLS-cached session lookup: hot path for streaming updates.
+        let sess = match hsm.session_manager.get_session_cached(session) {
             Ok(s) => s,
             Err(e) => return err_to_rv(e),
         };
@@ -4677,7 +4723,9 @@ pub extern "C" fn C_SignFinal(
             return CKR_ARGUMENTS_BAD;
         }
 
-        let sess = match hsm.session_manager.get_session(session) {
+        // TLS-cached session lookup avoids the DashMap shard lock when the
+        // same session repeatedly calls C_SignFinal.
+        let sess = match hsm.session_manager.get_session_cached(session) {
             Ok(s) => s,
             Err(e) => return err_to_rv(e),
         };
@@ -4694,14 +4742,22 @@ pub extern "C" fn C_SignFinal(
                 }) => (*mechanism, *key_handle),
                 _ => return CKR_OPERATION_NOT_INITIALIZED,
             };
-            let obj = match hsm.object_store.get_object(kh) {
-                Ok(o) => o,
-                Err(e) => {
-                    sess.active_operation = None;
-                    return err_to_rv(e);
-                }
+            // Peek at cached object without taking it; fall back to
+            // ObjectStore lookup only if the cache is missing.
+            let obj_arc = match &sess.active_operation {
+                Some(ActiveOperation::Sign {
+                    cached_object: Some(o),
+                    ..
+                }) => Arc::clone(o),
+                _ => match hsm.object_store.get_object(kh) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        sess.active_operation = None;
+                        return err_to_rv(e);
+                    }
+                },
             };
-            let obj = obj.read();
+            let obj = obj_arc.read();
             let est = match estimated_signature_len(mech, &obj) {
                 Some(n) => n,
                 None => {
@@ -4836,7 +4892,8 @@ pub extern "C" fn C_VerifyUpdate(
             return CKR_ARGUMENTS_BAD;
         }
 
-        let sess = match hsm.session_manager.get_session(session) {
+        // TLS-cached session lookup: hot path for streaming updates.
+        let sess = match hsm.session_manager.get_session_cached(session) {
             Ok(s) => s,
             Err(e) => return err_to_rv(e),
         };
@@ -4891,7 +4948,9 @@ pub extern "C" fn C_VerifyFinal(
             return CKR_ARGUMENTS_BAD;
         }
 
-        let sess = match hsm.session_manager.get_session(session) {
+        // TLS-cached session lookup avoids the DashMap shard lock when the
+        // same session repeatedly calls C_VerifyFinal.
+        let sess = match hsm.session_manager.get_session_cached(session) {
             Ok(s) => s,
             Err(e) => return err_to_rv(e),
         };
