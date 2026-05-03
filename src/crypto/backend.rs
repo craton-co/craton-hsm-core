@@ -28,6 +28,25 @@ pub trait CryptoBackend: Send + Sync {
         hash_alg: Option<HashAlg>,
     ) -> HsmResult<Vec<u8>>;
 
+    /// RSA PKCS#1 v1.5 sign with a (slot_id, handle) hint that backends MAY use to
+    /// look up an already-parsed `RsaPrivateKey` rather than re-parse the DER on
+    /// every call.  The default implementation ignores the hint and falls back
+    /// to `rsa_pkcs1v15_sign` so backends without a handle cache (e.g. aws-lc-rs)
+    /// inherit working behavior.
+    ///
+    /// Eliminates the SHA-256(DER) hash + bignum reconstruction (~1.5-3 µs per
+    /// op, ~15-25 % of total sign latency) on cache hits.  See ROADMAP.md.
+    fn rsa_pkcs1v15_sign_with_handle(
+        &self,
+        _slot_id: u64,
+        _handle: u64,
+        private_key_der: &[u8],
+        data: &[u8],
+        hash_alg: Option<HashAlg>,
+    ) -> HsmResult<Vec<u8>> {
+        self.rsa_pkcs1v15_sign(private_key_der, data, hash_alg)
+    }
+
     fn rsa_pkcs1v15_verify(
         &self,
         modulus: &[u8],
@@ -43,6 +62,18 @@ pub trait CryptoBackend: Send + Sync {
         data: &[u8],
         hash_alg: HashAlg,
     ) -> HsmResult<Vec<u8>>;
+
+    /// RSA-PSS sign with handle hint.  See `rsa_pkcs1v15_sign_with_handle`.
+    fn rsa_pss_sign_with_handle(
+        &self,
+        _slot_id: u64,
+        _handle: u64,
+        private_key_der: &[u8],
+        data: &[u8],
+        hash_alg: HashAlg,
+    ) -> HsmResult<Vec<u8>> {
+        self.rsa_pss_sign(private_key_der, data, hash_alg)
+    }
 
     fn rsa_pss_verify(
         &self,
@@ -91,6 +122,19 @@ pub trait CryptoBackend: Send + Sync {
         hash_alg: HashAlg,
     ) -> HsmResult<Vec<u8>>;
 
+    /// Prehashed RSA PKCS#1 v1.5 sign with handle hint.
+    /// See `rsa_pkcs1v15_sign_with_handle` for rationale.
+    fn rsa_pkcs1v15_sign_prehashed_with_handle(
+        &self,
+        _slot_id: u64,
+        _handle: u64,
+        private_key_der: &[u8],
+        digest: &[u8],
+        hash_alg: HashAlg,
+    ) -> HsmResult<Vec<u8>> {
+        self.rsa_pkcs1v15_sign_prehashed(private_key_der, digest, hash_alg)
+    }
+
     fn rsa_pkcs1v15_verify_prehashed(
         &self,
         modulus: &[u8],
@@ -106,6 +150,19 @@ pub trait CryptoBackend: Send + Sync {
         digest: &[u8],
         hash_alg: HashAlg,
     ) -> HsmResult<Vec<u8>>;
+
+    /// Prehashed RSA-PSS sign with handle hint.
+    /// See `rsa_pkcs1v15_sign_with_handle` for rationale.
+    fn rsa_pss_sign_prehashed_with_handle(
+        &self,
+        _slot_id: u64,
+        _handle: u64,
+        private_key_der: &[u8],
+        digest: &[u8],
+        hash_alg: HashAlg,
+    ) -> HsmResult<Vec<u8>> {
+        self.rsa_pss_sign_prehashed(private_key_der, digest, hash_alg)
+    }
 
     fn rsa_pss_verify_prehashed(
         &self,
@@ -167,6 +224,19 @@ pub trait CryptoBackend: Send + Sync {
         ciphertext: &[u8],
         hash_alg: super::sign::OaepHash,
     ) -> HsmResult<Vec<u8>>;
+
+    /// RSA-OAEP decrypt with handle hint.
+    /// See `rsa_pkcs1v15_sign_with_handle` for rationale.
+    fn rsa_oaep_decrypt_with_handle(
+        &self,
+        _slot_id: u64,
+        _handle: u64,
+        private_key_der: &[u8],
+        ciphertext: &[u8],
+        hash_alg: super::sign::OaepHash,
+    ) -> HsmResult<Vec<u8>> {
+        self.rsa_oaep_decrypt(private_key_der, ciphertext, hash_alg)
+    }
 
     // ========================================================================
     // Key generation
