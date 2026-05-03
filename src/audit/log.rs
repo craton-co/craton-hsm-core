@@ -66,6 +66,12 @@ pub enum AuditOperation {
     InitToken {
         slot_id: u64,
     },
+    /// PKCS#11 C_InitPIN: Set the user PIN on a freshly initialized token.
+    InitPIN {
+        slot_id: u64,
+    },
+    /// PKCS#11 C_SetPIN: Change the PIN for the currently logged-in user.
+    SetPIN,
     /// `fips_approved`: FIPS 140-3 IG 2.4.C algorithm indicator.
     /// `true` = approved algorithm, `false` = non-approved.
     GenerateKey {
@@ -1054,6 +1060,8 @@ fn format_operation_name(op: &AuditOperation) -> &'static str {
         AuditOperation::Login { .. } => "Login",
         AuditOperation::Logout => "Logout",
         AuditOperation::InitToken { .. } => "InitToken",
+        AuditOperation::InitPIN { .. } => "InitPIN",
+        AuditOperation::SetPIN => "SetPIN",
         AuditOperation::GenerateKey { .. } => "GenerateKey",
         AuditOperation::GenerateKeyPair { .. } => "GenerateKeyPair",
         AuditOperation::Sign { .. } => "Sign",
