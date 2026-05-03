@@ -410,7 +410,12 @@ impl ObjectStore {
         for entry in self.objects.iter() {
             let mut obj = entry.value().write();
             if let Some((old_state, new_state)) = obj.transition_lifecycle_if_needed() {
-                let label = String::from_utf8_lossy(&obj.label).to_string();
+                // Avoid the extra allocation that `Cow::to_string()` always
+                // performs (it formats through a fresh String even when the
+                // bytes are already valid UTF-8).  `into_owned()` reuses the
+                // borrowed slice when there are no replacement chars and only
+                // allocates on the lossy fallback path.
+                let label = String::from_utf8_lossy(&obj.label).into_owned();
                 transitions.push(crate::store::lifecycle::LifecycleTransition {
                     handle: obj.handle,
                     label,
