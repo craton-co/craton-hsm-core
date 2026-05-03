@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Craton Software Company
 use dashmap::DashMap;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,6 +34,25 @@ pub struct SessionManager {
     /// are removed. The TLS cache stores the generation at cache-fill time;
     /// a mismatch forces a DashMap re-lookup, preventing use-after-close races.
     generation: AtomicU64,
+    /// Side index: slot_id -> set of session handles open against that slot.
+    ///
+    /// Maintained alongside `sessions` so that slot-scoped operations
+    /// (`logout_all`, `login_all`, `has_ro_sessions`) can find their
+    /// sessions in O(handles-on-slot) instead of O(all-sessions).  The
+    /// only legal lock ordering is **DashMap first, then `slot_index`**:
+    /// callers read or mutate `sessions` first, then update `slot_index`
+    /// to reflect the change.  Slot-scoped readers take `slot_index`
+    /// briefly, *clone* the handle set, release the lock, and only then
+    /// re-enter `sessions` for per-session work.  This avoids deadlock
+    /// between the two locks.
+    ///
+    /// Race note: a session opened concurrently with a slot-scoped
+    /// operation may not be visited by that operation if the index update
+    /// has not yet completed.  This matches the pre-existing behavior of
+    /// `login_all`'s two-phase loop (see the TOCTOU note on `login_all`)
+    /// and is safe because freshly-opened sessions inherit token-level
+    /// login state from `open_session` directly.
+    slot_index: Mutex<HashMap<CK_SLOT_ID, HashSet<CK_SESSION_HANDLE>>>,
 }
 
 impl SessionManager {
@@ -42,7 +62,73 @@ impl SessionManager {
             handle_alloc: SessionHandleAllocator::new(),
             idle_timeout: Duration::ZERO,
             generation: AtomicU64::new(0),
+            slot_index: Mutex::new(HashMap::new()),
         }
+    }
+
+    // ---- slot_index helpers ------------------------------------------------
+    //
+    // Each helper takes the `slot_index` lock briefly and never reaches into
+    // `sessions` while holding it.  Callers MUST update `sessions` first and
+    // only then call the index helper, to keep the documented lock order
+    // (DashMap before slot_index) and avoid deadlocks.
+
+    /// Record `handle` as open against `slot_id`.
+    fn slot_index_insert(&self, slot_id: CK_SLOT_ID, handle: CK_SESSION_HANDLE) {
+        self.slot_index
+            .lock()
+            .entry(slot_id)
+            .or_default()
+            .insert(handle);
+    }
+
+    /// Drop `handle` from `slot_id`'s entry, removing the entry entirely if it
+    /// becomes empty.  Silently no-ops if the handle is unknown — `close_session`
+    /// is the only caller that knows the slot, and other removal paths route
+    /// through `slot_index_drop_many`.
+    fn slot_index_remove(&self, slot_id: CK_SLOT_ID, handle: CK_SESSION_HANDLE) {
+        let mut idx = self.slot_index.lock();
+        if let Some(set) = idx.get_mut(&slot_id) {
+            set.remove(&handle);
+            if set.is_empty() {
+                idx.remove(&slot_id);
+            }
+        }
+    }
+
+    /// Drop a batch of handles from the index.  Used by retain-style removals
+    /// where the slot per handle isn't known up-front, so we sweep every slot.
+    fn slot_index_drop_many(&self, handles: &[CK_SESSION_HANDLE]) {
+        if handles.is_empty() {
+            return;
+        }
+        let mut idx = self.slot_index.lock();
+        for set in idx.values_mut() {
+            for h in handles {
+                set.remove(h);
+            }
+        }
+        idx.retain(|_slot, set| !set.is_empty());
+    }
+
+    /// Snapshot the handle set for `slot_id`.  Returns an empty `Vec` if no
+    /// sessions are open on that slot.  Caller iterates the snapshot against
+    /// `sessions` *after* releasing the index lock.
+    fn slot_index_snapshot(&self, slot_id: CK_SLOT_ID) -> Vec<CK_SESSION_HANDLE> {
+        self.slot_index
+            .lock()
+            .get(&slot_id)
+            .map(|set| set.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    fn slot_index_len(&self, slot_id: CK_SLOT_ID) -> usize {
+        self.slot_index
+            .lock()
+            .get(&slot_id)
+            .map(|s| s.len())
+            .unwrap_or(0)
     }
 
     /// Return the number of currently open sessions.
@@ -90,6 +176,10 @@ impl SessionManager {
         });
 
         if !closed_handles.is_empty() {
+            // Drop the closed handles from the slot side index.  We don't
+            // know each session's slot_id here (the Session is gone), so
+            // sweep all slot entries in one lock acquisition.
+            self.slot_index_drop_many(&closed_handles);
             // Bump generation so TLS caches are invalidated (H3).
             self.generation.fetch_add(1, Ordering::Release);
             tracing::debug!(
@@ -142,6 +232,8 @@ impl SessionManager {
         }
 
         self.sessions.insert(handle, Arc::new(RwLock::new(session)));
+        // DashMap insert is committed; now mirror into the side index.
+        self.slot_index_insert(slot_id, handle);
         Ok(handle)
     }
 
@@ -157,14 +249,18 @@ impl SessionManager {
         // Eagerly zeroize CSPs held in active operations rather than
         // relying on Arc refcount reaching zero (another thread may
         // still hold a clone from get_session).
-        {
+        let slot_id = {
             let mut s = session.write();
             s.closed = true;
             s.active_operation = None;
             s.find_context = None;
             // Propagate decrement errors — a double-close is a caller bug
             token.decrement_session_count(s.is_rw())?;
-        }
+            s.slot_id
+        };
+        // Update the side index after the DashMap removal is committed and
+        // the per-session lock has been released.
+        self.slot_index_remove(slot_id, handle);
         Ok(())
     }
 
@@ -179,8 +275,8 @@ impl SessionManager {
         // Decrement per-session to maintain accurate counts. Using
         // reset_session_counts() would corrupt counts for sessions on other
         // slots that share the same token.
-        let mut any_removed = false;
-        self.sessions.retain(|_handle, session| {
+        let mut closed: Vec<CK_SESSION_HANDLE> = Vec::new();
+        self.sessions.retain(|&handle, session| {
             let mut s = session.write();
             if s.slot_id == slot_id {
                 s.closed = true;
@@ -188,13 +284,26 @@ impl SessionManager {
                 if let Err(e) = token.decrement_session_count(s.is_rw()) {
                     tracing::error!("close_all_sessions: decrement failed: {:?}", e);
                 }
-                any_removed = true;
+                closed.push(handle);
                 false // remove this entry
             } else {
                 true // keep entries for other slots
             }
         });
-        if any_removed {
+        if !closed.is_empty() {
+            // Drop all closed handles from the slot_id entry of the side
+            // index in one lock acquisition.
+            {
+                let mut idx = self.slot_index.lock();
+                if let Some(set) = idx.get_mut(&slot_id) {
+                    for h in &closed {
+                        set.remove(h);
+                    }
+                    if set.is_empty() {
+                        idx.remove(&slot_id);
+                    }
+                }
+            }
             // Bump generation AFTER removal so TLS caches are invalidated (H3).
             self.generation.fetch_add(1, Ordering::Release);
         }
@@ -282,19 +391,10 @@ impl SessionManager {
             return Err(HsmError::UserTypeInvalid);
         }
 
-        // Phase 1: collect handles for matching sessions (releases shard locks)
-        let handles: Vec<CK_SESSION_HANDLE> = self
-            .sessions
-            .iter()
-            .filter_map(|entry| {
-                let s = entry.value().read();
-                if s.slot_id == slot_id {
-                    Some(*entry.key())
-                } else {
-                    None
-                }
-            })
-            .collect();
+        // Phase 1: collect handles via the side index (O(handles-on-slot)
+        // instead of O(all-sessions)).  No DashMap shard locks are held
+        // during the snapshot — the index Mutex is released immediately.
+        let handles: Vec<CK_SESSION_HANDLE> = self.slot_index_snapshot(slot_id);
 
         // Phase 2: apply login to each session, tracking successes for rollback
         let mut logged_in: Vec<CK_SESSION_HANDLE> = Vec::new();
@@ -337,10 +437,21 @@ impl SessionManager {
     /// of errors so that partial-logout (some sessions logged in, some
     /// not) is minimised.
     pub fn logout_all(&self, slot_id: CK_SLOT_ID) -> HsmResult<()> {
+        // Snapshot the slot's handles via the side index to skip the full
+        // DashMap walk.  Sessions opened concurrently with this call may not
+        // be visited (matching the pre-existing race window noted on
+        // `login_all`); they inherit token-level state via `open_session`.
+        let handles = self.slot_index_snapshot(slot_id);
         let mut first_err: Option<HsmError> = None;
-        for entry in self.sessions.iter() {
-            let session = entry.value();
+        for handle in handles {
+            let session = match self.sessions.get(&handle) {
+                Some(s) => s.value().clone(),
+                // Handle may have been closed between snapshot and lookup.
+                None => continue,
+            };
             let mut s = session.write();
+            // Re-check slot_id as a guard against the (currently impossible)
+            // case where handles are recycled between slots.
             if s.slot_id == slot_id && s.state.is_logged_in() {
                 if let Err(e) = s.on_logout() {
                     tracing::error!("logout_all: failed to logout session {}: {:?}", s.handle, e);
@@ -376,12 +487,16 @@ impl SessionManager {
             // Eagerly zeroize CSPs under the lock.
             s.active_operation = None;
             s.find_context = None;
+            // Snapshot slot_id before releasing the session lock so we can
+            // update the side index without re-locking the (closed) session.
+            let slot_id = s.slot_id;
             // Now safe to release the lock — the closed flag protects against
             // concurrent use.
             drop(s);
             drop(session);
             // Remove from DashMap and bump generation for TLS cache invalidation.
             self.sessions.remove(&handle);
+            self.slot_index_remove(slot_id, handle);
             self.generation.fetch_add(1, Ordering::Release);
             Self::invalidate_session_cache(handle);
             tracing::debug!("Session {} closed due to idle timeout", handle);
@@ -393,10 +508,18 @@ impl SessionManager {
     }
 
     pub fn has_ro_sessions(&self, slot_id: CK_SLOT_ID) -> bool {
-        self.sessions.iter().any(|entry| {
-            let s = entry.value().read();
-            s.slot_id == slot_id && !s.is_rw()
-        })
+        // Snapshot the slot's handle set first so we don't hold the
+        // index lock while taking per-session read locks.
+        let handles = self.slot_index_snapshot(slot_id);
+        for handle in handles {
+            if let Some(entry) = self.sessions.get(&handle) {
+                let s = entry.value().read();
+                if s.slot_id == slot_id && !s.is_rw() {
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 
@@ -713,5 +836,108 @@ mod tests {
             mgr.check_and_touch(h).is_ok(),
             "Session should survive because touch reset the idle timer"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // slot_index correctness
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn slot_index_tracks_open_close() {
+        let mgr = SessionManager::new();
+        let token = make_token();
+        let flags = CKF_SERIAL_SESSION | CKF_RW_SESSION;
+
+        let a = mgr.open_session(0, flags, &token).unwrap();
+        let b = mgr.open_session(0, flags, &token).unwrap();
+        let c = mgr.open_session(7, flags, &token).unwrap();
+
+        assert_eq!(mgr.slot_index_len(0), 2);
+        assert_eq!(mgr.slot_index_len(7), 1);
+        assert_eq!(mgr.slot_index_len(99), 0);
+
+        mgr.close_session(a, &token).unwrap();
+        assert_eq!(mgr.slot_index_len(0), 1);
+
+        mgr.close_session(b, &token).unwrap();
+        // Empty slot entries are pruned so size goes back to 0.
+        assert_eq!(mgr.slot_index_len(0), 0);
+
+        mgr.close_session(c, &token).unwrap();
+        assert_eq!(mgr.slot_index_len(7), 0);
+    }
+
+    #[test]
+    fn slot_index_drops_on_close_all_sessions() {
+        let mgr = SessionManager::new();
+        let token = make_token();
+        let flags = CKF_SERIAL_SESSION | CKF_RW_SESSION;
+
+        let _ = mgr.open_session(0, flags, &token).unwrap();
+        let _ = mgr.open_session(0, flags, &token).unwrap();
+        let keep = mgr.open_session(1, flags, &token).unwrap();
+
+        mgr.close_all_sessions(0, &token);
+
+        assert_eq!(mgr.slot_index_len(0), 0);
+        assert_eq!(mgr.slot_index_len(1), 1);
+        assert!(mgr.get_session(keep).is_ok());
+    }
+
+    #[test]
+    fn slot_index_drops_on_idle_cleanup() {
+        let mut mgr = SessionManager::new();
+        mgr.set_idle_timeout(Duration::from_millis(1));
+        let token = make_token();
+        let flags = CKF_SERIAL_SESSION | CKF_RW_SESSION;
+
+        let _ = mgr.open_session(0, flags, &token).unwrap();
+        let _ = mgr.open_session(2, flags, &token).unwrap();
+
+        std::thread::sleep(Duration::from_millis(10));
+        let closed = mgr.cleanup_idle_sessions();
+        assert_eq!(closed.len(), 2);
+
+        assert_eq!(mgr.slot_index_len(0), 0);
+        assert_eq!(mgr.slot_index_len(2), 0);
+    }
+
+    #[test]
+    fn logout_all_only_touches_target_slot_via_index() {
+        let mgr = SessionManager::new();
+        let token = make_token();
+        // The token starts in Public state; we just verify the iteration
+        // visits exactly the right handles by checking the index is empty
+        // before / after for the untouched slot.
+        let flags = CKF_SERIAL_SESSION | CKF_RW_SESSION;
+        let _ = mgr.open_session(0, flags, &token).unwrap();
+        let _ = mgr.open_session(0, flags, &token).unwrap();
+        let other = mgr.open_session(5, flags, &token).unwrap();
+
+        assert_eq!(mgr.slot_index_len(0), 2);
+        assert_eq!(mgr.slot_index_len(5), 1);
+
+        // No-op for Public sessions, but exercises the index snapshot path.
+        mgr.logout_all(0).unwrap();
+
+        // Sessions on slot 5 untouched.
+        assert!(mgr.get_session(other).is_ok());
+        assert_eq!(mgr.slot_index_len(5), 1);
+    }
+
+    #[test]
+    fn has_ro_sessions_uses_index() {
+        let mgr = SessionManager::new();
+        let token = make_token();
+
+        // RW session on slot 0; RO session on slot 1.
+        let _ = mgr
+            .open_session(0, CKF_SERIAL_SESSION | CKF_RW_SESSION, &token)
+            .unwrap();
+        let _ = mgr.open_session(1, CKF_SERIAL_SESSION, &token).unwrap();
+
+        assert!(!mgr.has_ro_sessions(0), "slot 0 has only RW");
+        assert!(mgr.has_ro_sessions(1), "slot 1 has an RO session");
+        assert!(!mgr.has_ro_sessions(99), "slot 99 has nothing");
     }
 }
