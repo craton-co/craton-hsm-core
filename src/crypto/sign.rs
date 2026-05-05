@@ -158,11 +158,21 @@ pub fn get_cached_rsa_public_key(slot_id: u64, handle: u64) -> Option<Arc<RsaPub
 
 /// Evict all cached keys for a given (slot_id, handle) pair (call on C_DestroyObject).
 ///
-/// Stale queue entries are tolerated by `evict_oldest_handle_cache_entry`,
-/// so we don't rebuild the FIFO here.
+/// Also drops every matching `HANDLE_CACHE_FIFO` entry so the queue cannot grow
+/// unboundedly across repeated destroy-then-recreate cycles: while the eviction
+/// loop in `evict_oldest_handle_cache_entry` does skip stale entries, it only
+/// runs when the cache hits capacity. If `evict_cached_keys` is invoked many
+/// times on small/under-capacity caches, the FIFO would otherwise leak one
+/// entry per destroyed handle indefinitely.
+///
+/// The `VecDeque::retain` walk is O(N) where N ≤ 2 × RSA_KEY_CACHE_MAX in
+/// steady state (once this fix is applied, the queue cannot grow beyond live
+/// entries plus the small backlog produced by concurrent inserts).
 pub fn evict_cached_keys(slot_id: u64, handle: u64) {
     RSA_PRIV_CACHE.remove(&(slot_id, handle));
     RSA_PUB_CACHE.remove(&(slot_id, handle));
+    let target = (slot_id, handle);
+    HANDLE_CACHE_FIFO.lock().retain(|(_tag, key)| *key != target);
 }
 
 // ---------------------------------------------------------------------------
@@ -316,6 +326,63 @@ mod handle_cache_eviction_tests {
         assert!(
             get_cached_rsa_private_key(slot, 100).is_none(),
             "FIFO must skip the stale entry and evict the real oldest"
+        );
+        reset_caches();
+    }
+
+    /// Regression: `evict_cached_keys` must drop FIFO entries too, otherwise the
+    /// queue grows unboundedly across destroy-then-recreate cycles even though
+    /// the cache itself stays small.  Before the fix, this test would show the
+    /// FIFO holding one entry per iteration; with the fix it stays bounded.
+    #[test]
+    fn evict_cached_keys_drops_fifo_entries() {
+        reset_caches();
+        let slot = 0xfaceu64;
+
+        // 1000 destroy/recreate cycles on a single handle. The cache size stays
+        // at 1, but a leaky FIFO would grow to ~1000.
+        for _ in 0..1000 {
+            cache_rsa_private_key(slot, 42, fresh_priv_key());
+            evict_cached_keys(slot, 42);
+        }
+
+        // Cache is empty.
+        assert_eq!(RSA_PRIV_CACHE.len(), 0);
+        // FIFO must also be empty (or at most a tiny number from races; we are
+        // single-threaded here so it must be exactly 0).
+        let fifo_len = HANDLE_CACHE_FIFO.lock().len();
+        assert_eq!(
+            fifo_len, 0,
+            "FIFO must shrink in lockstep with evict_cached_keys (was {})",
+            fifo_len
+        );
+        reset_caches();
+    }
+
+    /// Mixed insert + evict pattern: after a balanced workload, FIFO size must
+    /// match cache size, not "cache size + total destroys ever".
+    #[test]
+    fn fifo_size_tracks_cache_size_after_mixed_ops() {
+        reset_caches();
+        let slot = 0xbabeu64;
+
+        // Insert 32 keys, evict 16, insert another 32 — final cache size 48.
+        for h in 0..32u64 {
+            cache_rsa_private_key(slot, h, fresh_priv_key());
+        }
+        for h in 0..16u64 {
+            evict_cached_keys(slot, h);
+        }
+        for h in 100..132u64 {
+            cache_rsa_private_key(slot, h, fresh_priv_key());
+        }
+
+        let cache_len = RSA_PRIV_CACHE.len();
+        let fifo_len = HANDLE_CACHE_FIFO.lock().len();
+        assert_eq!(cache_len, 48);
+        assert_eq!(
+            fifo_len, cache_len,
+            "FIFO must track live cache exactly under balanced ops"
         );
         reset_caches();
     }
