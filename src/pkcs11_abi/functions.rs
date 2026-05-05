@@ -4609,7 +4609,30 @@ pub extern "C" fn C_DigestFinal(
             return CKR_OK;
         }
 
-        // Real finalization: consume the hasher and produce output.
+        // PKCS#11 §11.2: BUFFER_TOO_SMALL must NOT terminate the operation.
+        // The hasher's output_len is known up-front, so we can decide before
+        // consuming the hasher. If the user buffer is too small, return early
+        // with the operation intact.
+        let user_buf_len = unsafe { *pul_digest_len } as usize;
+        let output_len = match &sess.active_operation {
+            Some(ActiveOperation::Digest {
+                hasher: Some(h), ..
+            }) => h.output_len(),
+            Some(ActiveOperation::Digest { hasher: None, .. }) => {
+                sess.active_operation = None;
+                return CKR_OPERATION_NOT_INITIALIZED;
+            }
+            _ => return CKR_OPERATION_NOT_INITIALIZED,
+        };
+        if user_buf_len < output_len {
+            unsafe {
+                *pul_digest_len = output_len as CK_ULONG;
+            }
+            // Operation stays active; caller retries with larger buffer.
+            return CKR_BUFFER_TOO_SMALL;
+        }
+
+        // Buffer is large enough — now consume the hasher and produce output.
         let (_mechanism, hasher, _acc_input) = match &mut sess.active_operation {
             Some(ActiveOperation::Digest {
                 mechanism,
@@ -4626,18 +4649,6 @@ pub extern "C" fn C_DigestFinal(
                 return CKR_OPERATION_NOT_INITIALIZED;
             }
         };
-
-        let output_len = hasher.output_len();
-
-        let buf_len = unsafe { *pul_digest_len } as usize;
-        if buf_len < output_len {
-            unsafe {
-                *pul_digest_len = output_len as CK_ULONG;
-            }
-            // Operation is terminated per PKCS#11 spec on buffer too small
-            sess.active_operation = None;
-            return CKR_BUFFER_TOO_SMALL;
-        }
 
         let digest_out = hasher.finalize();
         let out = unsafe { slice::from_raw_parts_mut(p_digest, digest_out.len()) };
@@ -4771,6 +4782,49 @@ pub extern "C" fn C_SignFinal(
             return CKR_OK;
         }
 
+        // PKCS#11 §11.2 BUFFER_TOO_SMALL pre-check: returning CKR_BUFFER_TOO_SMALL
+        // from a Final must NOT terminate the active operation (caller must be
+        // able to retry with a larger buffer). To preserve state we estimate the
+        // signature length from mechanism + key BEFORE consuming hasher/data,
+        // and bail out early if the user buffer is too small. Once the state is
+        // taken (next block), it can't be reconstituted; the post-sign size
+        // check below stays as a defensive backstop for the (theoretical) case
+        // where the actual signature exceeds the estimate.
+        let user_buf_len = unsafe { *pul_signature_len } as usize;
+        {
+            let (mech_peek, kh_peek) = match &sess.active_operation {
+                Some(ActiveOperation::Sign {
+                    mechanism,
+                    key_handle,
+                    ..
+                }) => (*mechanism, *key_handle),
+                _ => return CKR_OPERATION_NOT_INITIALIZED,
+            };
+            let obj_arc_peek = match &sess.active_operation {
+                Some(ActiveOperation::Sign {
+                    cached_object: Some(o),
+                    ..
+                }) => Arc::clone(o),
+                _ => match hsm.object_store.get_object(kh_peek) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        sess.active_operation = None;
+                        return err_to_rv(e);
+                    }
+                },
+            };
+            let obj_peek = obj_arc_peek.read();
+            if let Some(est) = estimated_signature_len(mech_peek, &obj_peek) {
+                if user_buf_len < est {
+                    unsafe {
+                        *pul_signature_len = est as CK_ULONG;
+                    }
+                    // Operation stays active; caller retries with larger buffer.
+                    return CKR_BUFFER_TOO_SMALL;
+                }
+            }
+        }
+
         let (mechanism, key_handle, hasher, data, cached_object) = match &mut sess.active_operation
         {
             Some(ActiveOperation::Sign {
@@ -4822,6 +4876,11 @@ pub extern "C" fn C_SignFinal(
             Ok(signature) => {
                 let buf_len = unsafe { *pul_signature_len } as usize;
                 if buf_len < signature.len() {
+                    // Defensive backstop: the pre-check above should have
+                    // caught this. We're here only if estimated_signature_len
+                    // under-estimated. State is unrecoverable at this point
+                    // (hasher already finalized, data already taken), so we
+                    // do clear the operation and report the required size.
                     unsafe {
                         *pul_signature_len = signature.len() as CK_ULONG;
                     }
