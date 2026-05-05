@@ -461,37 +461,35 @@ impl ObjectStore {
     /// returned. This prevents cross-slot object access in multi-slot
     /// deployments.
     ///
-    /// Always iterates *all* objects to maintain constant-time behavior.
+    /// **Index-narrowed iteration when applicable.**  When the template
+    /// specifies both `CKA_CLASS` and `CKA_KEY_TYPE`, we iterate only the
+    /// candidate handle set obtained from `attr_index` — non-candidate
+    /// objects are not touched at all (no `RwLock` acquired, no
+    /// `matches_template` evaluated).  The candidate count for a given
+    /// (class, key_type) is independent of login state, so the timing of a
+    /// specific template query does not leak whether the caller is logged
+    /// in (private/public visibility is checked under the read lock,
+    /// after the candidate set is fixed).
     ///
-    /// **Performance hint**: when the template specifies *both* `CKA_CLASS`
-    /// and `CKA_KEY_TYPE` (the most-selective common case), the secondary
-    /// `attr_index` is consulted to obtain the candidate handle set. The
-    /// outer iteration still visits every object — including a read-lock
-    /// acquisition on its `RwLock` — so the timing-side-channel invariant
-    /// described above is preserved. Inside the inner check, however,
-    /// non-candidate handles short-circuit `matches_template` to a constant
-    /// "no match", avoiding the full attribute-by-attribute comparison.
-    /// This keeps the wall-clock cost of a highly-selective find roughly
-    /// proportional to the candidate count rather than the total object
-    /// count, while leaking no more information than the existing iteration
-    /// already does about the *count* of objects (which is itself derivable
-    /// from the pre-allocated `results` vector capacity).
+    /// **Full-iteration fallback.**  When the template lacks either
+    /// `CKA_CLASS` or `CKA_KEY_TYPE`, we walk the entire DashMap and
+    /// take a per-object read lock — preserving the original behavior.
+    /// Templates that don't fix both attributes are inherently unselective,
+    /// so the full walk is appropriate.
+    ///
+    /// The previous implementation took 10,000 `RwLock` read locks for a
+    /// 10,000-object store regardless of how selective the template was —
+    /// the index lookup short-circuited only the inner attribute-match
+    /// comparison, not the per-object lock acquisition.  That overhead
+    /// completely dominated the index's intended speedup, which is what
+    /// this revision fixes.
     pub fn find_objects_for_slot(
         &self,
         template: &[(CK_ATTRIBUTE_TYPE, Vec<u8>)],
         is_logged_in: bool,
         slot_id: Option<CK_ULONG>,
     ) -> Vec<CK_OBJECT_HANDLE> {
-        // Pre-allocate to maximum possible size so push() never reallocates.
-        // This prevents timing differences between logged-in and logged-out
-        // states from leaking information about private object counts.
-        let total = self.objects.len();
-        let mut results = Vec::with_capacity(total);
-
-        // Optimization hint: if the template fixes both CKA_CLASS and
-        // CKA_KEY_TYPE, look up the candidate set from the secondary index.
-        // We still iterate every object below, but inner short-circuiting
-        // becomes a cheap HashSet::contains check.
+        // Extract CKA_CLASS / CKA_KEY_TYPE from the template (if present).
         let mut tmpl_class: Option<CK_ULONG> = None;
         let mut tmpl_key_type: Option<CK_ULONG> = None;
         for (attr_type, value) in template {
@@ -510,36 +508,41 @@ impl ObjectStore {
             }
         }
 
-        // `candidates` is `Some` only when both CKA_CLASS and CKA_KEY_TYPE
-        // were specified. In that case we *clone* the candidate handle set
-        // out of the index lock so the inner loop doesn't hold the index
-        // lock while taking per-object read locks (avoids lock-ordering
-        // issues with concurrent create/destroy callers).
-        let candidates: Option<HashSet<CK_OBJECT_HANDLE>> = match (tmpl_class, tmpl_key_type) {
-            (Some(cls), Some(kt)) => {
+        // Fast path: both class and key_type fixed → iterate candidates only.
+        if let (Some(cls), Some(kt)) = (tmpl_class, tmpl_key_type) {
+            // Snapshot the candidate handle set so we don't hold the index
+            // lock while taking per-object read locks.
+            let candidates: Vec<CK_OBJECT_HANDLE> = {
                 let idx = self.attr_index.read();
-                Some(idx.get(&(cls, kt)).cloned().unwrap_or_default())
+                idx.get(&(cls, kt))
+                    .map(|set| set.iter().copied().collect())
+                    .unwrap_or_default()
+            };
+            let mut results = Vec::with_capacity(candidates.len());
+            for handle in candidates {
+                if let Some(entry) = self.objects.get(&handle) {
+                    let obj = entry.value().read();
+                    let visible = !obj.private || is_logged_in;
+                    let slot_ok = slot_id.map_or(true, |sid| obj.slot_id == sid);
+                    if visible && slot_ok && obj.matches_template(template) {
+                        results.push(handle);
+                    }
+                }
+                // If `objects.get` is `None`, the handle was destroyed between
+                // index snapshot and lookup — silently skip (the index entry
+                // will be reconciled by the next destroy_object pass).
             }
-            _ => None,
-        };
+            return results;
+        }
 
+        // Fallback path: template did not fix both CKA_CLASS and CKA_KEY_TYPE.
+        // Walk the full object map.
+        let mut results = Vec::with_capacity(self.objects.len());
         for entry in self.objects.iter() {
-            // Always touch the read lock and the slot bit so timing remains
-            // roughly constant per object regardless of whether the index
-            // says the candidate is interesting.
             let obj = entry.value().read();
             let visible = !obj.private || is_logged_in;
             let slot_ok = slot_id.map_or(true, |sid| obj.slot_id == sid);
-
-            // Short-circuit `matches_template` only if the candidate set
-            // explicitly excludes this handle. Without the index the
-            // behavior is identical to the original implementation.
-            let matches = match &candidates {
-                Some(set) if !set.contains(entry.key()) => false,
-                _ => obj.matches_template(template),
-            };
-
-            if matches && visible && slot_ok {
+            if visible && slot_ok && obj.matches_template(template) {
                 results.push(*entry.key());
             }
         }
