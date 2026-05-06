@@ -1406,3 +1406,110 @@ pub(crate) fn ecdsa_p384_verify_prehashed(
         p384::ecdsa::Signature::from_der(signature_der).map_err(|_| HsmError::SignatureInvalid)?;
     Ok(verifying_key.verify_prehash(digest, &signature).is_ok())
 }
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Use a per-test slot id derived from a counter so that tests run in
+    /// parallel without colliding on cache slots.  Handle ids are picked the
+    /// same way.
+    fn unique_ids() -> (u64, u64) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        // Spread bits between slot and handle to avoid trivial collisions.
+        (0xC0DE_0000 | n, 0xBEEF_0000 | n)
+    }
+
+    fn fresh_rsa_key_der() -> Vec<u8> {
+        // Use the keygen module to obtain a 2048-bit PKCS#8 DER key.
+        let (priv_der, _modulus, _pub_exp) =
+            crate::crypto::keygen::generate_rsa_key_pair(2048, false).unwrap();
+        priv_der.as_bytes().to_vec()
+    }
+
+    #[test]
+    fn rsa_pkcs1v15_sign_cached_populates_handle_cache() {
+        let (slot, handle) = unique_ids();
+        let der = fresh_rsa_key_der();
+        // Pre-condition: cache miss.
+        assert!(get_cached_rsa_private_key(slot, handle).is_none());
+
+        // First call: parses DER, populates cache.
+        let _ = rsa_pkcs1v15_sign_cached(slot, handle, &der, b"hello", Some(HashAlg::Sha256))
+            .expect("first sign");
+
+        // Post-condition: cache hit available.
+        assert!(
+            get_cached_rsa_private_key(slot, handle).is_some(),
+            "cache_rsa_private_key was not invoked by rsa_pkcs1v15_sign_cached"
+        );
+
+        // Second call: should reuse the cached Arc (same pointer).
+        let arc1 = get_cached_rsa_private_key(slot, handle).unwrap();
+        let _ = rsa_pkcs1v15_sign_cached(slot, handle, &der, b"world", Some(HashAlg::Sha256))
+            .expect("second sign");
+        let arc2 = get_cached_rsa_private_key(slot, handle).unwrap();
+        assert!(
+            Arc::ptr_eq(&arc1, &arc2),
+            "second sign should reuse the same Arc<RsaPrivateKey> rather than \
+             reparsing DER"
+        );
+
+        evict_cached_keys(slot, handle);
+    }
+
+    #[test]
+    fn rsa_pss_sign_cached_populates_handle_cache() {
+        let (slot, handle) = unique_ids();
+        let der = fresh_rsa_key_der();
+        assert!(get_cached_rsa_private_key(slot, handle).is_none());
+
+        let _ = rsa_pss_sign_cached(slot, handle, &der, b"data", HashAlg::Sha256).expect("sign");
+        assert!(
+            get_cached_rsa_private_key(slot, handle).is_some(),
+            "rsa_pss_sign_cached should populate the handle cache"
+        );
+
+        evict_cached_keys(slot, handle);
+    }
+
+    #[test]
+    fn rsa_oaep_decrypt_cached_uses_handle_cache() {
+        let (slot, handle) = unique_ids();
+        let (priv_der, modulus, pub_exp) =
+            crate::crypto::keygen::generate_rsa_key_pair(2048, false).unwrap();
+        // Encrypt something we can decrypt back.
+        let ct = rsa_oaep_encrypt(&modulus, &pub_exp, b"secret", OaepHash::Sha256).unwrap();
+
+        assert!(get_cached_rsa_private_key(slot, handle).is_none());
+        let pt = rsa_oaep_decrypt_cached(slot, handle, priv_der.as_bytes(), &ct, OaepHash::Sha256)
+            .expect("decrypt");
+        assert_eq!(pt, b"secret");
+        assert!(
+            get_cached_rsa_private_key(slot, handle).is_some(),
+            "rsa_oaep_decrypt_cached should populate the handle cache"
+        );
+
+        evict_cached_keys(slot, handle);
+    }
+
+    #[test]
+    fn evict_cached_keys_removes_entries() {
+        let (slot, handle) = unique_ids();
+        let der = fresh_rsa_key_der();
+        let _ = rsa_pkcs1v15_sign_cached(slot, handle, &der, b"x", Some(HashAlg::Sha256)).unwrap();
+        assert!(get_cached_rsa_private_key(slot, handle).is_some());
+
+        evict_cached_keys(slot, handle);
+        assert!(
+            get_cached_rsa_private_key(slot, handle).is_none(),
+            "evict_cached_keys must drop the entry"
+        );
+    }
+}
