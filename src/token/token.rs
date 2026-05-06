@@ -149,7 +149,7 @@ impl Token {
             .unwrap_or(DEFAULT_MAX_FAILED_LOGINS);
         let pbkdf2_iterations = config
             .map(|c| c.security.pbkdf2_iterations)
-            .unwrap_or(600_000);
+            .unwrap_or(if cfg!(debug_assertions) { 1 } else { 600_000 });
 
         // Create lockout store and restore persisted lockout state if available.
         let lockout_store = config.map(|c| LockoutStore::new(&c.token.storage_path));

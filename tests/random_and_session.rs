@@ -348,7 +348,7 @@ fn test_login_wrong_pin() {
 fn test_set_pin() {
     let session = setup_user_session();
     let old_pin = b"userpin1";
-    let new_pin = b"newuserpin";
+    let new_pin = b"New0pin!";
 
     let rv = C_SetPIN(
         session,
