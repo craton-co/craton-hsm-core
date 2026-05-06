@@ -1101,12 +1101,16 @@ pub extern "C" fn C_DestroyObject(session: CK_SESSION_HANDLE, object: CK_OBJECT_
         drop(obj_read);
         drop(obj);
 
+        let slot_id = sess.read().slot_id;
         match hsm.object_store.destroy_object(object) {
             Ok(()) => {
                 // Clean up per-key GCM/IV counters now that the key is destroyed
                 if let Some(ref kb) = key_bytes {
                     crate::crypto::encrypt::remove_gcm_counter(kb);
                 }
+                // Evict any cached parsed RSA keys for this handle so the
+                // cache does not retain key material past destruction.
+                crate::crypto::sign::evict_cached_keys(slot_id as u64, object as u64);
                 let _ = hsm.audit_log.record(
                     session as u64,
                     AuditOperation::DestroyObject,
@@ -1904,8 +1908,14 @@ pub extern "C" fn C_Decrypt(
                         return rv;
                     }
                 };
-                hsm.crypto_backend
-                    .rsa_oaep_decrypt(key_bytes, data, oaep_hash)
+                let slot_id = sess.slot_id;
+                hsm.crypto_backend.rsa_oaep_decrypt_with_handle(
+                    slot_id as u64,
+                    key_handle as u64,
+                    key_bytes,
+                    data,
+                    oaep_hash,
+                )
             }
             _ => {
                 sess.active_operation = None;
@@ -2113,7 +2123,16 @@ pub extern "C" fn C_Sign(
             return CKR_OK;
         }
 
-        let result = sign_single_shot(&*hsm.crypto_backend, mechanism, key_bytes, data, &obj);
+        let slot_id = sess.slot_id;
+        let result = sign_single_shot(
+            &*hsm.crypto_backend,
+            slot_id as u64,
+            key_handle as u64,
+            mechanism,
+            key_bytes,
+            data,
+            &obj,
+        );
 
         match result {
             Ok(signature) => {
@@ -2170,9 +2189,17 @@ fn is_p384_params(ec_params: &[u8]) -> bool {
     ec_params == P384_OID || ec_params.windows(P384_OID.len()).any(|w| w == P384_OID)
 }
 
-/// Single-shot sign: hash + sign in one step (used by C_Sign and C_SignFinal for non-hashed mechanisms)
+/// Single-shot sign: hash + sign in one step (used by C_Sign and C_SignFinal for non-hashed mechanisms).
+///
+/// `slot_id` and `key_handle` identify the PKCS#11 object backing `key_bytes`;
+/// for RSA mechanisms they are forwarded to `*_with_handle` backend methods so
+/// the backend can hit the handle-based RSA private-key cache and avoid
+/// re-parsing PKCS#8 DER on every call (see ROADMAP.md "Eliminate
+/// per-operation RSA key re-parsing").
 fn sign_single_shot(
     backend: &dyn CryptoBackend,
+    slot_id: u64,
+    key_handle: u64,
     mechanism: CK_MECHANISM_TYPE,
     key_bytes: &[u8],
     data: &[u8],
@@ -2180,7 +2207,7 @@ fn sign_single_shot(
 ) -> HsmResult<Vec<u8>> {
     if sign::is_pss_mechanism(mechanism) {
         let hash = sign::pss_mechanism_to_hash(mechanism)?;
-        backend.rsa_pss_sign(key_bytes, data, hash)
+        backend.rsa_pss_sign_with_handle(slot_id, key_handle, key_bytes, data, hash)
     } else if sign::is_ecdsa_mechanism(mechanism) {
         let key_type = obj.key_type.unwrap_or(0);
         match key_type {
@@ -2213,14 +2240,19 @@ fn sign_single_shot(
     } else {
         // RSA PKCS#1 v1.5
         let hash_alg = sign::mechanism_to_hash(mechanism);
-        backend.rsa_pkcs1v15_sign(key_bytes, data, hash_alg)
+        backend.rsa_pkcs1v15_sign_with_handle(slot_id, key_handle, key_bytes, data, hash_alg)
     }
 }
 
 /// Prehashed sign: used by C_SignFinal when data was hashed via multi-part C_SignUpdate.
 /// The `digest` is the finalized hash output.
+///
+/// `slot_id` and `key_handle` are forwarded to `*_with_handle` backend methods
+/// for the RSA paths (see `sign_single_shot`).
 fn sign_prehashed(
     backend: &dyn CryptoBackend,
+    slot_id: u64,
+    key_handle: u64,
     mechanism: CK_MECHANISM_TYPE,
     key_bytes: &[u8],
     digest: &[u8],
@@ -2228,7 +2260,7 @@ fn sign_prehashed(
 ) -> HsmResult<Vec<u8>> {
     if sign::is_pss_mechanism(mechanism) {
         let hash = sign::pss_mechanism_to_hash(mechanism)?;
-        backend.rsa_pss_sign_prehashed(key_bytes, digest, hash)
+        backend.rsa_pss_sign_prehashed_with_handle(slot_id, key_handle, key_bytes, digest, hash)
     } else if sign::is_ecdsa_mechanism(mechanism) {
         let key_type = obj.key_type.unwrap_or(0);
         match key_type {
@@ -2245,7 +2277,9 @@ fn sign_prehashed(
     } else {
         // RSA PKCS#1 v1.5 prehashed
         let hash_alg = sign::mechanism_to_hash(mechanism).ok_or(HsmError::MechanismInvalid)?;
-        backend.rsa_pkcs1v15_sign_prehashed(key_bytes, digest, hash_alg)
+        backend.rsa_pkcs1v15_sign_prehashed_with_handle(
+            slot_id, key_handle, key_bytes, digest, hash_alg,
+        )
     }
 }
 
@@ -4753,13 +4787,30 @@ pub extern "C" fn C_SignFinal(
             }
         };
 
+        let slot_id = sess.slot_id;
         let result = if let Some(h) = hasher {
             // Multi-part with built-in hash: finalize hash, then prehash sign
             let digest = h.finalize();
-            sign_prehashed(&*hsm.crypto_backend, mechanism, key_bytes, &digest, &obj)
+            sign_prehashed(
+                &*hsm.crypto_backend,
+                slot_id as u64,
+                key_handle as u64,
+                mechanism,
+                key_bytes,
+                &digest,
+                &obj,
+            )
         } else {
             // Accumulated raw data: sign directly (same as C_Sign)
-            sign_single_shot(&*hsm.crypto_backend, mechanism, key_bytes, &data, &obj)
+            sign_single_shot(
+                &*hsm.crypto_backend,
+                slot_id as u64,
+                key_handle as u64,
+                mechanism,
+                key_bytes,
+                &data,
+                &obj,
+            )
         };
 
         match result {
