@@ -4,7 +4,6 @@ pub mod approved_services;
 #[cfg(feature = "awslc-backend")]
 pub mod awslc_backend;
 pub mod backend;
-pub mod build_integrity;
 pub mod conditional_test;
 pub mod derive;
 pub mod digest;
@@ -12,6 +11,7 @@ pub mod drbg;
 pub mod encrypt;
 pub mod entropy_health;
 pub mod integrity;
+pub use integrity as build_integrity;
 pub mod keygen;
 pub mod mechanisms;
 pub mod metrics;
