@@ -104,7 +104,7 @@ impl HsmCore {
 
         #[cfg(all(feature = "rustcrypto-backend", not(feature = "awslc-backend")))]
         {
-            return Arc::new(RustCryptoBackend);
+            Arc::new(RustCryptoBackend)
         }
 
         #[cfg(not(any(feature = "rustcrypto-backend", feature = "awslc-backend")))]
@@ -140,13 +140,6 @@ impl HsmCore {
     /// seeded (e.g., OS entropy source unavailable).
     pub fn try_new(config: &HsmConfig) -> Result<Self, crate::error::HsmError> {
         let drbg = HmacDrbg::new().map_err(|_| crate::error::HsmError::GeneralError)?;
-        let audit_log = if config.audit.enabled {
-            AuditLog::new_with_path(config.audit.log_path.clone())?
-        } else {
-            AuditLog::new()
-        };
-        // Install global zeroization audit sink
-        crate::audit::log::set_zeroization_audit_sink(&audit_log);
         Ok(Self {
             slot_manager: SlotManager::new_with_config(config),
             session_manager: SessionManager::new(),
@@ -168,7 +161,7 @@ impl HsmCore {
             state_hmac_key: Self::generate_state_hmac_key(),
             conditional_self_test: ConditionalSelfTest::new(),
             metrics: MetricsCollector::new(true),
-            rate_limiter: RateLimiter::new(&config.rate_limit),
+            rate_limiter: RateLimiter::new(&crate::crypto::rate_limit::RateLimitConfig::default()),
         })
     }
 
@@ -192,12 +185,6 @@ impl HsmCore {
         backend: Arc<dyn CryptoBackend>,
     ) -> Result<Self, crate::error::HsmError> {
         let drbg = HmacDrbg::new().map_err(|_| crate::error::HsmError::GeneralError)?;
-        let audit_log = if config.audit.enabled {
-            AuditLog::new_with_path(config.audit.log_path.clone())?
-        } else {
-            AuditLog::new()
-        };
-        crate::audit::log::set_zeroization_audit_sink(&audit_log);
         Ok(Self {
             slot_manager: SlotManager::new_with_config(config),
             session_manager: SessionManager::new(),
@@ -219,7 +206,7 @@ impl HsmCore {
             state_hmac_key: Self::generate_state_hmac_key(),
             conditional_self_test: ConditionalSelfTest::new(),
             metrics: MetricsCollector::new(true),
-            rate_limiter: RateLimiter::new(&config.rate_limit),
+            rate_limiter: RateLimiter::new(&crate::crypto::rate_limit::RateLimitConfig::default()),
         })
     }
 

@@ -58,7 +58,7 @@ impl HandleScrambler {
 
     /// Forward permutation: counter → handle.
     fn scramble(&self, counter: u64) -> u64 {
-        if MAX_HANDLE <= u32::MAX as u64 {
+        if MAX_HANDLE == u32::MAX as u64 {
             self.feistel32_forward(counter as u32) as u64
         } else {
             self.feistel64_forward(counter)
@@ -67,7 +67,7 @@ impl HandleScrambler {
 
     /// Inverse permutation: handle → counter.
     fn unscramble(&self, handle: u64) -> u64 {
-        if MAX_HANDLE <= u32::MAX as u64 {
+        if MAX_HANDLE == u32::MAX as u64 {
             self.feistel32_inverse(handle as u32) as u64
         } else {
             self.feistel64_inverse(handle)
@@ -144,12 +144,20 @@ impl SessionHandleAllocator {
             scrambler: HandleScrambler::new(),
         }
     }
+}
 
+impl Default for SessionHandleAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SessionHandleAllocator {
     pub fn next(&self) -> HsmResult<CK_SESSION_HANDLE> {
         loop {
             let current = self.next.load(Ordering::Acquire);
             // Wrap around instead of permanently failing on exhaustion.
-            let next_val = if current >= MAX_HANDLE {
+            let next_val = if current == MAX_HANDLE {
                 0
             } else {
                 current + 1
@@ -194,11 +202,19 @@ impl ObjectHandleAllocator {
             reserved: parking_lot::Mutex::new(HashSet::new()),
         }
     }
+}
 
+impl Default for ObjectHandleAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ObjectHandleAllocator {
     pub fn next(&self) -> HsmResult<CK_OBJECT_HANDLE> {
         loop {
             let current = self.next.load(Ordering::Acquire);
-            let next_val = if current >= MAX_HANDLE {
+            let next_val = if current == MAX_HANDLE {
                 0
             } else {
                 current + 1

@@ -9,10 +9,10 @@
 # - Cargo plugins: audit, deny, tarpaulin, semver-checks
 #
 # Build: docker build -t craton_hsm_ci:latest -f deploy/Dockerfile.ci .
-# Run:   ./scripts/local-ci-container.sh
+# Run:   ./scripts/local-ci.sh
 # ============================================================================
 
-FROM rust:1.83-bookworm
+FROM rust:1.91-bookworm
 
 # 1. Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -38,16 +38,21 @@ RUN curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/ca
 
 RUN cargo binstall -y --locked \
     cargo-audit \
-    cargo-deny \
-    cargo-tarpaulin \
-    cargo-semver-checks
+    cargo-deny
+
+# Install tools that require local GLIBC linking from source to prevent compatibility errors
+RUN cargo install --locked \
+    cargo-tarpaulin@0.35.4 \
+    cargo-semver-checks@0.47.0
 
 # 4. Set environment variables
 ENV CARGO_TERM_COLOR=always
 ENV RUST_BACKTRACE=1
+ENV PROTOC=/usr/bin/protoc
 
 WORKDIR /app
 
-# The entrypoint will be the local-ci script
-ENTRYPOINT ["/bin/bash", "./scripts/ci-local.sh"]
+ENV CRATON_CI_CONTAINER=1
+
+ENTRYPOINT ["/bin/bash", "./scripts/local-ci.sh"]
 CMD ["all"]

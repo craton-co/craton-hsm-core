@@ -115,14 +115,14 @@ pub(crate) fn restrict_file_to_owner(path: &Path) -> Result<(), String> {
         let mut acl_buf: Vec<u8> = vec![0u8; acl_size as usize];
         let acl_ptr = acl_buf.as_mut_ptr() as *mut WIN_ACL;
 
-        if InitializeAcl(acl_ptr, acl_size, ACL_REVISION as u32) == 0 {
+        if InitializeAcl(acl_ptr, acl_size, ACL_REVISION) == 0 {
             let err = GetLastError();
             return Err(format!("InitializeAcl failed (error {})", err));
         }
 
         // GENERIC_READ | GENERIC_WRITE
         let access_mask: u32 = 0x80000000 | 0x40000000;
-        if AddAccessAllowedAce(acl_ptr, ACL_REVISION as u32, access_mask, user_sid) == 0 {
+        if AddAccessAllowedAce(acl_ptr, ACL_REVISION, access_mask, user_sid) == 0 {
             let err = GetLastError();
             return Err(format!("AddAccessAllowedAce failed (error {})", err));
         }
@@ -174,9 +174,7 @@ mod tests {
     #[test]
     fn restricted_dacl_has_single_ace_at_expected_revision() {
         use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Security::Authorization::{
-            GetNamedSecurityInfoW, SE_FILE_OBJECT,
-        };
+        use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
         use windows_sys::Win32::Security::{
             GetAclInformation, ACL as WIN_ACL, ACL_INFORMATION_CLASS, ACL_REVISION,
             ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION,
@@ -232,7 +230,11 @@ mod tests {
                 ACL_SIZE_INFO,
             );
             assert_ne!(ok, 0, "GetAclInformation failed");
-            assert_eq!(info.AceCount, 1, "expected exactly one ACE, got {}", info.AceCount);
+            assert_eq!(
+                info.AceCount, 1,
+                "expected exactly one ACE, got {}",
+                info.AceCount
+            );
             assert_eq!(
                 info.AclBytesFree, 0,
                 "ACL buffer was oversized by {} bytes — indicates miscalculated size",

@@ -46,6 +46,12 @@ pub struct ObjectStore {
     handle_to_store_key: parking_lot::Mutex<std::collections::HashMap<CK_OBJECT_HANDLE, String>>,
 }
 
+impl Default for ObjectStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ObjectStore {
     pub fn new() -> Self {
         Self {
