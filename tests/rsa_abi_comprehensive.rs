@@ -307,10 +307,11 @@ fn test_rsa_2048_oaep_encrypt_decrypt() {
     );
 
     // Decrypt via C ABI with private key
+    let mut hash_alg = CKM_SHA256;
     let mut dec_mechanism = CK_MECHANISM {
         mechanism: CKM_RSA_PKCS_OAEP,
-        p_parameter: ptr::null_mut(),
-        parameter_len: 0,
+        p_parameter: &mut hash_alg as *mut _ as CK_VOID_PTR,
+        parameter_len: std::mem::size_of::<CK_ULONG>() as CK_ULONG,
     };
     let rv = C_DecryptInit(session, &mut dec_mechanism, priv_key);
     assert_eq!(rv, CKR_OK, "DecryptInit failed: 0x{:08X}", rv);
@@ -481,10 +482,11 @@ fn test_rsa_oaep_wrong_key_decrypt_fails() {
     let ciphertext = oaep_encrypt_via_internal(&modulus_a, &pub_exp_a, plaintext);
 
     // Decrypt with priv_B via C ABI -- should fail
+    let mut hash_alg = CKM_SHA256;
     let mut dec_mechanism = CK_MECHANISM {
         mechanism: CKM_RSA_PKCS_OAEP,
-        p_parameter: ptr::null_mut(),
-        parameter_len: 0,
+        p_parameter: &mut hash_alg as *mut _ as CK_VOID_PTR,
+        parameter_len: std::mem::size_of::<CK_ULONG>() as CK_ULONG,
     };
     let rv = C_DecryptInit(session, &mut dec_mechanism, priv_b);
     assert_eq!(rv, CKR_OK);
@@ -519,10 +521,11 @@ fn test_rsa_oaep_tampered_ciphertext_fails() {
     ciphertext[0] ^= 0xFF;
 
     // Decrypt via C ABI should fail
+    let mut hash_alg = CKM_SHA256;
     let mut dec_mechanism = CK_MECHANISM {
         mechanism: CKM_RSA_PKCS_OAEP,
-        p_parameter: ptr::null_mut(),
-        parameter_len: 0,
+        p_parameter: &mut hash_alg as *mut _ as CK_VOID_PTR,
+        parameter_len: std::mem::size_of::<CK_ULONG>() as CK_ULONG,
     };
     let rv = C_DecryptInit(session, &mut dec_mechanism, priv_key);
     assert_eq!(rv, CKR_OK);

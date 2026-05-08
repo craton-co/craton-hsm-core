@@ -214,7 +214,7 @@ fn post_hmac_sha512_kat() -> HsmResult<()> {
         HmacSha512::new_from_slice(key).map_err(|_| crate::error::HsmError::GeneralError)?;
     mac.update(data);
     let result = mac.finalize().into_bytes();
-    if &result[..] != expected {
+    if result[..] != expected {
         return Err(crate::error::HsmError::GeneralError);
     }
     Ok(())

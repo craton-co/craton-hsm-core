@@ -20,7 +20,7 @@ thread_local! {
     /// The `u64` is the generation counter at the time of caching; a mismatch
     /// against `SessionManager::generation` means sessions were removed and
     /// the cached entry may be stale (use-after-close defense).
-    static TLS_SESSION_CACHE: RefCell<Option<(CK_SESSION_HANDLE, u64, Arc<RwLock<Session>>)>> = RefCell::new(None);
+    static TLS_SESSION_CACHE: RefCell<Option<(CK_SESSION_HANDLE, u64, Arc<RwLock<Session>>)>> = const { RefCell::new(None) };
 }
 
 pub struct SessionManager {
@@ -33,6 +33,12 @@ pub struct SessionManager {
     /// are removed. The TLS cache stores the generation at cache-fill time;
     /// a mismatch forces a DashMap re-lookup, preventing use-after-close races.
     generation: AtomicU64,
+}
+
+impl Default for SessionManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SessionManager {
@@ -116,10 +122,8 @@ impl SessionManager {
         let is_rw = (flags & CKF_RW_SESSION) != 0;
 
         // Check if SO is logged in — only RW sessions allowed
-        if !is_rw {
-            if token.login_state() == crate::token::token::LoginState::SoLoggedIn {
-                return Err(HsmError::SessionReadWriteSoExists);
-            }
+        if !is_rw && token.login_state() == crate::token::token::LoginState::SoLoggedIn {
+            return Err(HsmError::SessionReadWriteSoExists);
         }
 
         token.increment_session_count(is_rw)?;

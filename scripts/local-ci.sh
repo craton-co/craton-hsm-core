@@ -2,138 +2,224 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Craton Software Company
 #
-# local-ci.sh — Run all CI jobs locally (mirrors .github/workflows/ci.yml + security-audit.yml)
+# local-ci.sh — Run the GitHub Actions CI pipeline locally inside Docker.
 #
-# Usage:
-#   ./scripts/local-ci.sh              # Run all jobs
-#   ./scripts/local-ci.sh fmt          # Run a single job
-#   ./scripts/local-ci.sh fmt test     # Run specific jobs
+# By default this script wraps work in deploy/Dockerfile.ci (Rust, protoc, Miri,
+# cargo-audit/deny/tarpaulin/semver-checks). That matches the tooling and Linux
+# environment used on ubuntu-latest runners.
 #
-# Available jobs:
-#   fmt        Format check (cargo fmt --check)
-#   test       Build & test (cargo test --workspace)
-#   clippy     Clippy lint with -D warnings
-#   semver     Semver compatibility check
-#   miri       Miri undefined-behavior check on crypto modules
-#   docs       Build rustdoc
-#   audit      Security audit (cargo-audit + cargo-deny)
-#   bench      Benchmarks (cargo bench, no SoftHSMv2 comparison)
+# Usage (from repo root):
+#   ./scripts/local-ci.sh                  # fmt + tests + lint + audit + semver + miri + docs + coverage
+#   ./scripts/local-ci.sh quick            # fmt + tests + clippy
+#   ./scripts/local-ci.sh fmt|test|clippy|audit|semver|miri|docs|coverage
 #
-# Prerequisites:
-#   - Rust stable + nightly (rustup)
-#   - protoc (for gRPC daemon)
-#   - cargo-semver-checks:  cargo install cargo-semver-checks
-#   - cargo-audit:          cargo install cargo-audit
-#   - cargo-deny:           cargo install cargo-deny
+# Force running on the host (not recommended; install the same tools as the image):
+#   CRATON_CI_CONTAINER=1 ./scripts/local-ci.sh quick
 
 set -euo pipefail
 
-# ── Colors ────────────────────────────────────────────────────────────────────
+# ── Docker bootstrap (host) ───────────────────────────────────────────────────
+if [[ "${CRATON_CI_CONTAINER:-}" != "1" ]]; then
+    if ! command -v docker &>/dev/null; then
+        echo "Error: docker is required to run local CI (mirrors GitHub Actions)."
+        exit 1
+    fi
+
+    REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+    cd "$REPO_ROOT"
+
+    echo "==> Building CI image (deploy/Dockerfile.ci)..."
+    docker build -t craton_hsm_ci:latest -f deploy/Dockerfile.ci .
+
+    DOCKER_TTY=()
+    if [[ -t 0 && -t 1 ]]; then
+        DOCKER_TTY=(-it)
+    else
+        DOCKER_TTY=(-i)
+    fi
+
+    echo "==> Running CI in container..."
+    exec docker run --rm "${DOCKER_TTY[@]}" \
+        --privileged \
+        -e CRATON_CI_CONTAINER=1 \
+        -v "$REPO_ROOT":/app \
+        -v craton-cargo-registry:/usr/local/cargo/registry \
+        -v craton-cargo-git:/usr/local/cargo/git \
+        -v craton-ci-target:/app/target \
+        craton_hsm_ci:latest "$@"
+fi
+
+# ── In-container runner (mirrors .github/workflows/ci.yml + security-audit) ─
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 BOLD='\033[1m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# ── State ─────────────────────────────────────────────────────────────────────
-PASS=()
-FAIL=()
-SKIP=()
-TOTAL_START=$SECONDS
+declare -a JOB_NAMES=()
+declare -a JOB_RESULTS=()
+FAILED=0
+START_TIME=$SECONDS
+export PROTOC=${PROTOC:-/usr/bin/protoc}
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-header() {
+log_header() {
     echo ""
-    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${BOLD}  ▶ $1${NC}"
-    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BLUE}══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}  $1${NC}"
+    echo -e "${BLUE}══════════════════════════════════════════════════════════════${NC}"
 }
 
-run_job() {
-    local name="$1"
-    shift
-    local start=$SECONDS
-    header "$name"
+log_pass() {
+    echo -e "  ${GREEN}✓ PASS${NC}: $1"
+    JOB_NAMES+=("$1")
+    JOB_RESULTS+=("pass")
+}
 
-    if "$@"; then
-        local elapsed=$(( SECONDS - start ))
-        echo -e "${GREEN}  ✓ ${name} passed${NC} (${elapsed}s)"
-        PASS+=("$name")
-        return 0
+log_fail() {
+    echo -e "  ${RED}✗ FAIL${NC}: $1"
+    JOB_NAMES+=("$1")
+    JOB_RESULTS+=("fail")
+    FAILED=1
+}
+
+log_skip() {
+    echo -e "  ${YELLOW}○ SKIP${NC}: $1 ($2)"
+    JOB_NAMES+=("$1")
+    JOB_RESULTS+=("skip")
+}
+
+log_warn() {
+    echo -e "  ${YELLOW}⚠ WARN${NC}: $1 (non-blocking, matches CI continue-on-error)"
+    JOB_NAMES+=("$1")
+    JOB_RESULTS+=("warn")
+}
+
+job_fmt() {
+    log_header "Format Check (cargo fmt --check)"
+    if cargo fmt --check 2>&1; then
+        log_pass "Format Check"
     else
-        local elapsed=$(( SECONDS - start ))
-        echo -e "${RED}  ✗ ${name} FAILED${NC} (${elapsed}s)"
-        FAIL+=("$name")
-        return 1
+        log_fail "Format Check"
     fi
 }
 
-skip_job() {
-    echo -e "${YELLOW}  ⊘ $1 skipped ($2)${NC}"
-    SKIP+=("$1")
-}
-
-has_cmd() {
-    command -v "$1" &>/dev/null
-}
-
-# ── Job implementations ──────────────────────────────────────────────────────
-
-job_fmt() {
-    cargo fmt --check
-}
-
+# Mirrors CI shards: separate cargo test invocations avoid PKCS#11 singleton issues.
 job_test() {
-    export CARGO_TERM_COLOR=always
-    export RUST_BACKTRACE=1
-    cargo test --workspace -- --test-threads=1
+    log_header "Build & Test"
+    local test_ok=true
+
+    echo -e "\n${BOLD}  Shard 1: Unit & crypto tests (parallel-safe)${NC}"
+    if cargo test --lib \
+        --test crypto_vectors \
+        --test drbg_tests \
+        --test concurrent_stress \
+        --test zeroization \
+        --test integrity_tests \
+        --test multi_slot \
+        -- --test-threads=8 2>&1; then
+        echo -e "  ${GREEN}✓${NC} Unit & crypto tests passed"
+    else
+        echo -e "  ${RED}✗${NC} Unit & crypto tests failed"
+        test_ok=false
+    fi
+
+    echo -e "\n${BOLD}  Audit & FIPS POST tests (serial — shared IV tracker)${NC}"
+    if cargo test \
+        --test audit_and_integrity \
+        -- --test-threads=1 2>&1; then
+        echo -e "  ${GREEN}✓${NC} Audit & FIPS POST tests passed"
+    else
+        echo -e "  ${RED}✗${NC} Audit & FIPS POST tests failed"
+        test_ok=false
+    fi
+
+    echo -e "\n${BOLD}  Shard 2: PKCS#11 ABI — compliance${NC}"
+    if cargo test \
+        --test attribute_management \
+        --test attribute_validation \
+        --test digest_abi \
+        --test fips_approved_mode \
+        --test negative_edge_cases \
+        --test operation_state \
+        --test pkcs11_compliance \
+        --test pkcs11_compliance_extended \
+        --test pkcs11_conformance \
+        --test pkcs11_error_paths \
+        --test pkcs11_info_functions \
+        --test random_and_session \
+        --test session_state_machine \
+        --test supplementary_functions \
+        -- --test-threads=1 2>&1; then
+        echo -e "  ${GREEN}✓${NC} PKCS#11 compliance tests passed"
+    else
+        echo -e "  ${RED}✗${NC} PKCS#11 compliance tests failed"
+        test_ok=false
+    fi
+
+    echo -e "\n${BOLD}  Shard 3: PKCS#11 ABI — crypto ops${NC}"
+    if cargo test \
+        --test backup_restore \
+        --test concurrent_session_stress \
+        --test crypto_vectors_phase2 \
+        --test key_derivation_abi \
+        --test key_lifecycle_abi \
+        --test key_wrapping_abi \
+        --test multipart_encrypt_decrypt \
+        --test multipart_sign_verify \
+        --test pairwise_consistency \
+        --test persistence \
+        --test pqc_abi_comprehensive \
+        --test pqc_phase3 \
+        --test rsa_abi_comprehensive \
+        --test security_properties \
+        -- --test-threads=1 2>&1; then
+        echo -e "  ${GREEN}✓${NC} PKCS#11 crypto ops tests passed"
+    else
+        echo -e "  ${RED}✗${NC} PKCS#11 crypto ops tests failed"
+        test_ok=false
+    fi
+
+    echo -e "\n${BOLD}  Workspace member tests${NC}"
+    if cargo test \
+        -p craton-hsm-admin \
+        -p pkcs11-spy \
+        -p craton-hsm-daemon \
+        -- --test-threads=1 2>&1; then
+        echo -e "  ${GREEN}✓${NC} Workspace member tests passed"
+    else
+        echo -e "  ${RED}✗${NC} Workspace member tests failed"
+        test_ok=false
+    fi
+
+    if $test_ok; then
+        log_pass "Build & Test"
+    else
+        log_fail "Build & Test"
+    fi
 }
 
 job_clippy() {
-    # Deny correctness and suspicious lints (safety-critical for a crypto project).
-    # Other clippy categories remain warnings until pre-existing issues are resolved.
-    # -A deprecated: upstream generic-array deprecation from transitive deps
-    cargo clippy --workspace -- \
+    log_header "Clippy (cargo clippy --workspace)"
+    if cargo clippy --workspace -- \
         -D clippy::correctness -D clippy::suspicious \
         -A deprecated -A clippy::incompatible_msrv \
-        -A clippy::not_unsafe_ptr_arg_deref
-}
-
-job_semver() {
-    if ! has_cmd cargo-semver-checks; then
-        skip_job "semver" "cargo-semver-checks not installed (cargo install cargo-semver-checks)"
-        return 0
+        -A clippy::not_unsafe_ptr_arg_deref 2>&1; then
+        log_pass "Clippy"
+    else
+        log_fail "Clippy"
     fi
-    # Non-blocking until 1.0 — report but don't fail
-    cargo semver-checks check-release --package craton-hsm || true
-}
-
-job_miri() {
-    # Check nightly is available
-    if ! rustup run nightly rustc --version &>/dev/null; then
-        skip_job "miri" "Rust nightly not installed (rustup toolchain install nightly)"
-        return 0
-    fi
-    if ! rustup run nightly cargo miri --version &>/dev/null; then
-        skip_job "miri" "Miri not installed (rustup +nightly component add miri)"
-        return 0
-    fi
-
-    export MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-symbolic-alignment-check"
-    cargo +nightly miri test --lib -- --test-threads=1 crypto::zeroize crypto::digest crypto::integrity
-}
-
-job_docs() {
-    RUSTDOCFLAGS="--cfg docsrs" cargo doc --no-deps
 }
 
 job_audit() {
+    log_header "Security Audit (cargo-audit + cargo-deny)"
+
     local audit_ok=true
 
-    if has_cmd cargo-audit; then
-        echo -e "${BOLD}  Running cargo-audit...${NC}"
-        cargo audit \
+    if command -v cargo-audit &>/dev/null; then
+        echo -e "\n${BOLD}  cargo audit${NC}"
+        if cargo audit \
             --ignore RUSTSEC-2023-0071 \
             --ignore RUSTSEC-2026-0042 \
             --ignore RUSTSEC-2026-0044 \
@@ -142,134 +228,150 @@ job_audit() {
             --ignore RUSTSEC-2026-0047 \
             --ignore RUSTSEC-2026-0048 \
             --ignore RUSTSEC-2026-0049 \
-            --ignore RUSTSEC-2025-0134 \
-            || audit_ok=false
-    else
-        echo -e "${YELLOW}  cargo-audit not installed — skipping CVE check${NC}"
-    fi
-
-    if has_cmd cargo-deny; then
-        echo -e "${BOLD}  Running cargo-deny...${NC}"
-        cargo deny check advisories licenses || audit_ok=false
-    else
-        echo -e "${YELLOW}  cargo-deny not installed — skipping license/advisory check${NC}"
-    fi
-
-    if ! has_cmd cargo-audit && ! has_cmd cargo-deny; then
-        skip_job "audit" "neither cargo-audit nor cargo-deny installed"
-        return 0
-    fi
-
-    $audit_ok
-}
-
-job_bench() {
-    cargo bench --bench crypto_bench
-}
-
-# ── Job registry ──────────────────────────────────────────────────────────────
-
-ALL_JOBS=(fmt test clippy semver miri docs audit bench)
-
-declare -A JOB_FN
-JOB_FN[fmt]=job_fmt
-JOB_FN[test]=job_test
-JOB_FN[clippy]=job_clippy
-JOB_FN[semver]=job_semver
-JOB_FN[miri]=job_miri
-JOB_FN[docs]=job_docs
-JOB_FN[audit]=job_audit
-JOB_FN[bench]=job_bench
-
-declare -A JOB_NAME
-JOB_NAME[fmt]="Format Check"
-JOB_NAME[test]="Build & Test"
-JOB_NAME[clippy]="Clippy Lint"
-JOB_NAME[semver]="Semver Compliance"
-JOB_NAME[miri]="Miri (UB Check)"
-JOB_NAME[docs]="Documentation Build"
-JOB_NAME[audit]="Security Audit"
-JOB_NAME[bench]="Benchmarks"
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-
-echo -e "${BOLD}Craton HSM — Local CI Runner${NC}"
-echo -e "Mirrors .github/workflows/ci.yml + security-audit.yml"
-echo ""
-
-# Parse args: if specific jobs given, run only those
-if [[ $# -gt 0 ]]; then
-    JOBS_TO_RUN=("$@")
-else
-    JOBS_TO_RUN=("${ALL_JOBS[@]}")
-fi
-
-# Validate job names
-for job in "${JOBS_TO_RUN[@]}"; do
-    if [[ -z "${JOB_FN[$job]+x}" ]]; then
-        echo -e "${RED}Unknown job: ${job}${NC}"
-        echo "Available jobs: ${ALL_JOBS[*]}"
-        exit 1
-    fi
-done
-
-# Preflight checks
-echo -e "${BOLD}Preflight:${NC}"
-echo -n "  rustc:    " && rustc --version
-echo -n "  cargo:    " && cargo --version
-if has_cmd protoc; then
-    echo -n "  protoc:   " && protoc --version
-else
-    echo -e "  protoc:   ${YELLOW}not found (gRPC daemon tests may fail)${NC}"
-fi
-echo ""
-
-# Run each job — fmt is the fast gate, fail early
-CONTINUE=true
-for job in "${JOBS_TO_RUN[@]}"; do
-    if [[ "$CONTINUE" == false && "$job" != "audit" ]]; then
-        skip_job "${JOB_NAME[$job]}" "prior job failed"
-        continue
-    fi
-
-    run_job "${JOB_NAME[$job]}" "${JOB_FN[$job]}" || {
-        # fmt failure is a hard stop (mirrors CI dependency graph)
-        if [[ "$job" == "fmt" ]]; then
-            echo -e "${RED}  Format check failed — fix with: cargo fmt${NC}"
-            CONTINUE=false
+            --ignore RUSTSEC-2025-0134 2>&1; then
+            echo -e "  ${GREEN}✓${NC} cargo-audit passed"
+        else
+            echo -e "  ${RED}✗${NC} cargo-audit failed"
+            audit_ok=false
         fi
-    }
-done
+    else
+        echo -e "  ${YELLOW}○${NC} cargo-audit not installed"
+        audit_ok=false
+    fi
 
-# ── Summary ───────────────────────────────────────────────────────────────────
-TOTAL_ELAPSED=$(( SECONDS - TOTAL_START ))
+    if command -v cargo-deny &>/dev/null; then
+        echo -e "\n${BOLD}  cargo deny check${NC}"
+        if cargo deny check advisories licenses 2>&1; then
+            echo -e "  ${GREEN}✓${NC} cargo-deny passed"
+        else
+            echo -e "  ${RED}✗${NC} cargo-deny failed"
+            audit_ok=false
+        fi
+    else
+        echo -e "  ${YELLOW}○${NC} cargo-deny not installed"
+        audit_ok=false
+    fi
 
-echo ""
-echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${BOLD}  CI Summary  (${TOTAL_ELAPSED}s total)${NC}"
-echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    if $audit_ok; then
+        log_pass "Security Audit"
+    else
+        log_fail "Security Audit"
+    fi
+}
 
-if [[ ${#PASS[@]} -gt 0 ]]; then
-    for j in "${PASS[@]}"; do
-        echo -e "  ${GREEN}✓${NC} $j"
+job_semver() {
+    log_header "Semver Compliance (cargo-semver-checks)"
+    if ! command -v cargo-semver-checks &>/dev/null; then
+        log_skip "Semver Checks" "cargo-semver-checks not in PATH"
+        return
+    fi
+    # Non-blocking in CI until 1.0 (semver-checks job continues on error).
+    if cargo semver-checks check-release --package craton-hsm --baseline-rev main 2>&1; then
+        log_pass "Semver Checks"
+    else
+        log_warn "Semver Checks"
+    fi
+}
+
+job_miri() {
+    log_header "Miri (Undefined Behavior Check)"
+    export MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-symbolic-alignment-check"
+    if cargo +nightly miri test --lib -- --test-threads=1 crypto::zeroize crypto::digest crypto::integrity 2>&1; then
+        log_pass "Miri"
+    else
+        log_fail "Miri"
+    fi
+}
+
+job_docs() {
+    log_header "Documentation Build (cargo doc)"
+    if RUSTDOCFLAGS="--cfg docsrs" cargo doc --no-deps 2>&1; then
+        log_pass "Documentation Build"
+    else
+        log_fail "Documentation Build"
+    fi
+}
+
+job_coverage() {
+    log_header "Code Coverage (cargo-tarpaulin)"
+    if ! command -v cargo-tarpaulin &>/dev/null; then
+        log_skip "Coverage" "cargo-tarpaulin not in PATH"
+        return
+    fi
+    if cargo tarpaulin --out xml --out html --skip-clean --timeout 300 \
+        --exclude-files 'tests/fips_*' -- --test-threads=1 2>&1; then
+        log_pass "Coverage"
+        if [[ -f tarpaulin-report.html ]]; then
+            echo -e "  Report: ${BOLD}tarpaulin-report.html${NC}"
+        fi
+    else
+        log_fail "Coverage"
+    fi
+}
+
+print_summary() {
+    local elapsed=$(( SECONDS - START_TIME ))
+    local mins=$(( elapsed / 60 ))
+    local secs=$(( elapsed % 60 ))
+
+    echo ""
+    echo -e "${BLUE}══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}  CI Results Summary                         ${mins}m ${secs}s${NC}"
+    echo -e "${BLUE}══════════════════════════════════════════════════════════════${NC}"
+
+    for i in "${!JOB_NAMES[@]}"; do
+        case "${JOB_RESULTS[$i]}" in
+            pass) echo -e "  ${GREEN}✓ PASS${NC}  ${JOB_NAMES[$i]}" ;;
+            fail) echo -e "  ${RED}✗ FAIL${NC}  ${JOB_NAMES[$i]}" ;;
+            warn) echo -e "  ${YELLOW}⚠ WARN${NC}  ${JOB_NAMES[$i]}" ;;
+            skip) echo -e "  ${YELLOW}○ SKIP${NC}  ${JOB_NAMES[$i]}" ;;
+        esac
     done
-fi
-if [[ ${#SKIP[@]} -gt 0 ]]; then
-    for j in "${SKIP[@]}"; do
-        echo -e "  ${YELLOW}⊘${NC} $j (skipped)"
-    done
-fi
-if [[ ${#FAIL[@]} -gt 0 ]]; then
-    for j in "${FAIL[@]}"; do
-        echo -e "  ${RED}✗${NC} $j"
-    done
-fi
 
-echo ""
-if [[ ${#FAIL[@]} -eq 0 ]]; then
-    echo -e "${GREEN}${BOLD}  All CI checks passed!${NC}"
-    exit 0
-else
-    echo -e "${RED}${BOLD}  ${#FAIL[@]} job(s) failed: ${FAIL[*]}${NC}"
-    exit 1
-fi
+    echo -e "${BLUE}══════════════════════════════════════════════════════════════${NC}"
+
+    if [[ $FAILED -eq 0 ]]; then
+        echo -e "  ${GREEN}${BOLD}All blocking checks passed.${NC}"
+    else
+        echo -e "  ${RED}${BOLD}Some checks failed.${NC}"
+    fi
+    echo ""
+}
+
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+
+export CARGO_TERM_COLOR=always
+export RUST_BACKTRACE=1
+
+case "${1:-all}" in
+    fmt)      job_fmt ;;
+    test)     job_test ;;
+    clippy)   job_clippy ;;
+    audit)    job_audit ;;
+    semver)   job_semver ;;
+    miri)     job_miri ;;
+    docs)     job_docs ;;
+    coverage) job_coverage ;;
+    quick)
+        job_fmt
+        job_test
+        job_clippy
+        ;;
+    all)
+        job_fmt
+        job_test
+        job_clippy
+        job_audit
+        job_semver
+        job_miri
+        job_docs
+        job_coverage
+        ;;
+    *)
+        echo "Usage: $0 {all|quick|fmt|test|clippy|audit|semver|miri|docs|coverage}"
+        exit 1
+        ;;
+esac
+
+print_summary
+exit "$FAILED"

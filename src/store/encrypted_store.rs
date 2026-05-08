@@ -254,10 +254,8 @@ impl EncryptedStore {
             tracing::error!("Failed to iterate objects table: {}", e);
             HsmError::GeneralError
         })?;
-        for entry in iter {
-            if let Ok(entry) = entry {
-                keys.push(entry.0.value().to_string());
-            }
+        for entry in iter.flatten() {
+            keys.push(entry.0.value().to_string());
         }
         Ok(keys)
     }
