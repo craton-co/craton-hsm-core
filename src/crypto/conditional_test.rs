@@ -521,7 +521,7 @@ pub fn mechanism_to_family(
     use crate::pkcs11_abi::constants::*;
 
     // Helper: check if EC params indicate P-384
-    let is_p384 = ec_params.map_or(false, |params| {
+    let is_p384 = ec_params.is_some_and(|params| {
         // OID for secp384r1: 06 05 2b 81 04 00 22
         params.len() >= 7
             && params.contains(&0x22)

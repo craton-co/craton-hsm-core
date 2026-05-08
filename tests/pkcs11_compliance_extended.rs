@@ -346,6 +346,11 @@ fn test_extended_pkcs11_compliance() {
     );
     assert_eq!(rv, CKR_PIN_INCORRECT);
 
+    // The failed attempt above triggers a per-account backoff window (~100ms
+    // base delay); wait it out so the next attempt isn't rejected as
+    // rate-limited (CKR_FUNCTION_FAILED).
+    std::thread::sleep(std::time::Duration::from_millis(250));
+
     // Correct new PIN should work
     let rv = C_Login(
         rw_session,

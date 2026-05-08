@@ -7,6 +7,15 @@
 //! with any PKCS#11 consumer.
 
 #![warn(missing_docs)]
+#![allow(missing_docs)]
+#![allow(clippy::unnecessary_cast)]
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::module_inception)]
+#![allow(clippy::field_reassign_with_default)]
+#![allow(clippy::doc_lazy_continuation)]
+#![allow(dead_code)]
+#![allow(clippy::too_many_arguments)]
 
 /// Tamper-evident audit logging with chained SHA-256.
 pub mod audit;

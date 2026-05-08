@@ -296,10 +296,19 @@ fn test_multipart_encrypt_decrypt() {
     let session = setup_session();
     let aes_key = generate_aes_key(session);
 
-    let iv: [u8; 16] = [
-        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
-        0x10,
-    ];
+    // Each encryption with this AES key must use a unique IV — the backend's
+    // IV-reuse detector rejects (key, IV) pairs it has seen before. `iv_n`
+    // builds a distinct 16-byte IV from a counter so every encrypt call below
+    // can avoid colliding with earlier ones.
+    let iv_n = |n: u8| -> [u8; 16] {
+        let mut v = [0u8; 16];
+        v[0] = n;
+        v[15] = 0x10;
+        v
+    };
+    // Initial IV used for the first multi-part encrypt and for decrypt-only
+    // operations (decrypt does not feed the reuse tracker).
+    let iv = iv_n(1);
     let plaintext = b"The quick brown fox jumps over the lazy dog. This is test data for multi-part encryption.";
     let chunk1 = &plaintext[..20];
     let chunk2 = &plaintext[20..50];
@@ -323,11 +332,12 @@ fn test_multipart_encrypt_decrypt() {
     // 2. AES-CBC-PAD: single-shot encrypt → multi-part decrypt
     // ========================================================================
     println!("Test 2: AES-CBC-PAD single-shot encrypt → multi-part decrypt");
-    let ciphertext = single_shot_encrypt(session, CKM_AES_CBC_PAD, aes_key, &iv, plaintext);
+    let iv2 = iv_n(2);
+    let ciphertext = single_shot_encrypt(session, CKM_AES_CBC_PAD, aes_key, &iv2, plaintext);
     let ct_chunk1 = &ciphertext[..16];
     let ct_chunk2 = &ciphertext[16..];
     let ct_chunks: Vec<&[u8]> = vec![ct_chunk1, ct_chunk2];
-    let decrypted = multi_part_decrypt(session, CKM_AES_CBC_PAD, aes_key, &iv, &ct_chunks);
+    let decrypted = multi_part_decrypt(session, CKM_AES_CBC_PAD, aes_key, &iv2, &ct_chunks);
     assert_eq!(
         decrypted.as_slice(),
         plaintext.as_slice(),
@@ -338,24 +348,40 @@ fn test_multipart_encrypt_decrypt() {
     // 3. AES-CBC-PAD: cross-validation (multi-part == single-shot)
     // ========================================================================
     println!("Test 3: AES-CBC-PAD cross-validation");
-    let ct_single = single_shot_encrypt(session, CKM_AES_CBC_PAD, aes_key, &iv, plaintext);
-    let ct_multi = multi_part_encrypt(session, CKM_AES_CBC_PAD, aes_key, &iv, &chunks);
+    // Cannot directly compare ciphertexts: the backend rejects (key, IV)
+    // reuse, so we must use distinct IVs for the two encryptions. Instead,
+    // verify both ciphertexts decrypt back to the same plaintext, which is
+    // the semantically meaningful equivalence between single-shot and
+    // multi-part encryption.
+    let iv3a = iv_n(3);
+    let iv3b = iv_n(4);
+    let ct_single = single_shot_encrypt(session, CKM_AES_CBC_PAD, aes_key, &iv3a, plaintext);
+    let ct_multi = multi_part_encrypt(session, CKM_AES_CBC_PAD, aes_key, &iv3b, &chunks);
+    let pt_single = single_shot_decrypt(session, CKM_AES_CBC_PAD, aes_key, &iv3a, &ct_single);
+    let pt_multi = single_shot_decrypt(session, CKM_AES_CBC_PAD, aes_key, &iv3b, &ct_multi);
     assert_eq!(
-        ct_single, ct_multi,
-        "CBC-PAD: single-shot and multi-part ciphertexts should be identical"
+        pt_single.as_slice(),
+        plaintext.as_slice(),
+        "CBC-PAD: single-shot ciphertext should decrypt to plaintext"
+    );
+    assert_eq!(
+        pt_multi.as_slice(),
+        plaintext.as_slice(),
+        "CBC-PAD: multi-part ciphertext should decrypt to plaintext"
     );
 
     // ========================================================================
     // 4. AES-CTR: multi-part encrypt → single-shot decrypt
     // ========================================================================
     println!("Test 4: AES-CTR multi-part encrypt → single-shot decrypt");
-    let ciphertext = multi_part_encrypt(session, CKM_AES_CTR, aes_key, &iv, &chunks);
+    let iv4 = iv_n(5);
+    let ciphertext = multi_part_encrypt(session, CKM_AES_CTR, aes_key, &iv4, &chunks);
     assert_eq!(
         ciphertext.len(),
         plaintext.len(),
         "CTR ciphertext should be same length"
     );
-    let decrypted = single_shot_decrypt(session, CKM_AES_CTR, aes_key, &iv, &ciphertext);
+    let decrypted = single_shot_decrypt(session, CKM_AES_CTR, aes_key, &iv4, &ciphertext);
     assert_eq!(
         decrypted.as_slice(),
         plaintext.as_slice(),
@@ -366,9 +392,10 @@ fn test_multipart_encrypt_decrypt() {
     // 5. AES-CTR: single-shot encrypt → multi-part decrypt
     // ========================================================================
     println!("Test 5: AES-CTR single-shot encrypt → multi-part decrypt");
-    let ciphertext = single_shot_encrypt(session, CKM_AES_CTR, aes_key, &iv, plaintext);
+    let iv5 = iv_n(6);
+    let ciphertext = single_shot_encrypt(session, CKM_AES_CTR, aes_key, &iv5, plaintext);
     let ct_chunks: Vec<&[u8]> = vec![&ciphertext[..30], &ciphertext[30..]];
-    let decrypted = multi_part_decrypt(session, CKM_AES_CTR, aes_key, &iv, &ct_chunks);
+    let decrypted = multi_part_decrypt(session, CKM_AES_CTR, aes_key, &iv5, &ct_chunks);
     assert_eq!(
         decrypted.as_slice(),
         plaintext.as_slice(),
@@ -379,11 +406,23 @@ fn test_multipart_encrypt_decrypt() {
     // 6. AES-CTR: cross-validation
     // ========================================================================
     println!("Test 6: AES-CTR cross-validation");
-    let ct_single = single_shot_encrypt(session, CKM_AES_CTR, aes_key, &iv, plaintext);
-    let ct_multi = multi_part_encrypt(session, CKM_AES_CTR, aes_key, &iv, &chunks);
+    // Same constraint as Test 3: distinct IVs required, so verify
+    // decrypt-equivalence rather than ciphertext-equality.
+    let iv6a = iv_n(7);
+    let iv6b = iv_n(8);
+    let ct_single = single_shot_encrypt(session, CKM_AES_CTR, aes_key, &iv6a, plaintext);
+    let ct_multi = multi_part_encrypt(session, CKM_AES_CTR, aes_key, &iv6b, &chunks);
+    let pt_single = single_shot_decrypt(session, CKM_AES_CTR, aes_key, &iv6a, &ct_single);
+    let pt_multi = single_shot_decrypt(session, CKM_AES_CTR, aes_key, &iv6b, &ct_multi);
     assert_eq!(
-        ct_single, ct_multi,
-        "CTR: single-shot and multi-part should be identical"
+        pt_single.as_slice(),
+        plaintext.as_slice(),
+        "CTR: single-shot ciphertext should decrypt to plaintext"
+    );
+    assert_eq!(
+        pt_multi.as_slice(),
+        plaintext.as_slice(),
+        "CTR: multi-part ciphertext should decrypt to plaintext"
     );
 
     // ========================================================================
@@ -447,14 +486,15 @@ fn test_multipart_encrypt_decrypt() {
     println!("Test 9: AES-CBC-PAD exact block-size data");
     let block_data = [0xABu8; 48]; // 3 * 16 = exact block alignment
     let bd_chunks: Vec<&[u8]> = vec![&block_data[..16], &block_data[16..32], &block_data[32..]];
-    let ct = multi_part_encrypt(session, CKM_AES_CBC_PAD, aes_key, &iv, &bd_chunks);
+    let iv9 = iv_n(9);
+    let ct = multi_part_encrypt(session, CKM_AES_CBC_PAD, aes_key, &iv9, &bd_chunks);
     // CBC-PAD adds a full padding block when input is block-aligned → 64 bytes
     assert_eq!(
         ct.len(),
         64,
         "CBC-PAD of 48 bytes should produce 64 bytes (extra padding block)"
     );
-    let dec = single_shot_decrypt(session, CKM_AES_CBC_PAD, aes_key, &iv, &ct);
+    let dec = single_shot_decrypt(session, CKM_AES_CBC_PAD, aes_key, &iv9, &ct);
     assert_eq!(dec.as_slice(), block_data.as_slice());
 
     // ========================================================================
@@ -462,14 +502,15 @@ fn test_multipart_encrypt_decrypt() {
     // ========================================================================
     println!("Test 10: AES-CBC-PAD empty data");
     let empty_chunks: Vec<&[u8]> = vec![b""];
-    let ct = multi_part_encrypt(session, CKM_AES_CBC_PAD, aes_key, &iv, &empty_chunks);
+    let iv10 = iv_n(10);
+    let ct = multi_part_encrypt(session, CKM_AES_CBC_PAD, aes_key, &iv10, &empty_chunks);
     // CBC-PAD of empty data → one block of padding (16 bytes)
     assert_eq!(
         ct.len(),
         16,
         "CBC-PAD of empty data should produce 16 bytes"
     );
-    let dec = single_shot_decrypt(session, CKM_AES_CBC_PAD, aes_key, &iv, &ct);
+    let dec = single_shot_decrypt(session, CKM_AES_CBC_PAD, aes_key, &iv10, &ct);
     assert!(dec.is_empty(), "Decrypted empty data should be empty");
 
     // ========================================================================
@@ -478,21 +519,23 @@ fn test_multipart_encrypt_decrypt() {
     println!("Test 11: AES-CBC-PAD large data (64KB in 4KB chunks)");
     let large_data: Vec<u8> = (0..65536u32).map(|i| (i % 256) as u8).collect();
     let large_chunks: Vec<&[u8]> = large_data.chunks(4096).collect();
-    let ct = multi_part_encrypt(session, CKM_AES_CBC_PAD, aes_key, &iv, &large_chunks);
-    let dec = single_shot_decrypt(session, CKM_AES_CBC_PAD, aes_key, &iv, &ct);
+    let iv11 = iv_n(11);
+    let ct = multi_part_encrypt(session, CKM_AES_CBC_PAD, aes_key, &iv11, &large_chunks);
+    let dec = single_shot_decrypt(session, CKM_AES_CBC_PAD, aes_key, &iv11, &ct);
     assert_eq!(dec, large_data, "Large data CBC-PAD roundtrip failed");
 
     // ========================================================================
     // 12. Large data with AES-CTR
     // ========================================================================
     println!("Test 12: AES-CTR large data (64KB in 4KB chunks)");
-    let ct = multi_part_encrypt(session, CKM_AES_CTR, aes_key, &iv, &large_chunks);
+    let iv12 = iv_n(12);
+    let ct = multi_part_encrypt(session, CKM_AES_CTR, aes_key, &iv12, &large_chunks);
     assert_eq!(
         ct.len(),
         large_data.len(),
         "CTR ciphertext length should match"
     );
-    let dec = single_shot_decrypt(session, CKM_AES_CTR, aes_key, &iv, &ct);
+    let dec = single_shot_decrypt(session, CKM_AES_CTR, aes_key, &iv12, &ct);
     assert_eq!(dec, large_data, "Large data CTR roundtrip failed");
 
     // ========================================================================
@@ -528,9 +571,10 @@ fn test_multipart_encrypt_decrypt() {
     println!("Test 15: AES-CBC-PAD non-aligned data (17 bytes)");
     let odd_data = [0x42u8; 17];
     let odd_chunks: Vec<&[u8]> = vec![&odd_data[..5], &odd_data[5..12], &odd_data[12..]];
-    let ct = multi_part_encrypt(session, CKM_AES_CBC_PAD, aes_key, &iv, &odd_chunks);
+    let iv15 = iv_n(13);
+    let ct = multi_part_encrypt(session, CKM_AES_CBC_PAD, aes_key, &iv15, &odd_chunks);
     assert_eq!(ct.len(), 32, "CBC-PAD of 17 bytes should be 32 bytes");
-    let dec = single_shot_decrypt(session, CKM_AES_CBC_PAD, aes_key, &iv, &ct);
+    let dec = single_shot_decrypt(session, CKM_AES_CBC_PAD, aes_key, &iv15, &ct);
     assert_eq!(dec.as_slice(), odd_data.as_slice());
 
     // Cleanup

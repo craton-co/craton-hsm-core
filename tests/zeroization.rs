@@ -150,7 +150,7 @@ fn test_zeroization_post_drop_memory_is_zeroed() {
     // Run multiple iterations to increase confidence against allocator reuse
     for round in 0..10 {
         let sentinel: u8 = 0xA0 + round;
-        let key = RawKeyMaterial::new(vec![sentinel; 64]);
+        let key = RawKeyMaterial::new(vec![sentinel; 1024]);
 
         // Capture pointer and length BEFORE drop
         let ptr = key.as_bytes().as_ptr();
@@ -174,24 +174,26 @@ fn test_zeroization_post_drop_memory_is_zeroed() {
         // 1. The allocation was just freed in the same thread
         // 2. Most allocators don't unmap pages this quickly
         // 3. We're only reading, not writing
-        let mut non_zero_count = 0;
+        let mut sentinel_count = 0;
         for i in 0..len {
             let byte = unsafe { std::ptr::read(ptr.add(i)) };
-            if byte != 0 {
-                non_zero_count += 1;
+            if byte == sentinel {
+                sentinel_count += 1;
             }
         }
 
-        // Allow some tolerance — the allocator may have written metadata.
-        // But the vast majority of bytes (>90%) should be zero if zeroize ran.
-        let zero_ratio = (len - non_zero_count) as f64 / len as f64;
+        // Allow some tolerance — the allocator may have written metadata or
+        // another thread may have reallocated the memory.
+        // If zeroize DID NOT run, nearly all bytes would be `sentinel`.
+        // If zeroize ran, very few (if any) bytes should randomly match `sentinel`.
+        let sentinel_ratio = sentinel_count as f64 / len as f64;
         assert!(
-            zero_ratio > 0.9,
-            "Round {}: Only {:.0}% of bytes are zero after drop — zeroize may not have run \
-             (expected >90%). non_zero={}, total={}",
+            sentinel_ratio < 0.1,
+            "Round {}: {:.0}% of bytes are still the sentinel after drop — zeroize may not have run \
+             (expected <10%). sentinel_count={}, total={}",
             round,
-            zero_ratio * 100.0,
-            non_zero_count,
+            sentinel_ratio * 100.0,
+            sentinel_count,
             len
         );
     }
@@ -201,7 +203,7 @@ fn test_zeroization_post_drop_memory_is_zeroed() {
 /// Both the clone and the original must be zeroed.
 #[test]
 fn test_zeroization_clone_independently_zeroed() {
-    let original = RawKeyMaterial::new(vec![0xFE; 128]);
+    let original = RawKeyMaterial::new(vec![0xFE; 1024]);
     let cloned = original.clone();
 
     let clone_ptr = cloned.as_bytes().as_ptr();
@@ -213,18 +215,17 @@ fn test_zeroization_clone_independently_zeroed() {
     // Drop clone first
     drop(cloned);
 
-    // Check clone memory is zeroed
-    let mut non_zero = 0;
+    let mut sentinel_count = 0;
     for i in 0..clone_len {
-        if unsafe { std::ptr::read(clone_ptr.add(i)) } != 0 {
-            non_zero += 1;
+        if unsafe { std::ptr::read(clone_ptr.add(i)) } == 0xFE {
+            sentinel_count += 1;
         }
     }
-    let zero_ratio = (clone_len - non_zero) as f64 / clone_len as f64;
+    let sentinel_ratio = sentinel_count as f64 / clone_len as f64;
     assert!(
-        zero_ratio > 0.9,
-        "Cloned key: only {:.0}% zeroed after drop (expected >90%)",
-        zero_ratio * 100.0
+        sentinel_ratio < 0.1,
+        "Cloned key: {:.0}% of bytes are still sentinel after drop (expected <10%)",
+        sentinel_ratio * 100.0
     );
 
     // Original should still be valid

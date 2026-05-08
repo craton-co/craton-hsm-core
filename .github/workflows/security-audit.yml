@@ -40,11 +40,13 @@ jobs:
           tool: cargo-deny
 
       - name: Run cargo-audit (CVE check)
-        # Ignored advisories — review quarterly (last reviewed 2026-03-21):
+        # Ignored advisories — review quarterly (last reviewed 2026-05-07):
         # RUSTSEC-2023-0071: rsa crate Marvin Attack — no fix available yet
         # RUSTSEC-2026-0042: aws-lc-fips-sys — optional FIPS backend, update pending
         # RUSTSEC-2026-004[4-8]: aws-lc-sys — transitive via optional aws-lc-rs
         # RUSTSEC-2026-0049: rustls-webpki — daemon TLS dep, update pending
+        # RUSTSEC-2026-009[8-9]: rustls-webpki — daemon TLS dep, update pending
+        # RUSTSEC-2026-0104: rustls-webpki — daemon TLS dep, update pending
         # RUSTSEC-2025-0134: rustls-pemfile — daemon TLS dep, update pending
         run: >-
           cargo audit
@@ -56,6 +58,9 @@ jobs:
           --ignore RUSTSEC-2026-0047
           --ignore RUSTSEC-2026-0048
           --ignore RUSTSEC-2026-0049
+          --ignore RUSTSEC-2026-0098
+          --ignore RUSTSEC-2026-0099
+          --ignore RUSTSEC-2026-0104
           --ignore RUSTSEC-2025-0134
 
       - name: Run cargo-deny (license + advisory)

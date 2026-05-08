@@ -1301,6 +1301,13 @@ pub extern "C" fn C_SetAttributeValue(
                 // read-only once the object exists.
                 CKA_LABEL => obj.label = value.clone(),
                 CKA_ID => obj.id = value.clone(),
+                // Hybrid signature mechanisms (e.g. CKM_HYBRID_ML_DSA_ECDSA)
+                // attach the ECDSA component to a PQC key object via
+                // CKA_EC_POINT. The hybrid sign/verify paths look this up in
+                // `extra_attributes`, so allow it to be set on ML-DSA keys.
+                CKA_EC_POINT if obj.key_type == Some(CKK_ML_DSA) => {
+                    obj.extra_attributes.insert(CKA_EC_POINT, value.clone());
+                }
                 // Reject all other attributes as read-only
                 _ => {
                     return CKR_ATTRIBUTE_READ_ONLY;
@@ -1487,7 +1494,7 @@ pub extern "C" fn C_EncryptInit(
                 return CKR_KEY_FUNCTION_NOT_PERMITTED;
             }
             // SP 800-57 lifecycle check
-            if let Err(_) = obj_read.check_lifecycle("encrypt") {
+            if obj_read.check_lifecycle("encrypt").is_err() {
                 return CKR_KEY_FUNCTION_NOT_PERMITTED;
             }
         }
@@ -1784,7 +1791,7 @@ pub extern "C" fn C_DecryptInit(
                 return CKR_KEY_FUNCTION_NOT_PERMITTED;
             }
             // SP 800-57 lifecycle check
-            if let Err(_) = obj_read.check_lifecycle("decrypt") {
+            if obj_read.check_lifecycle("decrypt").is_err() {
                 return CKR_KEY_FUNCTION_NOT_PERMITTED;
             }
         }
@@ -2031,7 +2038,7 @@ pub extern "C" fn C_SignInit(
                 return CKR_KEY_FUNCTION_NOT_PERMITTED;
             }
             // SP 800-57 lifecycle check
-            if let Err(_) = obj_read.check_lifecycle("sign") {
+            if obj_read.check_lifecycle("sign").is_err() {
                 return CKR_KEY_FUNCTION_NOT_PERMITTED;
             }
         }
@@ -2439,7 +2446,7 @@ pub extern "C" fn C_VerifyInit(
                 return CKR_KEY_FUNCTION_NOT_PERMITTED;
             }
             // SP 800-57 lifecycle check
-            if let Err(_) = obj_read.check_lifecycle("verify") {
+            if obj_read.check_lifecycle("verify").is_err() {
                 return CKR_KEY_FUNCTION_NOT_PERMITTED;
             }
         }
@@ -2846,12 +2853,14 @@ fn generate_rsa_keypair(
         .map_err(err_to_rv)?;
 
     // FIPS 140-3 §9.6: Pairwise consistency test
-    if let Err(_) = pairwise_test::rsa_pairwise_test(
+    if pairwise_test::rsa_pairwise_test(
         hsm.crypto_backend.as_ref(),
         &private_key_der,
         &modulus,
         &pub_exp,
-    ) {
+    )
+    .is_err()
+    {
         tracing::error!("RSA pairwise consistency test failed — entering error state");
         POST_FAILED.store(true, Ordering::Release);
         return Err(CKR_GENERAL_ERROR);
@@ -2889,12 +2898,10 @@ fn generate_rsa_keypair(
         return Err(rv);
     }
 
-    hsm.object_store
-        .insert_object(pub_obj)
-        .map_err(|e| err_to_rv(e))?;
+    hsm.object_store.insert_object(pub_obj).map_err(err_to_rv)?;
     hsm.object_store
         .insert_object(priv_obj)
-        .map_err(|e| err_to_rv(e))?;
+        .map_err(err_to_rv)?;
     Ok((pub_handle, priv_handle, modulus_bits))
 }
 
@@ -2975,12 +2982,10 @@ fn generate_ec_keypair(
         return Err(rv);
     }
 
-    hsm.object_store
-        .insert_object(pub_obj)
-        .map_err(|e| err_to_rv(e))?;
+    hsm.object_store.insert_object(pub_obj).map_err(err_to_rv)?;
     hsm.object_store
         .insert_object(priv_obj)
-        .map_err(|e| err_to_rv(e))?;
+        .map_err(err_to_rv)?;
     Ok((pub_handle, priv_handle, key_bits))
 }
 
@@ -2996,8 +3001,8 @@ fn generate_ed25519_keypair(
         .map_err(err_to_rv)?;
 
     // FIPS 140-3 §9.6: Pairwise consistency test
-    if let Err(_) =
-        pairwise_test::ed25519_pairwise_test(hsm.crypto_backend.as_ref(), &private_key, &public_key)
+    if pairwise_test::ed25519_pairwise_test(hsm.crypto_backend.as_ref(), &private_key, &public_key)
+        .is_err()
     {
         tracing::error!("Ed25519 pairwise consistency test failed — entering error state");
         POST_FAILED.store(true, Ordering::Release);
@@ -3032,12 +3037,10 @@ fn generate_ed25519_keypair(
         return Err(rv);
     }
 
-    hsm.object_store
-        .insert_object(pub_obj)
-        .map_err(|e| err_to_rv(e))?;
+    hsm.object_store.insert_object(pub_obj).map_err(err_to_rv)?;
     hsm.object_store
         .insert_object(priv_obj)
-        .map_err(|e| err_to_rv(e))?;
+        .map_err(err_to_rv)?;
     Ok((pub_handle, priv_handle, 256))
 }
 
@@ -3158,12 +3161,10 @@ fn generate_pqc_keypair(
         return Err(rv);
     }
 
-    hsm.object_store
-        .insert_object(pub_obj)
-        .map_err(|e| err_to_rv(e))?;
+    hsm.object_store.insert_object(pub_obj).map_err(err_to_rv)?;
     hsm.object_store
         .insert_object(priv_obj)
-        .map_err(|e| err_to_rv(e))?;
+        .map_err(err_to_rv)?;
     Ok((pub_handle, priv_handle, key_bits))
 }
 
@@ -3839,7 +3840,7 @@ fn estimated_signature_len(mechanism: CK_MECHANISM_TYPE, obj: &StoredObject) -> 
     {
         // RSA: signature length = modulus size in bytes
         if let Some(bits) = obj.modulus_bits {
-            return Some((bits as usize + 7) / 8);
+            return Some((bits as usize).div_ceil(8));
         }
         if let Some(ref m) = obj.modulus {
             return Some(m.len());
@@ -3856,8 +3857,13 @@ fn estimated_signature_len(mechanism: CK_MECHANISM_TYPE, obj: &StoredObject) -> 
     } else if sign::is_eddsa_mechanism(mechanism) {
         Some(64) // Ed25519
     } else if pqc::is_ml_dsa_mechanism(mechanism) {
-        // ML-DSA signatures vary by variant; use generous upper bound
-        Some(4672) // ML-DSA-87 max
+        // ML-DSA signature size is determined by the variant (FIPS 204).
+        Some(match mechanism {
+            CKM_ML_DSA_44 => 2420,
+            CKM_ML_DSA_65 => 3309,
+            CKM_ML_DSA_87 => 4627,
+            _ => 4672, // conservative fallback for unknown ML-DSA variant
+        })
     } else if pqc::is_slh_dsa_mechanism(mechanism) {
         Some(49_856) // SLH-DSA-SHA2-256f max
     } else if pqc::is_hybrid_mechanism(mechanism) {

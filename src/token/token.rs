@@ -118,6 +118,12 @@ pub struct Token {
     lockout_store: Option<LockoutStore>,
 }
 
+impl Default for Token {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Token {
     pub fn new() -> Self {
         Self::new_with_config(None)
@@ -601,7 +607,10 @@ impl Token {
                 // timing side-channels that leak lockout state.
                 let hash_guard = self.user_pin_hash.read();
                 let stored = hash_guard.as_ref().ok_or(HsmError::UserPinNotInitialized)?;
-                let pin_correct = self.verify_pin(stored, pin);
+                let stored_bytes: &[u8] = stored.as_ref();
+                eprintln!("DEBUG: login: stored hash length: {}, pin length: {}, hash (first 8 bytes): {:?}", stored_bytes.len(), pin.len(), &stored_bytes[..8.min(stored_bytes.len())]);
+                let pin_correct = self.verify_pin(stored_bytes, pin);
+                eprintln!("DEBUG: login: pin_correct = {}", pin_correct);
                 drop(hash_guard);
 
                 // Check lockout AFTER verification to keep timing constant

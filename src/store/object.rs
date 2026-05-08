@@ -16,19 +16,14 @@ use crate::store::key_material::RawKeyMaterial;
 /// - **Deactivated**: Past `end_date` — can verify/decrypt but cannot sign/encrypt.
 /// - **Compromised**: Manually marked — blocked from all operations.
 /// - **Destroyed**: Pending physical deletion — handle is invalid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum KeyLifecycleState {
     PreActivation,
+    #[default]
     Active,
     Deactivated,
     Compromised,
     Destroyed,
-}
-
-impl Default for KeyLifecycleState {
-    fn default() -> Self {
-        KeyLifecycleState::Active
-    }
 }
 
 impl fmt::Display for KeyLifecycleState {
@@ -464,7 +459,7 @@ fn ck_date_to_epoch(date: &[u8; 8]) -> Option<u64> {
     let month: u64 = s[4..6].parse().ok()?;
     let day: u64 = s[6..8].parse().ok()?;
 
-    if year < 1970 || year > 2200 || month < 1 || month > 12 || day < 1 || day > 31 {
+    if !(1970..=2200).contains(&year) || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
 
