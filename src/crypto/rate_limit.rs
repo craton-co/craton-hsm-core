@@ -20,7 +20,7 @@ use crate::error::HsmError;
 /// Rate-limiting configuration, deserializable from TOML.
 ///
 /// All limits default to `0` (unlimited / disabled).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct RateLimitConfig {
     /// Max operations per session per second. 0 = unlimited.
     #[serde(default)]
@@ -31,16 +31,6 @@ pub struct RateLimitConfig {
     /// Max concurrent operations across all sessions. 0 = unlimited.
     #[serde(default)]
     pub max_concurrent_ops: u64,
-}
-
-impl Default for RateLimitConfig {
-    fn default() -> Self {
-        Self {
-            max_ops_per_session_per_sec: 0,
-            max_global_ops_per_sec: 0,
-            max_concurrent_ops: 0,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

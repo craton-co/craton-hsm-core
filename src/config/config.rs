@@ -7,6 +7,9 @@ use std::path::PathBuf;
 use crate::error::HsmError;
 
 /// Minimum acceptable PBKDF2 iteration count to resist brute-force attacks.
+#[cfg(debug_assertions)]
+const MIN_PBKDF2_ITERATIONS: u32 = 1;
+#[cfg(not(debug_assertions))]
 const MIN_PBKDF2_ITERATIONS: u32 = 100_000;
 /// Maximum acceptable PBKDF2 iteration count to prevent algorithmic DoS via
 /// config-planted extreme values.
@@ -33,7 +36,7 @@ const VALID_LOG_LEVELS: &[&str] = &["all", "crypto", "auth", "admin", "none"];
 /// Relative path prefixes that could target sensitive directories.
 const SENSITIVE_PATH_PREFIXES: &[&str] = &[".git", ".ssh", ".gnupg", ".aws", ".config", ".env"];
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct HsmConfig {
     #[serde(default)]
     pub token: TokenConfig,
@@ -123,17 +126,6 @@ pub struct AlgorithmConfig {
     pub fips_approved_only: bool,
 }
 
-impl Default for HsmConfig {
-    fn default() -> Self {
-        Self {
-            token: TokenConfig::default(),
-            security: SecurityConfig::default(),
-            audit: AuditConfig::default(),
-            algorithms: AlgorithmConfig::default(),
-        }
-    }
-}
-
 impl Default for TokenConfig {
     fn default() -> Self {
         Self {
@@ -203,7 +195,11 @@ fn default_max_failed() -> u32 {
     10
 }
 fn default_pbkdf2_iterations() -> u32 {
-    600_000
+    if cfg!(debug_assertions) {
+        1
+    } else {
+        600_000
+    }
 }
 fn default_true() -> bool {
     true

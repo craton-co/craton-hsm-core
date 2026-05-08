@@ -18,6 +18,12 @@ pub struct SlotManager {
     tokens: HashMap<CK_SLOT_ID, Arc<Token>>,
 }
 
+impl Default for SlotManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SlotManager {
     pub fn new() -> Self {
         let mut tokens = HashMap::new();

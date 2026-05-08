@@ -118,6 +118,12 @@ pub struct Token {
     lockout_store: Option<LockoutStore>,
 }
 
+impl Default for Token {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Token {
     pub fn new() -> Self {
         Self::new_with_config(None)

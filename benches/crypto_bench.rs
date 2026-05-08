@@ -344,10 +344,13 @@ fn get_backends() -> Vec<(&'static str, Arc<dyn CryptoBackend>)> {
         backends.push(("RustCrypto", Arc::new(RustCryptoBackend)));
     }
 
+    // To bench AwsLc (Enterprise), clone the enterprise repo and uncomment the dependency in Cargo.toml
+    /*
     {
         use craton_hsm_awslc::AwsLcBackend;
         backends.push(("AwsLc", Arc::new(AwsLcBackend)));
     }
+    */
 
     backends
 }

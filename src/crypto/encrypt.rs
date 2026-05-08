@@ -32,7 +32,7 @@ const AES_CBC_CTR_MAX_PLAINTEXT: usize = 256 * 1024 * 1024; // 256 MiB
 /// on a heavily-used key. The hash also avoids storing raw key material in
 /// the map.
 static GCM_ENCRYPT_COUNTERS: std::sync::LazyLock<dashmap::DashMap<[u8; 32], AtomicU64>> =
-    std::sync::LazyLock::new(|| dashmap::DashMap::new());
+    std::sync::LazyLock::new(dashmap::DashMap::new);
 
 /// Per-key random nonce prefixes for AES-GCM.
 /// Each key gets a 4-byte random prefix generated once via DRBG. This prefix
@@ -40,7 +40,7 @@ static GCM_ENCRYPT_COUNTERS: std::sync::LazyLock<dashmap::DashMap<[u8; 32], Atom
 /// the monotonic counter. This guarantees nonce uniqueness within a single
 /// HSM lifetime (counter) and across restarts (random prefix).
 static GCM_NONCE_PREFIXES: std::sync::LazyLock<dashmap::DashMap<[u8; 32], [u8; 4]>> =
-    std::sync::LazyLock::new(|| dashmap::DashMap::new());
+    std::sync::LazyLock::new(dashmap::DashMap::new);
 
 /// Maximum number of AES-GCM encryptions permitted per key.
 /// With deterministic counter-based nonces, the limit is the counter space
@@ -135,7 +135,7 @@ fn gcm_nonce_prefix(key: &[u8]) -> HsmResult<[u8; 4]> {
 /// common plaintext prefixes. For CTR, IV reuse is catastrophic (two-time pad).
 static CBC_CTR_IV_TRACKER: std::sync::LazyLock<
     dashmap::DashMap<[u8; 32], Mutex<HashSet<[u8; 16]>>>,
-> = std::sync::LazyLock::new(|| dashmap::DashMap::new());
+> = std::sync::LazyLock::new(dashmap::DashMap::new);
 
 /// Maximum number of tracked IVs per key before eviction.
 /// Prevents unbounded memory growth for long-running sessions.

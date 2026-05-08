@@ -21,8 +21,16 @@ fn ensure_init() {
     );
 }
 
+fn cleanup_session(session: CK_SESSION_HANDLE) {
+    let _ = C_Logout(session);
+    let _ = C_CloseSession(session);
+}
+
 fn setup_user_session() -> CK_SESSION_HANDLE {
     ensure_init();
+    // Close any existing sessions to ensure clean state
+    let _ = C_CloseAllSessions(0);
+
     let so_pin = b"sopin123";
     let mut label = [b' '; 32];
     label[..8].copy_from_slice(b"AttrTest");
@@ -183,6 +191,7 @@ fn test_get_label_attribute() {
     assert_eq!(rv, CKR_OK, "GetAttributeValue(LABEL) failed: 0x{:08X}", rv);
     let actual_len = template[0].value_len as usize;
     assert_eq!(&buf[..actual_len], label.as_slice());
+    cleanup_session(session);
 }
 
 #[test]
@@ -201,6 +210,7 @@ fn test_get_id_attribute() {
     assert_eq!(rv, CKR_OK);
     let actual_len = template[0].value_len as usize;
     assert_eq!(&buf[..actual_len], id.as_slice());
+    cleanup_session(session);
 }
 
 #[test]
@@ -216,6 +226,7 @@ fn test_get_class_attribute() {
     let rv = C_GetAttributeValue(session, key, template.as_mut_ptr(), 1);
     assert_eq!(rv, CKR_OK);
     assert_eq!(class_val, CKO_SECRET_KEY);
+    cleanup_session(session);
 }
 
 #[test]
@@ -231,6 +242,7 @@ fn test_get_key_type_attribute() {
     let rv = C_GetAttributeValue(session, key, template.as_mut_ptr(), 1);
     assert_eq!(rv, CKR_OK);
     assert_eq!(kt, CKK_AES);
+    cleanup_session(session);
 }
 
 #[test]
@@ -246,6 +258,7 @@ fn test_get_encrypt_permission_attribute() {
     let rv = C_GetAttributeValue(session, key, template.as_mut_ptr(), 1);
     assert_eq!(rv, CKR_OK);
     assert_eq!(enc_val, CK_TRUE, "Key should have CKA_ENCRYPT=true");
+    cleanup_session(session);
 }
 
 #[test]
@@ -261,6 +274,7 @@ fn test_get_decrypt_permission_attribute() {
     let rv = C_GetAttributeValue(session, key, template.as_mut_ptr(), 1);
     assert_eq!(rv, CKR_OK);
     assert_eq!(dec_val, CK_TRUE);
+    cleanup_session(session);
 }
 
 #[test]
@@ -276,6 +290,7 @@ fn test_get_sensitive_attribute() {
     let rv = C_GetAttributeValue(session, key, template.as_mut_ptr(), 1);
     assert_eq!(rv, CKR_OK);
     // Default AES keys are not sensitive unless explicitly set
+    cleanup_session(session);
 }
 
 #[test]
@@ -296,6 +311,7 @@ fn test_get_extractable_attribute() {
         extr == CK_TRUE || extr == CK_FALSE,
         "Extractable should be a valid boolean"
     );
+    cleanup_session(session);
 }
 
 #[test]
@@ -312,6 +328,7 @@ fn test_get_attribute_null_value_returns_size() {
     assert_eq!(rv, CKR_OK, "Null-value query should return OK");
     let value_len = template[0].value_len;
     assert_eq!(value_len, 10, "Label 'size_query' is 10 bytes");
+    cleanup_session(session);
 }
 
 #[test]
@@ -325,6 +342,7 @@ fn test_get_attribute_invalid_handle() {
     }];
     let rv = C_GetAttributeValue(session, 0xFFFFFFFF, template.as_mut_ptr(), 1);
     assert_ne!(rv, CKR_OK, "Invalid handle should fail");
+    cleanup_session(session);
 }
 
 #[test]
@@ -357,6 +375,7 @@ fn test_get_multiple_attributes_at_once() {
     assert_eq!(class_val, CKO_SECRET_KEY);
     assert_eq!(kt, CKK_AES);
     assert_eq!(val_len, 32);
+    cleanup_session(session);
 }
 
 // ============================================================================
@@ -390,6 +409,7 @@ fn test_set_label_attribute() {
         &buf[..read_template[0].value_len as usize],
         new_label.as_slice()
     );
+    cleanup_session(session);
 }
 
 #[test]
@@ -418,6 +438,7 @@ fn test_set_id_attribute() {
         &buf[..read_template[0].value_len as usize],
         new_id.as_slice()
     );
+    cleanup_session(session);
 }
 
 #[test]
@@ -431,6 +452,7 @@ fn test_set_attribute_invalid_handle() {
     }];
     let rv = C_SetAttributeValue(session, 0xFFFFFFFF, template.as_mut_ptr(), 1);
     assert_ne!(rv, CKR_OK, "Set on invalid handle should fail");
+    cleanup_session(session);
 }
 
 // ============================================================================
@@ -459,6 +481,7 @@ fn test_find_objects_by_label() {
 
     let rv = C_FindObjectsFinal(session);
     assert_eq!(rv, CKR_OK);
+    cleanup_session(session);
 }
 
 #[test]
@@ -482,6 +505,7 @@ fn test_find_objects_by_class() {
     assert!(count >= 1, "Should find at least 1 secret key");
 
     C_FindObjectsFinal(session);
+    cleanup_session(session);
 }
 
 #[test]
@@ -505,6 +529,7 @@ fn test_find_objects_by_id() {
     assert!(count >= 1, "Should find object by CKA_ID");
 
     C_FindObjectsFinal(session);
+    cleanup_session(session);
 }
 
 #[test]
@@ -527,6 +552,7 @@ fn test_find_objects_no_match() {
     assert_eq!(count, 0, "Should find 0 objects for nonexistent label");
 
     C_FindObjectsFinal(session);
+    cleanup_session(session);
 }
 
 #[test]
@@ -545,6 +571,7 @@ fn test_find_objects_empty_template() {
     assert!(count >= 1, "Empty template should match at least 1 object");
 
     C_FindObjectsFinal(session);
+    cleanup_session(session);
 }
 
 #[test]
@@ -577,6 +604,7 @@ fn test_find_objects_after_set_label() {
     assert!(count >= 1, "Should find object by new label");
 
     C_FindObjectsFinal(session);
+    cleanup_session(session);
 }
 
 #[test]
@@ -591,6 +619,7 @@ fn test_find_objects_final_without_init() {
         "FindObjectsFinal without init: 0x{:08X}",
         rv
     );
+    cleanup_session(session);
 }
 
 #[test]
@@ -620,6 +649,7 @@ fn test_find_objects_multiple_with_same_label() {
     );
 
     C_FindObjectsFinal(session);
+    cleanup_session(session);
 }
 
 // ============================================================================
@@ -673,6 +703,7 @@ fn test_get_value_of_sensitive_key() {
     }];
     let rv = C_GetAttributeValue(session, key, read_template.as_mut_ptr(), 1);
     assert_ne!(rv, CKR_OK, "Reading CKA_VALUE of sensitive key should fail");
+    cleanup_session(session);
 }
 
 #[test]
@@ -688,6 +719,7 @@ fn test_get_value_len_attribute() {
     let rv = C_GetAttributeValue(session, key, template.as_mut_ptr(), 1);
     assert_eq!(rv, CKR_OK);
     assert_eq!(val_len, 32, "AES-256 key should have VALUE_LEN=32");
+    cleanup_session(session);
 }
 
 #[test]
@@ -726,4 +758,5 @@ fn test_find_and_get_combined_workflow() {
         &read_id[..read_template[0].value_len as usize],
         id.as_slice()
     );
+    cleanup_session(session);
 }

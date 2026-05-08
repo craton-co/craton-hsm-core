@@ -66,6 +66,10 @@ pub enum AuditOperation {
     InitToken {
         slot_id: u64,
     },
+    InitPIN {
+        slot_id: u64,
+    },
+    SetPIN,
     /// `fips_approved`: FIPS 140-3 IG 2.4.C algorithm indicator.
     /// `true` = approved algorithm, `false` = non-approved.
     GenerateKey {
@@ -350,6 +354,7 @@ impl AuditLog {
 
                 /// Process a single Record command. Returns the updated
                 /// (last_hash, last_timestamp) on success.
+                #[allow(clippy::too_many_arguments)]
                 fn process_record(
                     state: &Arc<RwLock<AuditLogState>>,
                     log_path: &Option<PathBuf>,
@@ -1054,6 +1059,8 @@ fn format_operation_name(op: &AuditOperation) -> &'static str {
         AuditOperation::Login { .. } => "Login",
         AuditOperation::Logout => "Logout",
         AuditOperation::InitToken { .. } => "InitToken",
+        AuditOperation::InitPIN { .. } => "InitPIN",
+        AuditOperation::SetPIN => "SetPIN",
         AuditOperation::GenerateKey { .. } => "GenerateKey",
         AuditOperation::GenerateKeyPair { .. } => "GenerateKeyPair",
         AuditOperation::Sign { .. } => "Sign",

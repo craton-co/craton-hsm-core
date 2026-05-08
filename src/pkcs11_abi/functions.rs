@@ -1487,7 +1487,7 @@ pub extern "C" fn C_EncryptInit(
                 return CKR_KEY_FUNCTION_NOT_PERMITTED;
             }
             // SP 800-57 lifecycle check
-            if let Err(_) = obj_read.check_lifecycle("encrypt") {
+            if obj_read.check_lifecycle("encrypt").is_err() {
                 return CKR_KEY_FUNCTION_NOT_PERMITTED;
             }
         }
@@ -1784,7 +1784,7 @@ pub extern "C" fn C_DecryptInit(
                 return CKR_KEY_FUNCTION_NOT_PERMITTED;
             }
             // SP 800-57 lifecycle check
-            if let Err(_) = obj_read.check_lifecycle("decrypt") {
+            if obj_read.check_lifecycle("decrypt").is_err() {
                 return CKR_KEY_FUNCTION_NOT_PERMITTED;
             }
         }
@@ -2031,7 +2031,7 @@ pub extern "C" fn C_SignInit(
                 return CKR_KEY_FUNCTION_NOT_PERMITTED;
             }
             // SP 800-57 lifecycle check
-            if let Err(_) = obj_read.check_lifecycle("sign") {
+            if obj_read.check_lifecycle("sign").is_err() {
                 return CKR_KEY_FUNCTION_NOT_PERMITTED;
             }
         }
@@ -2439,7 +2439,7 @@ pub extern "C" fn C_VerifyInit(
                 return CKR_KEY_FUNCTION_NOT_PERMITTED;
             }
             // SP 800-57 lifecycle check
-            if let Err(_) = obj_read.check_lifecycle("verify") {
+            if obj_read.check_lifecycle("verify").is_err() {
                 return CKR_KEY_FUNCTION_NOT_PERMITTED;
             }
         }
@@ -2846,12 +2846,14 @@ fn generate_rsa_keypair(
         .map_err(err_to_rv)?;
 
     // FIPS 140-3 §9.6: Pairwise consistency test
-    if let Err(_) = pairwise_test::rsa_pairwise_test(
+    if pairwise_test::rsa_pairwise_test(
         hsm.crypto_backend.as_ref(),
         &private_key_der,
         &modulus,
         &pub_exp,
-    ) {
+    )
+    .is_err()
+    {
         tracing::error!("RSA pairwise consistency test failed — entering error state");
         POST_FAILED.store(true, Ordering::Release);
         return Err(CKR_GENERAL_ERROR);
@@ -2889,12 +2891,10 @@ fn generate_rsa_keypair(
         return Err(rv);
     }
 
-    hsm.object_store
-        .insert_object(pub_obj)
-        .map_err(|e| err_to_rv(e))?;
+    hsm.object_store.insert_object(pub_obj).map_err(err_to_rv)?;
     hsm.object_store
         .insert_object(priv_obj)
-        .map_err(|e| err_to_rv(e))?;
+        .map_err(err_to_rv)?;
     Ok((pub_handle, priv_handle, modulus_bits))
 }
 
@@ -2975,12 +2975,10 @@ fn generate_ec_keypair(
         return Err(rv);
     }
 
-    hsm.object_store
-        .insert_object(pub_obj)
-        .map_err(|e| err_to_rv(e))?;
+    hsm.object_store.insert_object(pub_obj).map_err(err_to_rv)?;
     hsm.object_store
         .insert_object(priv_obj)
-        .map_err(|e| err_to_rv(e))?;
+        .map_err(err_to_rv)?;
     Ok((pub_handle, priv_handle, key_bits))
 }
 
@@ -2996,8 +2994,8 @@ fn generate_ed25519_keypair(
         .map_err(err_to_rv)?;
 
     // FIPS 140-3 §9.6: Pairwise consistency test
-    if let Err(_) =
-        pairwise_test::ed25519_pairwise_test(hsm.crypto_backend.as_ref(), &private_key, &public_key)
+    if pairwise_test::ed25519_pairwise_test(hsm.crypto_backend.as_ref(), &private_key, &public_key)
+        .is_err()
     {
         tracing::error!("Ed25519 pairwise consistency test failed — entering error state");
         POST_FAILED.store(true, Ordering::Release);
@@ -3032,12 +3030,10 @@ fn generate_ed25519_keypair(
         return Err(rv);
     }
 
-    hsm.object_store
-        .insert_object(pub_obj)
-        .map_err(|e| err_to_rv(e))?;
+    hsm.object_store.insert_object(pub_obj).map_err(err_to_rv)?;
     hsm.object_store
         .insert_object(priv_obj)
-        .map_err(|e| err_to_rv(e))?;
+        .map_err(err_to_rv)?;
     Ok((pub_handle, priv_handle, 256))
 }
 
@@ -3158,12 +3154,10 @@ fn generate_pqc_keypair(
         return Err(rv);
     }
 
-    hsm.object_store
-        .insert_object(pub_obj)
-        .map_err(|e| err_to_rv(e))?;
+    hsm.object_store.insert_object(pub_obj).map_err(err_to_rv)?;
     hsm.object_store
         .insert_object(priv_obj)
-        .map_err(|e| err_to_rv(e))?;
+        .map_err(err_to_rv)?;
     Ok((pub_handle, priv_handle, key_bits))
 }
 
@@ -3839,7 +3833,7 @@ fn estimated_signature_len(mechanism: CK_MECHANISM_TYPE, obj: &StoredObject) -> 
     {
         // RSA: signature length = modulus size in bytes
         if let Some(bits) = obj.modulus_bits {
-            return Some((bits as usize + 7) / 8);
+            return Some((bits as usize).div_ceil(8));
         }
         if let Some(ref m) = obj.modulus {
             return Some(m.len());

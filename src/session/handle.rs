@@ -144,12 +144,20 @@ impl SessionHandleAllocator {
             scrambler: HandleScrambler::new(),
         }
     }
+}
 
+impl Default for SessionHandleAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SessionHandleAllocator {
     pub fn next(&self) -> HsmResult<CK_SESSION_HANDLE> {
         loop {
             let current = self.next.load(Ordering::Acquire);
             // Wrap around instead of permanently failing on exhaustion.
-            let next_val = if current >= MAX_HANDLE {
+            let next_val = if current == MAX_HANDLE {
                 0
             } else {
                 current + 1
@@ -194,11 +202,19 @@ impl ObjectHandleAllocator {
             reserved: parking_lot::Mutex::new(HashSet::new()),
         }
     }
+}
 
+impl Default for ObjectHandleAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ObjectHandleAllocator {
     pub fn next(&self) -> HsmResult<CK_OBJECT_HANDLE> {
         loop {
             let current = self.next.load(Ordering::Acquire);
-            let next_val = if current >= MAX_HANDLE {
+            let next_val = if current == MAX_HANDLE {
                 0
             } else {
                 current + 1

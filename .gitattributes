@@ -1,0 +1,5 @@
+*.sh text eol=lf
+*.sh.ci text eol=lf
+Dockerfile* text eol=lf
+LICENSE text eol=lf
+*.md text eol=crlf
