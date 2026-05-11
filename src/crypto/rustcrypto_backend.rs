@@ -49,6 +49,27 @@ impl CryptoBackend for RustCryptoBackend {
         super::sign::rsa_pkcs1v15_verify(modulus, public_exponent, data, signature, hash_alg)
     }
 
+    fn rsa_pkcs1v15_verify_with_handle(
+        &self,
+        slot_id: u64,
+        handle: u64,
+        modulus: &[u8],
+        public_exponent: &[u8],
+        data: &[u8],
+        signature: &[u8],
+        hash_alg: Option<HashAlg>,
+    ) -> HsmResult<bool> {
+        super::sign::rsa_pkcs1v15_verify_cached(
+            slot_id,
+            handle,
+            modulus,
+            public_exponent,
+            data,
+            signature,
+            hash_alg,
+        )
+    }
+
     fn rsa_pss_sign(
         &self,
         private_key_der: &[u8],
@@ -78,6 +99,27 @@ impl CryptoBackend for RustCryptoBackend {
         hash_alg: HashAlg,
     ) -> HsmResult<bool> {
         super::sign::rsa_pss_verify(modulus, public_exponent, data, signature, hash_alg)
+    }
+
+    fn rsa_pss_verify_with_handle(
+        &self,
+        slot_id: u64,
+        handle: u64,
+        modulus: &[u8],
+        public_exponent: &[u8],
+        data: &[u8],
+        signature: &[u8],
+        hash_alg: HashAlg,
+    ) -> HsmResult<bool> {
+        super::sign::rsa_pss_verify_cached(
+            slot_id,
+            handle,
+            modulus,
+            public_exponent,
+            data,
+            signature,
+            hash_alg,
+        )
     }
 
     fn ecdsa_p256_sign(&self, private_key_bytes: &[u8], data: &[u8]) -> HsmResult<Vec<u8>> {
@@ -166,6 +208,27 @@ impl CryptoBackend for RustCryptoBackend {
         )
     }
 
+    fn rsa_pkcs1v15_verify_prehashed_with_handle(
+        &self,
+        slot_id: u64,
+        handle: u64,
+        modulus: &[u8],
+        public_exponent: &[u8],
+        digest: &[u8],
+        signature: &[u8],
+        hash_alg: HashAlg,
+    ) -> HsmResult<bool> {
+        super::sign::rsa_pkcs1v15_verify_prehashed_cached(
+            slot_id,
+            handle,
+            modulus,
+            public_exponent,
+            digest,
+            signature,
+            hash_alg,
+        )
+    }
+
     fn rsa_pss_sign_prehashed(
         &self,
         private_key_der: &[u8],
@@ -201,6 +264,27 @@ impl CryptoBackend for RustCryptoBackend {
         hash_alg: HashAlg,
     ) -> HsmResult<bool> {
         super::sign::rsa_pss_verify_prehashed(modulus, public_exponent, digest, signature, hash_alg)
+    }
+
+    fn rsa_pss_verify_prehashed_with_handle(
+        &self,
+        slot_id: u64,
+        handle: u64,
+        modulus: &[u8],
+        public_exponent: &[u8],
+        digest: &[u8],
+        signature: &[u8],
+        hash_alg: HashAlg,
+    ) -> HsmResult<bool> {
+        super::sign::rsa_pss_verify_prehashed_cached(
+            slot_id,
+            handle,
+            modulus,
+            public_exponent,
+            digest,
+            signature,
+            hash_alg,
+        )
     }
 
     fn ecdsa_p256_sign_prehashed(
@@ -273,6 +357,25 @@ impl CryptoBackend for RustCryptoBackend {
         hash_alg: super::sign::OaepHash,
     ) -> HsmResult<Vec<u8>> {
         super::sign::rsa_oaep_encrypt(modulus, public_exponent, plaintext, hash_alg)
+    }
+
+    fn rsa_oaep_encrypt_with_handle(
+        &self,
+        slot_id: u64,
+        handle: u64,
+        modulus: &[u8],
+        public_exponent: &[u8],
+        plaintext: &[u8],
+        hash_alg: super::sign::OaepHash,
+    ) -> HsmResult<Vec<u8>> {
+        super::sign::rsa_oaep_encrypt_cached(
+            slot_id,
+            handle,
+            modulus,
+            public_exponent,
+            plaintext,
+            hash_alg,
+        )
     }
 
     fn rsa_oaep_decrypt(
