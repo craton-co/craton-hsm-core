@@ -20,6 +20,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     softhsm2 \
     pkg-config \
     libssl-dev \
+    cmake \
+    golang-go \
     curl \
     git \
     ca-certificates \

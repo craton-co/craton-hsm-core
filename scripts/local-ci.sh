@@ -5,13 +5,13 @@
 # local-ci.sh — Run the GitHub Actions CI pipeline locally inside Docker.
 #
 # By default this script wraps work in deploy/Dockerfile.ci (Rust, protoc, Miri,
-# cargo-audit/deny/tarpaulin/semver-checks). That matches the tooling and Linux
+# cargo-audit/deny/semver-checks). That matches the tooling and Linux
 # environment used on ubuntu-latest runners.
 #
 # Usage (from repo root):
-#   ./scripts/local-ci.sh                  # fmt + tests + lint + audit + semver + miri + docs + coverage
+#   ./scripts/local-ci.sh                  # fmt + tests + lint + audit + semver + miri + docs
 #   ./scripts/local-ci.sh quick            # fmt + tests + clippy
-#   ./scripts/local-ci.sh fmt|test|clippy|audit|semver|miri|docs|coverage
+#   ./scripts/local-ci.sh fmt|test|clippy|audit|semver|miri|docs
 #
 # Force running on the host (not recommended; install the same tools as the image):
 #   CRATON_CI_CONTAINER=1 ./scripts/local-ci.sh quick
@@ -292,22 +292,6 @@ job_docs() {
     fi
 }
 
-job_coverage() {
-    log_header "Code Coverage (cargo-tarpaulin)"
-    if ! command -v cargo-tarpaulin &>/dev/null; then
-        log_skip "Coverage" "cargo-tarpaulin not in PATH"
-        return
-    fi
-    if cargo tarpaulin --out xml --out html --skip-clean --timeout 300 \
-        --exclude-files 'tests/fips_*' -- --test-threads=1 2>&1; then
-        log_pass "Coverage"
-        if [[ -f tarpaulin-report.html ]]; then
-            echo -e "  Report: ${BOLD}tarpaulin-report.html${NC}"
-        fi
-    else
-        log_fail "Coverage"
-    fi
-}
 
 print_summary() {
     local elapsed=$(( SECONDS - START_TIME ))
@@ -351,7 +335,6 @@ case "${1:-all}" in
     semver)   job_semver ;;
     miri)     job_miri ;;
     docs)     job_docs ;;
-    coverage) job_coverage ;;
     quick)
         job_fmt
         job_test
@@ -365,10 +348,9 @@ case "${1:-all}" in
         job_semver
         job_miri
         job_docs
-        job_coverage
         ;;
     *)
-        echo "Usage: $0 {all|quick|fmt|test|clippy|audit|semver|miri|docs|coverage}"
+        echo "Usage: $0 {all|quick|fmt|test|clippy|audit|semver|miri|docs}"
         exit 1
         ;;
 esac

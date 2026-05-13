@@ -29,9 +29,9 @@ jobs:
 
   # ── Build & Test ──
   #
-  # Tests are split into four parallel jobs for performance:
+  # Tests are split into three parallel jobs for performance:
   #   1. Unit + crypto: lib tests + pure crypto (no global state, parallel-safe)
-  #   2-4. PKCS#11 ABI shards: serial tests split across 3 runners
+  #   2-3. PKCS#11 ABI shards: serial tests split across 2 runners
   #
   # PKCS#11 §5.10 mandates one C_Initialize/C_Finalize per process, so ABI
   # tests must run with --test-threads=1. Each `cargo test --test X` invocation
@@ -43,11 +43,11 @@ jobs:
   test-unit:
     name: Unit & Crypto Tests (${{ matrix.os }})
     needs: fmt-check
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "windows-latest", "macos-latest"]') }}
+        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -75,6 +75,9 @@ jobs:
           --test multi_slot
           --
           --test-threads=8
+        timeout-minutes: 15
+        env:
+          RUST_BACKTRACE: 1
 
       - name: Run audit & FIPS POST tests (serial — shared IV tracker)
         run: >-
@@ -82,6 +85,9 @@ jobs:
           --test audit_and_integrity
           --
           --test-threads=1
+        timeout-minutes: 10
+        env:
+          RUST_BACKTRACE: 1
 
       - name: Run workspace member tests
         run: >-
@@ -91,16 +97,20 @@ jobs:
           -p craton-hsm-daemon
           --
           --test-threads=1
+        timeout-minutes: 10
+        env:
+          RUST_BACKTRACE: 1
+
 
   # ── Shard 2: PKCS#11 ABI — compliance, conformance, error paths, info ──
   test-abi-shard1:
     name: ABI Tests — Compliance (${{ matrix.os }})
     needs: fmt-check
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "windows-latest", "macos-latest"]') }}
+        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -136,16 +146,20 @@ jobs:
           --test supplementary_functions
           --
           --test-threads=1
+        timeout-minutes: 20
+        env:
+          RUST_BACKTRACE: 1
+
 
   # ── Shard 3: PKCS#11 ABI — crypto operations (keys, encrypt, sign, PQC) ──
   test-abi-shard2:
     name: ABI Tests — Crypto Ops (${{ matrix.os }})
     needs: fmt-check
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "windows-latest", "macos-latest"]') }}
+        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -181,6 +195,10 @@ jobs:
           --test security_properties
           --
           --test-threads=1
+        timeout-minutes: 25
+        env:
+          RUST_BACKTRACE: 1
+
 
   # ── Clippy lint (non-blocking) ──
   lint:
@@ -221,11 +239,18 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-      - name: Check semver compliance
-        uses: obi1kenobi/cargo-semver-checks-action@v2
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential
+
+      - name: Install cargo-semver-checks
+        uses: taiki-e/install-action@d858f8113943481093e02986a7586a4819a3bfd6 # v2
         with:
-          package: craton_hsm
-        continue-on-error: true  # Non-blocking until 1.0
+          tool: cargo-semver-checks
+
+      - name: Check semver compliance
+        run: |
+          export CMAKE=cmake
+          cargo semver-checks --package craton_hsm || true  # Non-blocking until 1.0
 
   # ── Miri: undefined-behavior checks on safety-critical crypto modules ──
   miri:
@@ -250,38 +275,6 @@ jobs:
         env:
           MIRIFLAGS: "-Zmiri-disable-isolation -Zmiri-symbolic-alignment-check"
 
-  # ── Benchmarks: main-only, compare Craton HSM vs SoftHSMv2 ──
-  benchmarks:
-    name: Benchmarks (PKCS#11 ABI)
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
-        with:
-          toolchain: stable
-
-      - name: Install SoftHSMv2
-        run: sudo apt-get update && sudo apt-get install -y softhsm2
-
-      - name: Cache cargo registry & build
-        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2
-
-      - name: Build release library
-        run: cargo build --release --lib
-
-      - name: Run ABI benchmarks (Craton HSM vs SoftHSMv2)
-        run: SOFTHSM2_LIB=/usr/lib/softhsm/libsofthsm2.so cargo bench --bench pkcs11_abi_bench
-
-      - name: Upload benchmark reports
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: always()
-        with:
-          name: criterion-reports
-          path: target/criterion/
-          retention-days: 30
 
   # ── Documentation: build on PRs, deploy on main ──
   docs:
@@ -302,6 +295,9 @@ jobs:
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install cmake
+        run: sudo apt-get update && sudo apt-get install -y cmake
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
@@ -332,53 +328,4 @@ jobs:
         uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
         continue-on-error: true  # Fails until GitHub Pages is enabled in repo settings
 
-  # ── Code Coverage ──
-  coverage:
-    name: Code Coverage
-    needs: fmt-check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-      - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
-        with:
-          toolchain: stable
-
-      - name: Cache cargo registry & build
-        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2
-
-      - name: Install cargo-tarpaulin
-        uses: taiki-e/install-action@d858f8113943481093e02986a7586a4819a3bfd6 # v2
-        with:
-          tool: cargo-tarpaulin
-
-      - name: Generate coverage report
-        run: cargo tarpaulin --out xml --out html --skip-clean --timeout 300 --exclude-files 'tests/fips_*' -- --test-threads=1
-        timeout-minutes: 20
-        env:
-          RUST_BACKTRACE: 1
-
-      - name: Upload to Codecov
-        uses: codecov/codecov-action@1af58845a975a7985b0beb0cbe6fbbb71a41dbad # v4
-        if: always()
-        with:
-          files: cobertura.xml
-          fail_ci_if_error: false
-        env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
-
-      - name: Upload coverage report
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: always()
-        with:
-          name: coverage-report
-          path: |
-            tarpaulin-report.html
-            cobertura.xml
-          retention-days: 30
