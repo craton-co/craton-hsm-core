@@ -3,8 +3,8 @@
 [![CI](https://github.com/craton-co/craton-hsm-core/actions/workflows/ci.yml/badge.svg)](https://github.com/craton-co/craton-hsm-core/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 <!-- Badges below will activate after crates.io publish and Codecov setup -->
-[![Crates.io](https://img.shields.io/crates/v/craton_hsm.svg)](https://crates.io/crates/craton_hsm)
-[![docs.rs](https://docs.rs/craton_hsm/badge.svg)](https://docs.rs/craton_hsm)
+[![Crates.io](https://img.shields.io/crates/v/craton-hsm.svg)](https://crates.io/crates/craton-hsm)
+[![docs.rs](https://docs.rs/craton_hsm/badge.svg)](https://docs.rs/craton-hsm)
 [![codecov](https://codecov.io/gh/craton-co/craton-hsm-core/branch/main/graph/badge.svg)](https://codecov.io/gh/craton-co/craton-hsm-core)
 
 > **Not FIPS 140-3 certified.** This software has not undergone CMVP validation.

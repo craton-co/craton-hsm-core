@@ -11,7 +11,7 @@ name = "craton-hsm-daemon"
 path = "src/main.rs"
 
 [dependencies]
-craton-hsm = { path = ".." }
+craton-hsm = "0.9.1"
 tokio = { version = "1", features = ["full"] }
 tonic = { version = "0.14", features = ["tls-ring"] }
 tonic-prost = "0.14"
