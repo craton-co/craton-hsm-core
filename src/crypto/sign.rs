@@ -1426,74 +1426,55 @@ mod tests {
         (0xC0DE_0000 | n, 0xBEEF_0000 | n)
     }
 
-    fn fresh_rsa_key_der() -> Vec<u8> {
-        // Use the keygen module to obtain a 2048-bit PKCS#8 DER key.
-        let (priv_der, _modulus, _pub_exp) =
-            crate::crypto::keygen::generate_rsa_key_pair(2048, false).unwrap();
-        priv_der.as_bytes().to_vec()
-    }
-
-    #[test]
-    fn rsa_pkcs1v15_sign_cached_populates_handle_cache() {
-        let (slot, handle) = unique_ids();
-        let der = fresh_rsa_key_der();
-        // Pre-condition: cache miss.
-        assert!(get_cached_rsa_private_key(slot, handle).is_none());
-
-        // First call: parses DER, populates cache.
-        let _ = rsa_pkcs1v15_sign_cached(slot, handle, &der, b"hello", Some(HashAlg::Sha256))
-            .expect("first sign");
-
-        // Post-condition: cache hit available.
-        assert!(
-            get_cached_rsa_private_key(slot, handle).is_some(),
-            "cache_rsa_private_key was not invoked by rsa_pkcs1v15_sign_cached"
-        );
-
-        // Second call: should reuse the cached Arc (same pointer).
-        let arc1 = get_cached_rsa_private_key(slot, handle).unwrap();
-        let _ = rsa_pkcs1v15_sign_cached(slot, handle, &der, b"world", Some(HashAlg::Sha256))
-            .expect("second sign");
-        let arc2 = get_cached_rsa_private_key(slot, handle).unwrap();
-        assert!(
-            Arc::ptr_eq(&arc1, &arc2),
-            "second sign should reuse the same Arc<RsaPrivateKey> rather than \
-             reparsing DER"
-        );
-
-        evict_cached_keys(slot, handle);
-    }
-
-    #[test]
-    fn rsa_pss_sign_cached_populates_handle_cache() {
-        let (slot, handle) = unique_ids();
-        let der = fresh_rsa_key_der();
-        assert!(get_cached_rsa_private_key(slot, handle).is_none());
-
-        let _ = rsa_pss_sign_cached(slot, handle, &der, b"data", HashAlg::Sha256).expect("sign");
-        assert!(
-            get_cached_rsa_private_key(slot, handle).is_some(),
-            "rsa_pss_sign_cached should populate the handle cache"
-        );
-
-        evict_cached_keys(slot, handle);
-    }
-
-    #[test]
-    fn rsa_oaep_decrypt_cached_uses_handle_cache() {
-        let (slot, handle) = unique_ids();
+    /// Generate a fresh 2048-bit RSA keypair as (priv_der, modulus, pub_exp).
+    fn fresh_rsa_keypair() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let (priv_der, modulus, pub_exp) =
             crate::crypto::keygen::generate_rsa_key_pair(2048, false).unwrap();
-        // Encrypt something we can decrypt back.
-        let ct = rsa_oaep_encrypt(&modulus, &pub_exp, b"secret", OaepHash::Sha256).unwrap();
+        (priv_der.as_bytes().to_vec(), modulus, pub_exp)
+    }
 
-        assert!(get_cached_rsa_private_key(slot, handle).is_none());
-        let pt = rsa_oaep_decrypt_cached(slot, handle, priv_der.as_bytes(), &ct, OaepHash::Sha256)
-            .expect("decrypt");
-        assert_eq!(pt, b"secret");
+    #[test]
+    fn rsa_pkcs1v15_verify_cached_populates_pub_cache() {
+        let (slot, handle) = unique_ids();
+        let (priv_der, modulus, pub_exp) = fresh_rsa_keypair();
+        let msg = b"verify hot path";
+        let sig = rsa_pkcs1v15_sign(&priv_der, msg, Some(HashAlg::Sha256)).unwrap();
+
+        // Pre-condition: cache miss.
+        assert!(get_cached_rsa_public_key(slot, handle).is_none());
+
+        // First verify: builds RsaPublicKey, populates cache.
+        let ok = rsa_pkcs1v15_verify_cached(
+            slot,
+            handle,
+            &modulus,
+            &pub_exp,
+            msg,
+            &sig,
+            Some(HashAlg::Sha256),
+        )
+        .expect("first verify");
+        assert!(ok, "valid signature must verify");
+
+        // Post-condition: cache hit available.
+        let arc1 = get_cached_rsa_public_key(slot, handle)
+            .expect("rsa_pkcs1v15_verify_cached should populate the public-key handle cache");
+
+        // Second verify: should reuse the cached Arc<RsaPublicKey>.
+        let _ok = rsa_pkcs1v15_verify_cached(
+            slot,
+            handle,
+            &modulus,
+            &pub_exp,
+            msg,
+            &sig,
+            Some(HashAlg::Sha256),
+        )
+        .expect("second verify");
+        let arc2 = get_cached_rsa_public_key(slot, handle).unwrap();
         assert!(
-            get_cached_rsa_private_key(slot, handle).is_some(),
-            "rsa_oaep_decrypt_cached should populate the handle cache"
+            Arc::ptr_eq(&arc1, &arc2),
+            "second verify should reuse the cached Arc<RsaPublicKey>, not rebuild BigUint"
         );
 
         evict_cached_keys(slot, handle);
@@ -1502,7 +1483,7 @@ mod tests {
     #[test]
     fn evict_cached_keys_removes_entries() {
         let (slot, handle) = unique_ids();
-        let der = fresh_rsa_key_der();
+        let (der, _, _) = fresh_rsa_keypair();
         let _ = rsa_pkcs1v15_sign_cached(slot, handle, &der, b"x", Some(HashAlg::Sha256)).unwrap();
         assert!(get_cached_rsa_private_key(slot, handle).is_some());
 
@@ -1510,6 +1491,104 @@ mod tests {
         assert!(
             get_cached_rsa_private_key(slot, handle).is_none(),
             "evict_cached_keys must drop the entry"
+        );
+    }
+
+    #[test]
+    fn rsa_oaep_decrypt_cached_uses_handle_cache() {
+        let (slot, handle) = unique_ids();
+        let (priv_der, modulus, pub_exp) = fresh_rsa_keypair();
+        let ct =
+            rsa_oaep_encrypt_cached(slot, handle, &modulus, &pub_exp, b"test", OaepHash::Sha256)
+                .expect("encrypt");
+
+        // Pre-condition: cache miss for private key
+        assert!(get_cached_rsa_private_key(slot, handle).is_none());
+
+        // Decrypt: should populate private key cache
+        let pt = rsa_oaep_decrypt_cached(slot, handle, &priv_der, &ct, OaepHash::Sha256)
+            .expect("decrypt");
+        assert_eq!(pt, b"test");
+
+        // Post-condition: cache hit for private key
+        let arc1 = get_cached_rsa_private_key(slot, handle)
+            .expect("rsa_oaep_decrypt_cached should populate the private-key handle cache");
+
+        // Second decrypt: should reuse the cached Arc<RsaPrivateKey>
+        let _pt = rsa_oaep_decrypt_cached(slot, handle, &priv_der, &ct, OaepHash::Sha256)
+            .expect("second decrypt");
+        let arc2 = get_cached_rsa_private_key(slot, handle).unwrap();
+        assert!(
+            Arc::ptr_eq(&arc1, &arc2),
+            "second decrypt should reuse the cached Arc<RsaPrivateKey>, not rebuild BigUint"
+        );
+
+        evict_cached_keys(slot, handle);
+    }
+
+    #[test]
+    fn rsa_pss_verify_cached_populates_pub_cache() {
+        let (slot, handle) = unique_ids();
+        let (priv_der, modulus, pub_exp) = fresh_rsa_keypair();
+        let msg = b"pss verify path";
+        let sig = rsa_pss_sign(&priv_der, msg, HashAlg::Sha256).unwrap();
+
+        assert!(get_cached_rsa_public_key(slot, handle).is_none());
+        let ok =
+            rsa_pss_verify_cached(slot, handle, &modulus, &pub_exp, msg, &sig, HashAlg::Sha256)
+                .expect("pss verify");
+        assert!(ok);
+        assert!(
+            get_cached_rsa_public_key(slot, handle).is_some(),
+            "rsa_pss_verify_cached should populate the public-key handle cache"
+        );
+
+        evict_cached_keys(slot, handle);
+    }
+
+    #[test]
+    fn rsa_oaep_encrypt_cached_populates_pub_cache_and_round_trips() {
+        let (slot, handle) = unique_ids();
+        let (priv_der, modulus, pub_exp) = fresh_rsa_keypair();
+
+        assert!(get_cached_rsa_public_key(slot, handle).is_none());
+        let ct =
+            rsa_oaep_encrypt_cached(slot, handle, &modulus, &pub_exp, b"hello", OaepHash::Sha256)
+                .expect("encrypt");
+        assert!(
+            get_cached_rsa_public_key(slot, handle).is_some(),
+            "rsa_oaep_encrypt_cached should populate the public-key handle cache"
+        );
+
+        // Sanity: the ciphertext decrypts back via the legacy decrypt path.
+        let pt = rsa_oaep_decrypt(&priv_der, &ct, OaepHash::Sha256).unwrap();
+        assert_eq!(pt, b"hello");
+
+        evict_cached_keys(slot, handle);
+    }
+
+    #[test]
+    fn evict_cached_keys_clears_public_entry() {
+        let (slot, handle) = unique_ids();
+        let (priv_der, modulus, pub_exp) = fresh_rsa_keypair();
+        let msg = b"x";
+        let sig = rsa_pkcs1v15_sign(&priv_der, msg, Some(HashAlg::Sha256)).unwrap();
+        let _ = rsa_pkcs1v15_verify_cached(
+            slot,
+            handle,
+            &modulus,
+            &pub_exp,
+            msg,
+            &sig,
+            Some(HashAlg::Sha256),
+        )
+        .unwrap();
+        assert!(get_cached_rsa_public_key(slot, handle).is_some());
+
+        evict_cached_keys(slot, handle);
+        assert!(
+            get_cached_rsa_public_key(slot, handle).is_none(),
+            "evict_cached_keys must drop the public-key entry"
         );
     }
 }
