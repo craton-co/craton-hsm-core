@@ -432,6 +432,13 @@ fn test_audit_log_export_ndjson_empty() {
 
 #[test]
 fn test_fips_post_passes() {
+    // Default test builds embed the all-zero placeholder integrity public
+    // key, so the §9.4 software-integrity test would now hard-fail.  Opt
+    // in to the documented dev bypass so this integration test can still
+    // exercise the algorithm KATs.
+    // SAFETY: process-global env var, set once for the rest of the test run.
+    unsafe { std::env::set_var("CRATON_HSM_INTEGRITY_BYPASS", "unsafe-dev-only") };
+
     // Run all FIPS Power-On Self Tests (KATs)
     let result = self_test::run_post();
     assert!(result.is_ok(), "FIPS POST should pass: {:?}", result.err());
