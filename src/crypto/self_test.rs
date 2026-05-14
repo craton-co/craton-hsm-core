@@ -471,6 +471,15 @@ mod tests {
 
     #[test]
     fn test_post_passes() {
+        // Default `cargo test` build embeds the all-zero placeholder integrity
+        // public key (no real CRATON_HSM_INTEGRITY_PUBLIC_KEY was set at build
+        // time).  Opt in to the documented dev bypass so the integrity check
+        // doesn't reject the test binary; this is exactly what the bypass env
+        // var exists for.
+        // SAFETY: env-var mutation is process-global, but this is a one-shot
+        // setup that is safe to leave in place for the remainder of the test
+        // process.
+        unsafe { std::env::set_var("CRATON_HSM_INTEGRITY_BYPASS", "unsafe-dev-only") };
         run_post().expect("POST self-tests should pass");
     }
 }

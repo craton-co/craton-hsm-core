@@ -10,9 +10,13 @@
 //! pipeline and never distributed — an attacker who modifies the binary
 //! cannot forge a valid signature without it.
 //!
-//! In development mode (no `.sig` sidecar file present), the check logs a
-//! warning and passes.  If the file is present but the signature doesn't
-//! verify, the check fails and the module enters error state.
+//! Both the embedded public key and the on-disk `.sig` sidecar are required:
+//! a missing `.sig` file or an all-zero placeholder public key is a hard
+//! error in every build (fips and non-fips).  The only escape hatch is the
+//! runtime env var `CRATON_HSM_INTEGRITY_BYPASS=unsafe-dev-only`, which only
+//! takes effect when the public key is still the all-zero placeholder and
+//! always emits a loud `tracing::warn!` — production builds must set
+//! `CRATON_HSM_INTEGRITY_PUBLIC_KEY` at build time and ship a valid `.sig`.
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
@@ -35,8 +39,10 @@ use std::path::PathBuf;
 /// detection.
 /// Set via the `CRATON_HSM_INTEGRITY_PUBLIC_KEY` env var at build time (64 hex chars).
 /// If unset, defaults to all-zeros — the placeholder is detected at runtime and
-/// signature verification is skipped with a warning (dev mode). Production builds
-/// MUST set this env var; FIPS builds will fail if the key is still all-zeros.
+/// `check_integrity()` refuses to start in every build (both fips and non-fips).
+/// Production builds MUST set this env var. Local dev/test runs can opt in to a
+/// bypass via the runtime env var `CRATON_HSM_INTEGRITY_BYPASS=unsafe-dev-only`,
+/// which only takes effect while the placeholder key is still embedded.
 const INTEGRITY_PUBLIC_KEY: [u8; 32] = {
     // Try to read the key from build-time environment variable.
     // Usage: CRATON_HSM_INTEGRITY_PUBLIC_KEY=<64 hex chars> cargo build --release
@@ -72,16 +78,63 @@ fn is_placeholder_key() -> bool {
     INTEGRITY_PUBLIC_KEY.iter().all(|&b| b == 0)
 }
 
+/// Runtime escape hatch that allows dev/test builds to skip the integrity
+/// check while the public key is still the all-zero placeholder.  Production
+/// builds embed a real public key, so this variable has no effect for them.
+const DEV_BYPASS_ENV: &str = "CRATON_HSM_INTEGRITY_BYPASS";
+const DEV_BYPASS_VALUE: &str = "unsafe-dev-only";
+
+/// Returns true if the runtime dev-bypass env var is set to its sentinel value.
+fn dev_bypass_requested() -> bool {
+    std::env::var(DEV_BYPASS_ENV)
+        .map(|v| v == DEV_BYPASS_VALUE)
+        .unwrap_or(false)
+}
+
 /// Run the software integrity check (POST §9.4).
 ///
-/// Returns `Ok(())` if:
-/// - The `.sig` sidecar file is missing (development mode, logs warning)
-/// - The `.sig` file is present and the Ed25519 signature verifies
+/// Returns `Ok(())` only if the embedded `INTEGRITY_PUBLIC_KEY` is a real
+/// (non-zero) key and the `.sig` sidecar is present and verifies under
+/// Ed25519.  Both conditions are enforced in every build (fips and non-fips).
 ///
-/// Returns `Err(...)` if:
-/// - The `.sig` file is present but the signature doesn't verify (tampered binary)
-/// - The module binary cannot be read (but `.sig` exists)
+/// Returns `Err(...)` if any of:
+/// - The embedded public key is the all-zeros placeholder
+///   (build with `CRATON_HSM_INTEGRITY_PUBLIC_KEY=<hex>` set)
+/// - The `.sig` sidecar is missing
+/// - The signature is malformed or doesn't verify (tampered binary)
+///
+/// The single escape hatch is the runtime env var
+/// `CRATON_HSM_INTEGRITY_BYPASS=unsafe-dev-only`, which is honored ONLY while
+/// the embedded public key is still the placeholder.  When honored, a loud
+/// `tracing::warn!` is emitted and the check returns `Ok(())` without
+/// inspecting the binary.  This is intended exclusively for `cargo test` and
+/// other local dev workflows.
 pub fn check_integrity() -> Result<(), String> {
+    // Reject the all-zero placeholder public key in every build.  An
+    // unsigned binary cannot be authenticated, so we refuse to start unless
+    // the caller explicitly opts in to the dev bypass.
+    if is_placeholder_key() {
+        if dev_bypass_requested() {
+            tracing::warn!(
+                "Software integrity test: BYPASSED via {}={} — this build is UNSIGNED \
+                 and MUST NOT be used in production. Set CRATON_HSM_INTEGRITY_PUBLIC_KEY \
+                 at build time and ship a .sig sidecar for any non-development use.",
+                DEV_BYPASS_ENV,
+                DEV_BYPASS_VALUE
+            );
+            return Ok(());
+        }
+        return Err(format!(
+            "Software integrity test: INTEGRITY_PUBLIC_KEY is still the all-zeros placeholder. \
+             Set CRATON_HSM_INTEGRITY_PUBLIC_KEY at build time, or (for local dev/test only) \
+             set {}={} at runtime.",
+            DEV_BYPASS_ENV, DEV_BYPASS_VALUE
+        ));
+    }
+
+    // A real public key is embedded.  The dev-bypass env var is intentionally
+    // ignored in this branch — once a build has a real key, the .sig file is
+    // mandatory.
     let module_path = match get_module_path() {
         Some(p) => p,
         None => {
@@ -106,48 +159,16 @@ pub fn check_integrity() -> Result<(), String> {
         );
     }
 
-    // If no .sig sidecar file exists, skip the integrity check.
-    // The .sig file is the opt-in mechanism: deployments that require FIPS
-    // integrity verification generate the .sig file at build/install time.
-    // Without it, the check passes — this covers development, testing, and
-    // deployments that haven't opted in to integrity verification.
-    //
-    // When the `fips` feature is enabled, the signature file MUST be present.
-    // Reject placeholder key in FIPS mode — production builds MUST set
-    // CRATON_HSM_INTEGRITY_PUBLIC_KEY at build time.
-    #[cfg(feature = "fips")]
-    if is_placeholder_key() {
-        return Err(
-            "Software integrity test: INTEGRITY_PUBLIC_KEY is still the all-zeros placeholder. \
-             Set CRATON_HSM_INTEGRITY_PUBLIC_KEY env var at build time for FIPS builds."
-                .to_string(),
-        );
-    }
-
+    // The .sig sidecar is mandatory in every build whenever a real public
+    // key is embedded.  Refuse to start if it's missing — silently passing
+    // would defeat the FIPS 140-3 §9.4 software-integrity test.
     if !sig_path.exists() {
-        #[cfg(feature = "fips")]
-        {
-            return Err(format!(
-                "Software integrity test: no .sig file found at {} — required in FIPS mode",
-                sig_path.display()
-            ));
-        }
-        #[cfg(not(feature = "fips"))]
-        {
-            tracing::info!(
-                "Software integrity test: no .sig file at {} — skipping (opt-in via .sig sidecar)",
-                sig_path.display()
-            );
-            return Ok(());
-        }
-    }
-
-    // In non-FIPS mode, warn if placeholder key is used with a .sig file present
-    if is_placeholder_key() {
-        tracing::warn!(
-            "Software integrity test: INTEGRITY_PUBLIC_KEY is the all-zeros placeholder. \
-             Signature verification will fail. Set CRATON_HSM_INTEGRITY_PUBLIC_KEY at build time."
-        );
+        return Err(format!(
+            "Software integrity test: no .sig file found at {} — required for all builds \
+             when CRATON_HSM_INTEGRITY_PUBLIC_KEY is set. Sign the binary with \
+             tools/sign-integrity.sh.",
+            sig_path.display()
+        ));
     }
 
     // Read the expected signature from the sidecar file (hex-encoded, 128 chars = 64 bytes)
@@ -345,10 +366,69 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn test_integrity_check_no_sig_file_passes() {
-        // When no .sig file exists, check should pass (dev mode)
-        // This test works because the test binary won't have a .sig sidecar
-        assert!(check_integrity().is_ok());
+    fn test_integrity_check_placeholder_key_rejected_by_default() {
+        // Without the dev-bypass env var, an all-zeros placeholder key MUST
+        // cause check_integrity() to fail — this is the security invariant
+        // that the previous "Ok(())" behavior silently violated.
+        //
+        // SAFETY: env-var mutation is process-global; this test does its own
+        // cleanup. We only enter this branch when the embedded key really is
+        // the all-zeros placeholder (i.e. the default `cargo test` build).
+        if !is_placeholder_key() {
+            // Build embedded a real key — the bypass is ignored anyway.
+            return;
+        }
+        // Ensure no bypass leaks in from the environment.
+        let prev = std::env::var(DEV_BYPASS_ENV).ok();
+        // SAFETY: single-threaded test, restored below.
+        unsafe { std::env::remove_var(DEV_BYPASS_ENV) };
+
+        let result = check_integrity();
+
+        // Restore previous value before asserting so a failure doesn't leak state.
+        // SAFETY: single-threaded test.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(DEV_BYPASS_ENV, v),
+                None => std::env::remove_var(DEV_BYPASS_ENV),
+            }
+        }
+
+        assert!(
+            result.is_err(),
+            "placeholder pubkey + no bypass must be a hard error"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_integrity_check_dev_bypass_allows_placeholder() {
+        // With the explicit dev-bypass env var AND a placeholder key, the
+        // check returns Ok(()) (and logs a loud warning).  This is the only
+        // sanctioned way to run `cargo test` against an unsigned build.
+        if !is_placeholder_key() {
+            // Real key embedded; the dev bypass is intentionally ignored.
+            return;
+        }
+        let prev = std::env::var(DEV_BYPASS_ENV).ok();
+        // SAFETY: single-threaded test.
+        unsafe { std::env::set_var(DEV_BYPASS_ENV, DEV_BYPASS_VALUE) };
+
+        let result = check_integrity();
+
+        // SAFETY: single-threaded test, restoring prior value.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(DEV_BYPASS_ENV, v),
+                None => std::env::remove_var(DEV_BYPASS_ENV),
+            }
+        }
+
+        assert!(
+            result.is_ok(),
+            "dev bypass with placeholder pubkey must pass: {:?}",
+            result.err()
+        );
     }
 
     #[test]
