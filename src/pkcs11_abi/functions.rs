@@ -3394,11 +3394,31 @@ pub extern "C" fn C_GenerateRandom(
             Err(e) => return err_to_rv(e),
         };
 
-        use rand::rngs::OsRng;
-        use rand::RngCore;
-
         let data = unsafe { slice::from_raw_parts_mut(p_random_data, random_len as usize) };
-        OsRng.fill_bytes(data);
+
+        // Route through the SP 800-90A HMAC_DRBG so output is gated by the
+        // approved DRBG's continuous health test and prediction-resistance
+        // reseed (FIPS 140-3). The mutex is held only for the generate call.
+        let drbg_result = hsm.drbg().lock().generate(data);
+
+        if let Err(e) = drbg_result {
+            // Zero any partial output before returning so callers never see
+            // unvetted bytes on a DRBG health-check failure.
+            data.fill(0);
+            tracing::error!(
+                "C_GenerateRandom: DRBG generate failed: {:?} — returning CKR_DEVICE_ERROR",
+                e
+            );
+            let _ = hsm.audit_log.record(
+                session as u64,
+                AuditOperation::GenerateRandom {
+                    length: random_len as u32,
+                },
+                AuditResult::Failure(CKR_DEVICE_ERROR as u64),
+                None,
+            );
+            return CKR_DEVICE_ERROR;
+        }
 
         let _ = hsm.audit_log.record(
             session as u64,
