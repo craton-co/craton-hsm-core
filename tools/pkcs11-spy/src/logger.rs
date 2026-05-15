@@ -169,6 +169,59 @@ where
     }
 }
 
+/// Log a loader-level error (e.g. missing or invalid PKCS11_SPY_TARGET).
+/// Used to replace panics in `loader.rs` so a misconfiguration produces a
+/// log line instead of unwinding across the FFI boundary.
+pub fn log_loader_error(msg: &str) {
+    // Sanitize: strip embedded quotes so a malicious env-var-derived message
+    // cannot break out of the JSON string field.
+    let safe: String = msg
+        .chars()
+        .map(|c| match c {
+            '"' | '\\' => ' ',
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect();
+    with_logger(|logger| {
+        let elapsed = logger.start.elapsed().as_secs_f64();
+        let _ = writeln!(
+            logger.writer,
+            r#"{{"ts":{:.6},"fn":"pkcs11-spy","event":"loader_error","msg":"{}"}}"#,
+            elapsed, safe
+        );
+    });
+}
+
+/// Log that a panic was caught at the FFI boundary. Returns CKR_GENERAL_ERROR
+/// to the host. The panic payload is best-effort: only `&str` and `String`
+/// payloads are surfaced; other types log as `<non-string panic>`.
+pub fn log_panic(func: &str, payload: &(dyn std::any::Any + Send)) {
+    let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic>".to_string()
+    };
+    let safe: String = msg
+        .chars()
+        .map(|c| match c {
+            '"' | '\\' => ' ',
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect();
+    with_logger(|logger| {
+        let elapsed = logger.start.elapsed().as_secs_f64();
+        let _ = writeln!(
+            logger.writer,
+            r#"{{"ts":{:.6},"fn":"{}","event":"panic_caught","msg":"{}"}}"#,
+            elapsed, func, safe
+        );
+    });
+}
+
 /// Log a function call entry.
 pub fn log_call(func: &str, args: &str) {
     with_logger(|logger| {
