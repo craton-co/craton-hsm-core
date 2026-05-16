@@ -53,6 +53,7 @@ use std::sync::Arc;
 use crate::audit::log::{AuditOperation, AuditResult};
 use crate::core::HsmCore;
 use crate::crypto::backend::CryptoBackend;
+use crate::crypto::conditional_test::mechanism_to_family;
 use crate::crypto::{mechanisms, pairwise_test, pqc, sign};
 use crate::error::{HsmError, HsmResult};
 use crate::pkcs11_abi::constants::*;
@@ -194,6 +195,46 @@ fn get_hsm() -> Result<Arc<HsmCore>, CK_RV> {
 }
 
 /// Helper: convert HsmError to CK_RV
+/// Prelude every crypto dispatcher runs before touching key material:
+///
+/// 1. **Rate-limit**: per-session token bucket + global ops/sec cap. Returns
+///    `CKR_FUNCTION_FAILED` if the caller has exceeded their bucket; the
+///    underlying `RateLimitConfig` defaults to unlimited, so a deployment
+///    that has not opted in pays only the lock-free fast path.
+///
+/// 2. **Conditional self-test (FIPS 140-3 IG 9.7)**: on the first use of an
+///    algorithm family the corresponding KAT runs; subsequent calls hit a
+///    cached "passed" entry. If the KAT fails, the module transitions to
+///    error state and every subsequent crypto dispatcher returns
+///    `CKR_DEVICE_ERROR`. `mechanism_to_family` returns `None` for
+///    mechanisms outside the CST taxonomy (e.g. proprietary or unsupported)
+///    -- those are not gated, the dispatcher's own mechanism validation
+///    rejects them with `CKR_MECHANISM_INVALID` further down.
+///
+/// The two checks together close the gap that the original audit flagged:
+/// both helpers were instantiated by `HsmCore::new` but never called from
+/// any C_* entry point.
+fn crypto_op_prelude(
+    hsm: &HsmCore,
+    session: CK_SESSION_HANDLE,
+    mechanism: CK_MECHANISM_TYPE,
+    ec_params: Option<&[u8]>,
+) -> Result<(), CK_RV> {
+    if hsm.rate_limiter.check_rate(session as u64).is_err() {
+        return Err(CKR_FUNCTION_FAILED);
+    }
+    if let Some(family) = mechanism_to_family(mechanism, ec_params) {
+        if hsm
+            .conditional_self_test
+            .ensure_tested(family, &**hsm.crypto_backend())
+            .is_err()
+        {
+            return Err(CKR_DEVICE_ERROR);
+        }
+    }
+    Ok(())
+}
+
 fn err_to_rv(e: HsmError) -> CK_RV {
     e.into()
 }
@@ -1472,6 +1513,9 @@ pub extern "C" fn C_EncryptInit(
         if !mechanisms::is_encrypt_mechanism(mechanism) {
             return CKR_MECHANISM_INVALID;
         }
+        if let Err(rv) = crypto_op_prelude(&hsm, session, mechanism, None) {
+            return rv;
+        }
         // FIPS algorithm policy check
         if let Err(rv) =
             mechanisms::validate_mechanism_for_policy(mechanism, &hsm.algorithm_config, false)
@@ -1777,6 +1821,9 @@ pub extern "C" fn C_DecryptInit(
         if !mechanisms::is_encrypt_mechanism(mechanism) {
             return CKR_MECHANISM_INVALID;
         }
+        if let Err(rv) = crypto_op_prelude(&hsm, session, mechanism, None) {
+            return rv;
+        }
         // FIPS algorithm policy check
         if let Err(rv) =
             mechanisms::validate_mechanism_for_policy(mechanism, &hsm.algorithm_config, false)
@@ -2027,6 +2074,9 @@ pub extern "C" fn C_SignInit(
 
         if !mechanisms::is_sign_mechanism(mechanism) {
             return CKR_MECHANISM_INVALID;
+        }
+        if let Err(rv) = crypto_op_prelude(&hsm, session, mechanism, None) {
+            return rv;
         }
         // FIPS algorithm policy check (signing context)
         if let Err(rv) =
@@ -2453,6 +2503,9 @@ pub extern "C" fn C_VerifyInit(
         if !mechanisms::is_sign_mechanism(mechanism) {
             return CKR_MECHANISM_INVALID;
         }
+        if let Err(rv) = crypto_op_prelude(&hsm, session, mechanism, None) {
+            return rv;
+        }
         // FIPS algorithm policy check (verify is not a signing context)
         if let Err(rv) =
             mechanisms::validate_mechanism_for_policy(mechanism, &hsm.algorithm_config, false)
@@ -2631,6 +2684,9 @@ pub extern "C" fn C_GenerateKey(
         let mechanism = unsafe { (*p_mechanism).mechanism };
         if mechanism != CKM_AES_KEY_GEN {
             return CKR_MECHANISM_INVALID;
+        }
+        if let Err(rv) = crypto_op_prelude(&hsm, session, mechanism, None) {
+            return rv;
         }
         // FIPS algorithm policy check
         if let Err(rv) =
@@ -2814,6 +2870,9 @@ pub extern "C" fn C_GenerateKeyPair(
         let mechanism = unsafe { (*p_mechanism).mechanism };
         if !mechanisms::is_keypair_gen_mechanism(mechanism) {
             return CKR_MECHANISM_INVALID;
+        }
+        if let Err(rv) = crypto_op_prelude(&hsm, session, mechanism, None) {
+            return rv;
         }
         // FIPS algorithm policy check
         if let Err(rv) =
@@ -3399,6 +3458,23 @@ pub extern "C" fn C_GenerateRandom(
 
         let data = unsafe { slice::from_raw_parts_mut(p_random_data, random_len as usize) };
         OsRng.fill_bytes(data);
+        // Conditional self-test gates the DRBG family explicitly here, since
+        // C_GenerateRandom has no `mechanism` argument and so cannot route
+        // through the shared `crypto_op_prelude` mechanism mapping. Rate-limit
+        // is applied for consistency with other crypto dispatchers.
+        if hsm.rate_limiter.check_rate(session as u64).is_err() {
+            return CKR_FUNCTION_FAILED;
+        }
+        if hsm
+            .conditional_self_test
+            .ensure_tested(
+                crate::crypto::conditional_test::AlgorithmFamily::Drbg,
+                &**hsm.crypto_backend(),
+            )
+            .is_err()
+        {
+            return CKR_DEVICE_ERROR;
+        }
 
         let _ = hsm.audit_log.record(
             session as u64,
