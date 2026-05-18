@@ -33,7 +33,7 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 aes-gcm = "0.10"
 aes = "0.8"
-cbc = { version = "0.1", features = ["alloc"] }
+cbc = { version = "0.2", features = ["alloc"] }
 ctr = "0.9"
 cipher = "0.5"
 hmac = "0.12"
