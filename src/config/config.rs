@@ -7,9 +7,9 @@ use std::path::PathBuf;
 use crate::error::HsmError;
 
 /// Minimum acceptable PBKDF2 iteration count to resist brute-force attacks.
-#[cfg(debug_assertions)]
+#[cfg(test)]
 const MIN_PBKDF2_ITERATIONS: u32 = 1;
-#[cfg(not(debug_assertions))]
+#[cfg(not(test))]
 const MIN_PBKDF2_ITERATIONS: u32 = 100_000;
 /// Maximum acceptable PBKDF2 iteration count to prevent algorithmic DoS via
 /// config-planted extreme values.
@@ -195,7 +195,7 @@ fn default_max_failed() -> u32 {
     10
 }
 fn default_pbkdf2_iterations() -> u32 {
-    if cfg!(debug_assertions) {
+    if cfg!(test) {
         1
     } else {
         600_000
