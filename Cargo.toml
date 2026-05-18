@@ -63,7 +63,7 @@ zeroize = { version = "1", features = ["derive"] }
 secrecy = "0.10"
 
 # Storage
-redb = "3"
+redb = "4"
 fs2 = "0.4"
 
 # Concurrency
