@@ -155,7 +155,7 @@ impl Token {
             .unwrap_or(DEFAULT_MAX_FAILED_LOGINS);
         let pbkdf2_iterations = config
             .map(|c| c.security.pbkdf2_iterations)
-            .unwrap_or(if cfg!(debug_assertions) { 1 } else { 600_000 });
+            .unwrap_or(if cfg!(test) { 1 } else { 600_000 });
 
         // Create lockout store and restore persisted lockout state if available.
         let lockout_store = config.map(|c| LockoutStore::new(&c.token.storage_path));
@@ -608,9 +608,7 @@ impl Token {
                 let hash_guard = self.user_pin_hash.read();
                 let stored = hash_guard.as_ref().ok_or(HsmError::UserPinNotInitialized)?;
                 let stored_bytes: &[u8] = stored.as_ref();
-                eprintln!("DEBUG: login: stored hash length: {}, pin length: {}, hash (first 8 bytes): {:?}", stored_bytes.len(), pin.len(), &stored_bytes[..8.min(stored_bytes.len())]);
                 let pin_correct = self.verify_pin(stored_bytes, pin);
-                eprintln!("DEBUG: login: pin_correct = {}", pin_correct);
                 drop(hash_guard);
 
                 // Check lockout AFTER verification to keep timing constant

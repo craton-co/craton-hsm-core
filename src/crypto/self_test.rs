@@ -48,17 +48,16 @@ pub fn run_post() -> HsmResult<()> {
     post_aes_cbc_kat()?;
     post_aes_ctr_kat()?;
 
-    // Asymmetric KATs — RSA keygen and PQC keygen are extremely slow in
-    // unoptimized debug builds (minutes per call). Skip them in debug to
-    // keep tests fast. Release builds run the full suite.
-    if !cfg!(debug_assertions) {
-        post_rsa_pkcs1v15_kat()?;
-        post_ecdsa_p256_kat()?;
+    // Asymmetric KATs — FIPS 140-3 IG §9.4 requires every approved
+    // algorithm's KAT to run on every module initialization, regardless
+    // of build profile. These are slow in unoptimized debug builds but
+    // must NOT be skipped.
+    post_rsa_pkcs1v15_kat()?;
+    post_ecdsa_p256_kat()?;
 
-        // PQC KATs
-        post_ml_dsa_kat()?;
-        post_ml_kem_kat()?;
-    }
+    // PQC KATs
+    post_ml_dsa_kat()?;
+    post_ml_kem_kat()?;
 
     // RNG health + continuous test
     post_rng_health()?;
@@ -471,6 +470,15 @@ mod tests {
 
     #[test]
     fn test_post_passes() {
+        // Default `cargo test` build embeds the all-zero placeholder integrity
+        // public key (no real CRATON_HSM_INTEGRITY_PUBLIC_KEY was set at build
+        // time).  Opt in to the documented dev bypass so the integrity check
+        // doesn't reject the test binary; this is exactly what the bypass env
+        // var exists for.
+        // SAFETY: env-var mutation is process-global, but this is a one-shot
+        // setup that is safe to leave in place for the remainder of the test
+        // process.
+        unsafe { std::env::set_var("CRATON_HSM_INTEGRITY_BYPASS", "unsafe-dev-only") };
         run_post().expect("POST self-tests should pass");
     }
 }
