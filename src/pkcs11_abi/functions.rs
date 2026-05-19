@@ -1301,6 +1301,13 @@ pub extern "C" fn C_SetAttributeValue(
                 // read-only once the object exists.
                 CKA_LABEL => obj.label = value.clone(),
                 CKA_ID => obj.id = value.clone(),
+                // Hybrid signature mechanisms (e.g. CKM_HYBRID_ML_DSA_ECDSA)
+                // attach the ECDSA component to a PQC key object via
+                // CKA_EC_POINT. The hybrid sign/verify paths look this up in
+                // `extra_attributes`, so allow it to be set on ML-DSA keys.
+                CKA_EC_POINT if obj.key_type == Some(CKK_ML_DSA) => {
+                    obj.extra_attributes.insert(CKA_EC_POINT, value.clone());
+                }
                 // Reject all other attributes as read-only
                 _ => {
                     return CKR_ATTRIBUTE_READ_ONLY;
@@ -3850,8 +3857,13 @@ fn estimated_signature_len(mechanism: CK_MECHANISM_TYPE, obj: &StoredObject) -> 
     } else if sign::is_eddsa_mechanism(mechanism) {
         Some(64) // Ed25519
     } else if pqc::is_ml_dsa_mechanism(mechanism) {
-        // ML-DSA signatures vary by variant; use generous upper bound
-        Some(4672) // ML-DSA-87 max
+        // ML-DSA signature size is determined by the variant (FIPS 204).
+        Some(match mechanism {
+            CKM_ML_DSA_44 => 2420,
+            CKM_ML_DSA_65 => 3309,
+            CKM_ML_DSA_87 => 4627,
+            _ => 4672, // conservative fallback for unknown ML-DSA variant
+        })
     } else if pqc::is_slh_dsa_mechanism(mechanism) {
         Some(49_856) // SLH-DSA-SHA2-256f max
     } else if pqc::is_hybrid_mechanism(mechanism) {

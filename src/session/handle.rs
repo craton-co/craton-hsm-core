@@ -58,7 +58,7 @@ impl HandleScrambler {
 
     /// Forward permutation: counter → handle.
     fn scramble(&self, counter: u64) -> u64 {
-        if MAX_HANDLE <= u32::MAX as u64 {
+        if MAX_HANDLE == u32::MAX as u64 {
             self.feistel32_forward(counter as u32) as u64
         } else {
             self.feistel64_forward(counter)
@@ -67,7 +67,7 @@ impl HandleScrambler {
 
     /// Inverse permutation: handle → counter.
     fn unscramble(&self, handle: u64) -> u64 {
-        if MAX_HANDLE <= u32::MAX as u64 {
+        if MAX_HANDLE == u32::MAX as u64 {
             self.feistel32_inverse(handle as u32) as u64
         } else {
             self.feistel64_inverse(handle)
