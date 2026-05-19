@@ -31,22 +31,67 @@ if [[ "${CRATON_CI_CONTAINER:-}" != "1" ]]; then
     echo "==> Building CI image (deploy/Dockerfile.ci)..."
     docker build -t craton_hsm_ci:latest -f deploy/Dockerfile.ci .
 
-    DOCKER_TTY=()
-    if [[ -t 0 && -t 1 ]]; then
-        DOCKER_TTY=(-it)
-    else
-        DOCKER_TTY=(-i)
+    TARGET="${1:-all}"
+    RUN_SHARD3=0
+    if [[ "$TARGET" == "all" || "$TARGET" == "quick" || "$TARGET" == "test" ]]; then
+        RUN_SHARD3=1
     fi
 
-    echo "==> Running CI in container..."
-    exec docker run --rm "${DOCKER_TTY[@]}" \
-        --privileged \
-        -e CRATON_CI_CONTAINER=1 \
-        -v "$REPO_ROOT":/app \
-        -v craton-cargo-registry:/usr/local/cargo/registry \
-        -v craton-cargo-git:/usr/local/cargo/git \
-        -v craton-ci-target:/app/target \
-        craton_hsm_ci:latest "$@"
+    DOCKER_ARGS=(
+        --rm
+        --privileged
+        -e CRATON_CI_CONTAINER=1
+        -v "$REPO_ROOT":/app
+        -v craton-cargo-registry:/usr/local/cargo/registry
+        -v craton-cargo-git:/usr/local/cargo/git
+    )
+
+    if [[ $RUN_SHARD3 -eq 1 ]]; then
+        MAIN_PREFIX=$'\033[36m[MAIN]\033[0m'
+        SHARD3_PREFIX=$'\033[35m[SHARD3]\033[0m'
+
+        echo "==> Starting Container 1 (Main Jobs)..."
+        (
+            set -euo pipefail
+            docker run "${DOCKER_ARGS[@]}" \
+                -v craton-ci-target-main:/app/target \
+                craton_hsm_ci:latest run_main "$TARGET" 2>&1 | sed "s/^/${MAIN_PREFIX} /"
+        ) &
+        PID_MAIN=$!
+
+        echo "==> Starting Container 2 (Test Shard 3)..."
+        (
+            set -euo pipefail
+            docker run "${DOCKER_ARGS[@]}" \
+                -v craton-ci-target-shard3:/app/target \
+                craton_hsm_ci:latest run_shard3 "$TARGET" 2>&1 | sed "s/^/${SHARD3_PREFIX} /"
+        ) &
+        PID_SHARD3=$!
+
+        FAIL=0
+        wait $PID_MAIN || FAIL=1
+        wait $PID_SHARD3 || FAIL=1
+
+        if [[ $FAIL -ne 0 ]]; then
+            echo -e "\n\033[0;31m✗ One or more container jobs failed.\033[0m"
+            exit 1
+        else
+            echo -e "\n\033[0;32m✓ All container jobs passed.\033[0m"
+            exit 0
+        fi
+    else
+        DOCKER_TTY=()
+        if [[ -t 0 && -t 1 ]]; then
+            DOCKER_TTY=(-it)
+        else
+            DOCKER_TTY=(-i)
+        fi
+
+        echo "==> Running CI in container (Main Only)..."
+        exec docker run "${DOCKER_TTY[@]}" "${DOCKER_ARGS[@]}" \
+            -v craton-ci-target-main:/app/target \
+            craton_hsm_ci:latest run_main "$TARGET"
+    fi
 fi
 
 # ── In-container runner (mirrors .github/workflows/ci.yml + security-audit) ─
@@ -102,101 +147,6 @@ job_fmt() {
         log_pass "Format Check"
     else
         log_fail "Format Check"
-    fi
-}
-
-# Mirrors CI shards: separate cargo test invocations avoid PKCS#11 singleton issues.
-job_test() {
-    log_header "Build & Test"
-    local test_ok=true
-
-    echo -e "\n${BOLD}  Shard 1: Unit & crypto tests (parallel-safe)${NC}"
-    if cargo test --lib \
-        --test crypto_vectors \
-        --test drbg_tests \
-        --test concurrent_stress \
-        --test zeroization \
-        --test integrity_tests \
-        --test multi_slot \
-        -- --test-threads=8 2>&1; then
-        echo -e "  ${GREEN}✓${NC} Unit & crypto tests passed"
-    else
-        echo -e "  ${RED}✗${NC} Unit & crypto tests failed"
-        test_ok=false
-    fi
-
-    echo -e "\n${BOLD}  Audit & FIPS POST tests (serial — shared IV tracker)${NC}"
-    if cargo test \
-        --test audit_and_integrity \
-        -- --test-threads=1 2>&1; then
-        echo -e "  ${GREEN}✓${NC} Audit & FIPS POST tests passed"
-    else
-        echo -e "  ${RED}✗${NC} Audit & FIPS POST tests failed"
-        test_ok=false
-    fi
-
-    echo -e "\n${BOLD}  Shard 2: PKCS#11 ABI — compliance${NC}"
-    if cargo test \
-        --test attribute_management \
-        --test attribute_validation \
-        --test digest_abi \
-        --test fips_approved_mode \
-        --test negative_edge_cases \
-        --test operation_state \
-        --test pkcs11_compliance \
-        --test pkcs11_compliance_extended \
-        --test pkcs11_conformance \
-        --test pkcs11_error_paths \
-        --test pkcs11_info_functions \
-        --test random_and_session \
-        --test session_state_machine \
-        --test supplementary_functions \
-        -- --test-threads=1 2>&1; then
-        echo -e "  ${GREEN}✓${NC} PKCS#11 compliance tests passed"
-    else
-        echo -e "  ${RED}✗${NC} PKCS#11 compliance tests failed"
-        test_ok=false
-    fi
-
-    echo -e "\n${BOLD}  Shard 3: PKCS#11 ABI — crypto ops${NC}"
-    if cargo test \
-        --test backup_restore \
-        --test concurrent_session_stress \
-        --test crypto_vectors_phase2 \
-        --test key_derivation_abi \
-        --test key_lifecycle_abi \
-        --test key_wrapping_abi \
-        --test multipart_encrypt_decrypt \
-        --test multipart_sign_verify \
-        --test pairwise_consistency \
-        --test persistence \
-        --test pqc_abi_comprehensive \
-        --test pqc_phase3 \
-        --test rsa_abi_comprehensive \
-        --test security_properties \
-        -- --test-threads=1 2>&1; then
-        echo -e "  ${GREEN}✓${NC} PKCS#11 crypto ops tests passed"
-    else
-        echo -e "  ${RED}✗${NC} PKCS#11 crypto ops tests failed"
-        test_ok=false
-    fi
-
-    echo -e "\n${BOLD}  Workspace member tests${NC}"
-    if cargo test \
-        -p craton-hsm-admin \
-        -p pkcs11-spy \
-        -p craton-hsm-daemon \
-        -- --test-threads=1 2>&1; then
-        echo -e "  ${GREEN}✓${NC} Workspace member tests passed"
-    else
-        echo -e "  ${RED}✗${NC} Workspace member tests failed"
-        test_ok=false
-    fi
-
-    if $test_ok; then
-        log_pass "Build & Test"
-    else
-        log_fail "Build & Test"
     fi
 }
 
@@ -292,15 +242,126 @@ job_docs() {
     fi
 }
 
+# Mirrors CI shards: main tests (everything excluding shard 3)
+job_test_main() {
+    log_header "Build & Test (Main)"
+    local test_ok=true
+
+    echo -e "\n${BOLD}  Shard 1: Unit & crypto tests (parallel-safe)${NC}"
+    if cargo test --lib \
+        --test crypto_vectors \
+        --test drbg_tests \
+        --test concurrent_stress \
+        --test zeroization \
+        --test integrity_tests \
+        --test multi_slot \
+        -- --test-threads=8 2>&1; then
+        echo -e "  ${GREEN}✓${NC} Unit & crypto tests passed"
+    else
+        echo -e "  ${RED}✗${NC} Unit & crypto tests failed"
+        test_ok=false
+    fi
+
+    echo -e "\n${BOLD}  Audit & FIPS POST tests (serial — shared IV tracker)${NC}"
+    if cargo test \
+        --test audit_and_integrity \
+        -- --test-threads=1 2>&1; then
+        echo -e "  ${GREEN}✓${NC} Audit & FIPS POST tests passed"
+    else
+        echo -e "  ${RED}✗${NC} Audit & FIPS POST tests failed"
+        test_ok=false
+    fi
+
+    echo -e "\n${BOLD}  Shard 2: PKCS#11 ABI — compliance${NC}"
+    if cargo test \
+        --test attribute_management \
+        --test attribute_validation \
+        --test digest_abi \
+        --test fips_approved_mode \
+        --test negative_edge_cases \
+        --test operation_state \
+        --test pkcs11_compliance \
+        --test pkcs11_compliance_extended \
+        --test pkcs11_conformance \
+        --test pkcs11_error_paths \
+        --test pkcs11_info_functions \
+        --test random_and_session \
+        --test session_state_machine \
+        --test supplementary_functions \
+        -- --test-threads=1 2>&1; then
+        echo -e "  ${GREEN}✓${NC} PKCS#11 compliance tests passed"
+    else
+        echo -e "  ${RED}✗${NC} PKCS#11 compliance tests failed"
+        test_ok=false
+    fi
+
+    echo -e "\n${BOLD}  Workspace member tests${NC}"
+    if cargo test \
+        -p craton-hsm-admin \
+        -p pkcs11-spy \
+        -p craton-hsm-daemon \
+        -- --test-threads=1 2>&1; then
+        echo -e "  ${GREEN}✓${NC} Workspace member tests passed"
+    else
+        echo -e "  ${RED}✗${NC} Workspace member tests failed"
+        test_ok=false
+    fi
+
+    if $test_ok; then
+        log_pass "Build & Test (Main)"
+    else
+        log_fail "Build & Test (Main)"
+    fi
+}
+
+job_test_shard3() {
+    log_header "Build & Test (Shard 3)"
+    local test_ok=true
+
+    echo -e "\n${BOLD}  Shard 3: PKCS#11 ABI — crypto ops${NC}"
+    if cargo test \
+        --test backup_restore \
+        --test concurrent_session_stress \
+        --test crypto_vectors_phase2 \
+        --test key_derivation_abi \
+        --test key_lifecycle_abi \
+        --test key_wrapping_abi \
+        --test multipart_encrypt_decrypt \
+        --test multipart_sign_verify \
+        --test pairwise_consistency \
+        --test persistence \
+        --test pqc_abi_comprehensive \
+        --test pqc_phase3 \
+        --test rsa_abi_comprehensive \
+        --test security_properties \
+        -- --test-threads=1 2>&1; then
+        echo -e "  ${GREEN}✓${NC} PKCS#11 crypto ops tests passed"
+    else
+        echo -e "  ${RED}✗${NC} PKCS#11 crypto ops tests failed"
+        test_ok=false
+    fi
+
+    if $test_ok; then
+        log_pass "Build & Test (Shard 3)"
+    else
+        log_fail "Build & Test (Shard 3)"
+    fi
+}
 
 print_summary() {
+    local title_suffix="${1:-}"
     local elapsed=$(( SECONDS - START_TIME ))
     local mins=$(( elapsed / 60 ))
     local secs=$(( elapsed % 60 ))
 
+    local header_title="CI Results Summary"
+    if [[ -n "$title_suffix" ]]; then
+        header_title="CI Results Summary ($title_suffix)"
+    fi
+
     echo ""
     echo -e "${BLUE}══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}  CI Results Summary                         ${mins}m ${secs}s${NC}"
+    printf "${BOLD}  %-43s %sm %ss${NC}\n" "$header_title" "$mins" "$secs"
     echo -e "${BLUE}══════════════════════════════════════════════════════════════${NC}"
 
     for i in "${!JOB_NAMES[@]}"; do
@@ -327,33 +388,59 @@ cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 export CARGO_TERM_COLOR=always
 export RUST_BACKTRACE=1
 
-case "${1:-all}" in
-    fmt)      job_fmt ;;
-    test)     job_test ;;
-    clippy)   job_clippy ;;
-    audit)    job_audit ;;
-    semver)   job_semver ;;
-    miri)     job_miri ;;
-    docs)     job_docs ;;
-    quick)
-        job_fmt
-        job_test
-        job_clippy
-        ;;
-    all)
-        job_fmt
-        job_test
-        job_clippy
-        job_audit
-        job_semver
-        job_miri
-        job_docs
-        ;;
-    *)
-        echo "Usage: $0 {all|quick|fmt|test|clippy|audit|semver|miri|docs}"
-        exit 1
-        ;;
-esac
+MODE="${1:-all}"
+TARGET="${2:-all}"
 
-print_summary
-exit "$FAILED"
+execute_main() {
+    case "$1" in
+        fmt)      job_fmt ;;
+        test)     job_test_main ;;
+        clippy)   job_clippy ;;
+        audit)    job_audit ;;
+        semver)   job_semver ;;
+        miri)     job_miri ;;
+        docs)     job_docs ;;
+        quick)
+            job_fmt
+            job_test_main
+            job_clippy
+            ;;
+        all)
+            job_fmt
+            job_test_main
+            job_clippy
+            job_audit
+            job_semver
+            job_miri
+            job_docs
+            ;;
+        *)
+            echo "Usage: $0 {all|quick|fmt|test|clippy|audit|semver|miri|docs}"
+            exit 1
+            ;;
+    esac
+}
+
+execute_shard3() {
+    case "$1" in
+        test|quick|all)
+            job_test_shard3
+            ;;
+    esac
+}
+
+if [[ "$MODE" == "run_main" ]]; then
+    execute_main "$TARGET"
+    print_summary "Main"
+    exit "$FAILED"
+elif [[ "$MODE" == "run_shard3" ]]; then
+    execute_shard3 "$TARGET"
+    print_summary "Shard 3"
+    exit "$FAILED"
+else
+    # Fallback to local host execution (if bypassed docker entirely)
+    execute_main "$MODE"
+    execute_shard3 "$MODE"
+    print_summary "Combined"
+    exit "$FAILED"
+fi
