@@ -539,7 +539,7 @@ dependencies = [
 
 [[package]]
 name = "craton-hsm"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -591,9 +591,9 @@ dependencies = [
 
 [[package]]
 name = "craton-hsm"
-version = "0.9.1"
+version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "225cf46b45f7060f240fb03f40ba826d6b31d9709faaa75fffd8fc6e80012369"
+checksum = "70e1bd6af49fe104c9cf720bb055d4ddec8d02c472f35098da0c7876a3d51782"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -641,11 +641,11 @@ dependencies = [
 
 [[package]]
 name = "craton-hsm-admin"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "clap",
  "comfy-table",
- "craton-hsm 0.9.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "craton-hsm 0.9.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "rpassword",
  "serde_json",
  "zeroize",
@@ -653,10 +653,10 @@ dependencies = [
 
 [[package]]
 name = "craton-hsm-daemon"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-stream",
- "craton-hsm 0.9.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "craton-hsm 0.9.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "prost",
  "rustls",
  "rustls-pemfile",

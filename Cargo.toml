@@ -3,7 +3,7 @@ members = ["tools/craton-hsm-admin", "tools/pkcs11-spy", "craton-hsm-daemon"]
 
 [package]
 name = "craton-hsm"
-version = "0.9.1"
+version = "0.9.2"
 edition = "2021"
 description = "A production-grade PKCS#11 v3.0-compliant Software HSM written in Rust"
 license = "Apache-2.0"
