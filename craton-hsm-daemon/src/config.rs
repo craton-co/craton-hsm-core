@@ -52,6 +52,26 @@ pub struct DaemonConfig {
     /// Per-request timeout in seconds. Default: 30.
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
+    /// TLS handshake timeout in seconds. A peer that completes the TCP
+    /// handshake but stalls the TLS ClientHello must not be allowed to
+    /// hold an accept task indefinitely. Default: 10.
+    #[serde(default = "default_tls_handshake_timeout_secs")]
+    pub tls_handshake_timeout_secs: u64,
+    /// HTTP/2 keepalive ping interval in seconds. Sends a PING frame if
+    /// the connection has been idle for this long. Default: 30.
+    #[serde(default = "default_http2_keepalive_interval_secs")]
+    pub http2_keepalive_interval_secs: u64,
+    /// HTTP/2 keepalive timeout in seconds. Closes the connection if a
+    /// PING is not acknowledged within this window. Default: 20.
+    #[serde(default = "default_http2_keepalive_timeout_secs")]
+    pub http2_keepalive_timeout_secs: u64,
+    /// TCP keepalive interval in seconds. Default: 60.
+    #[serde(default = "default_tcp_keepalive_secs")]
+    pub tcp_keepalive_secs: u64,
+    /// Maximum number of concurrent HTTP/2 streams per connection.
+    /// Caps RAPID-RESET-style stream-flood attacks. Default: 128.
+    #[serde(default = "default_max_concurrent_streams")]
+    pub max_concurrent_streams: u32,
 }
 
 fn default_bind() -> String {
@@ -82,6 +102,26 @@ fn default_request_timeout_secs() -> u64 {
     30
 }
 
+fn default_tls_handshake_timeout_secs() -> u64 {
+    10
+}
+
+fn default_http2_keepalive_interval_secs() -> u64 {
+    30
+}
+
+fn default_http2_keepalive_timeout_secs() -> u64 {
+    20
+}
+
+fn default_tcp_keepalive_secs() -> u64 {
+    60
+}
+
+fn default_max_concurrent_streams() -> u32 {
+    128
+}
+
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
@@ -97,6 +137,11 @@ impl Default for DaemonConfig {
             login_cooldown_secs: default_login_cooldown_secs(),
             max_connections: default_max_connections(),
             request_timeout_secs: default_request_timeout_secs(),
+            tls_handshake_timeout_secs: default_tls_handshake_timeout_secs(),
+            http2_keepalive_interval_secs: default_http2_keepalive_interval_secs(),
+            http2_keepalive_timeout_secs: default_http2_keepalive_timeout_secs(),
+            tcp_keepalive_secs: default_tcp_keepalive_secs(),
+            max_concurrent_streams: default_max_concurrent_streams(),
         }
     }
 }

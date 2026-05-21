@@ -104,13 +104,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (#15) Connection limits and request timeout
     let request_timeout = Duration::from_secs(full_config.daemon.request_timeout_secs);
     let max_connections = full_config.daemon.max_connections as usize;
+    let h2_keepalive_interval =
+        Duration::from_secs(full_config.daemon.http2_keepalive_interval_secs);
+    let h2_keepalive_timeout = Duration::from_secs(full_config.daemon.http2_keepalive_timeout_secs);
+    let tcp_keepalive = Duration::from_secs(full_config.daemon.tcp_keepalive_secs);
+    let max_concurrent_streams = full_config.daemon.max_concurrent_streams;
     let mut server = Server::builder()
         .timeout(request_timeout)
         .concurrency_limit_per_connection(64)
         // (#22) Enforce max_connections — previously configured but never applied.
         // This layer limits the total number of concurrent in-flight requests
         // across all connections, preventing connection exhaustion DoS.
-        .layer(ConcurrencyLimitLayer::new(max_connections));
+        .layer(ConcurrencyLimitLayer::new(max_connections))
+        // Slowloris / HTTP/2 RAPID-RESET defenses: keepalive pings detect
+        // dead peers, TCP keepalive trips OS-level abandoned-socket cleanup,
+        // and the stream cap bounds per-connection RAPID-RESET amplification.
+        .http2_keepalive_interval(Some(h2_keepalive_interval))
+        .http2_keepalive_timeout(Some(h2_keepalive_timeout))
+        .tcp_keepalive(Some(tcp_keepalive))
+        .max_concurrent_streams(Some(max_concurrent_streams));
 
     // Configure TLS — mandatory for production security
     if let (Some(cert), Some(key)) = (&full_config.daemon.tls_cert, &full_config.daemon.tls_key) {
@@ -132,31 +144,72 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("TLS enabled (cert: {}, TLS 1.3 enforced)", cert);
 
         // Bind a TCP listener and wrap accepted connections with TLS using our
-        // validated rustls config (TLS 1.3, mTLS, CRL). The resulting stream
-        // of TLS connections is passed to tonic's serve_with_incoming_shutdown.
+        // validated rustls config (TLS 1.3, mTLS, CRL). Each TLS handshake is
+        // performed inside its own tokio task with a timeout, so a slow / stuck
+        // client cannot block the accept loop for everyone else and cannot tie
+        // up an accept slot indefinitely. Completed TLS streams are funneled
+        // back to the accept stream via an mpsc channel.
         let listener = TcpListener::bind(addr).await?;
+        let handshake_timeout =
+            Duration::from_secs(full_config.daemon.tls_handshake_timeout_secs);
 
-        let incoming = async_stream::stream! {
-            loop {
-                match listener.accept().await {
-                    Ok((tcp, remote_addr)) => {
-                        match tls_acceptor.accept(tcp).await {
-                            Ok(tls_stream) => yield Ok(tls_stream),
-                            Err(e) => {
-                                tracing::debug!(
-                                    remote_addr = %remote_addr,
-                                    error = %e,
-                                    "TLS handshake failed"
-                                );
-                                continue;
-                            }
+        type AcceptItem =
+            Result<tokio_rustls::server::TlsStream<tokio::net::TcpStream>, std::io::Error>;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<AcceptItem>(max_connections);
+
+        // Spawn the accept loop in its own task. It only does cheap work
+        // (accept + spawn) and never awaits a handshake itself.
+        {
+            let tls_acceptor = tls_acceptor.clone();
+            tokio::spawn(async move {
+                loop {
+                    match listener.accept().await {
+                        Ok((tcp, remote_addr)) => {
+                            let tls_acceptor = tls_acceptor.clone();
+                            let tx = tx.clone();
+                            tokio::spawn(async move {
+                                match tokio::time::timeout(
+                                    handshake_timeout,
+                                    tls_acceptor.accept(tcp),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(tls_stream)) => {
+                                        // Send may fail if the server is shutting
+                                        // down; that's fine — the stream is dropped.
+                                        let _ = tx.send(Ok(tls_stream)).await;
+                                    }
+                                    Ok(Err(e)) => {
+                                        tracing::info!(
+                                            remote_addr = %remote_addr,
+                                            error = %e,
+                                            "TLS handshake failed"
+                                        );
+                                    }
+                                    Err(_) => {
+                                        tracing::info!(
+                                            remote_addr = %remote_addr,
+                                            timeout_secs = handshake_timeout.as_secs(),
+                                            "TLS handshake timed out"
+                                        );
+                                    }
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "TCP accept failed");
+                            // Backoff briefly to avoid a tight spin on a
+                            // persistent accept error (e.g. EMFILE).
+                            tokio::time::sleep(Duration::from_millis(100)).await;
                         }
                     }
-                    Err(e) => {
-                        tracing::error!(error = %e, "TCP accept failed");
-                        yield Err(e);
-                    }
                 }
+            });
+        }
+
+        let incoming = async_stream::stream! {
+            while let Some(item) = rx.recv().await {
+                yield item;
             }
         };
         tokio::pin!(incoming);
