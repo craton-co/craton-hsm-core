@@ -624,3 +624,68 @@ fn test_multipart_sign_verify() {
 
     println!("All 20 multi-part sign/verify tests passed!");
 }
+
+// Regression test: C_VerifyFinal must bounds-check caller-supplied
+// signature_len against MAX_SINGLE_BUFFER before constructing a slice from
+// the raw pointer. A pathological length (e.g. 2^60) previously produced
+// a slice aliasing unrelated memory; the fix mirrors C_Verify's existing
+// cap, returning CKR_DATA_LEN_RANGE without invoking the crypto backend.
+#[test]
+fn test_verify_final_rejects_oversize_signature_len() {
+    let session = setup_session();
+    let (rsa_pub, rsa_priv) = generate_rsa_key_pair(session);
+
+    // Drive a valid C_VerifyInit + C_VerifyUpdate so an operation is active
+    // and C_VerifyFinal would otherwise reach the slice::from_raw_parts call.
+    let message = b"bounds-check probe";
+
+    // Sign normally to obtain a small, valid buffer pointer.
+    let sig = single_shot_sign(session, CKM_SHA256_RSA_PKCS, rsa_priv, message);
+
+    // Start a multi-part verify.
+    let mut mechanism = CK_MECHANISM {
+        mechanism: CKM_SHA256_RSA_PKCS,
+        p_parameter: ptr::null_mut(),
+        parameter_len: 0,
+    };
+    let rv = C_VerifyInit(session, &mut mechanism, rsa_pub);
+    assert_eq!(rv, CKR_OK);
+    let rv = C_VerifyUpdate(
+        session,
+        message.as_ptr() as CK_BYTE_PTR,
+        message.len() as CK_ULONG,
+    );
+    assert_eq!(rv, CKR_OK);
+
+    // Call C_VerifyFinal with a *pointer* to a real buffer but a length
+    // larger than MAX_SINGLE_BUFFER (64 MiB = 67_108_864). The buffer
+    // itself is small; without the bounds check the function would build
+    // an out-of-bounds slice aliasing unrelated process memory. With the
+    // fix in place it must return CKR_DATA_LEN_RANGE before any unsafe
+    // slice construction and tear down the operation.
+    //
+    // CK_ULONG is c_ulong (32-bit on Windows, 64-bit on Linux); pick a
+    // value that exceeds the 64 MiB cap on both ABIs.
+    const MAX_SINGLE_BUFFER_BYTES: u64 = 64 * 1024 * 1024;
+    let oversize_len: CK_ULONG = (MAX_SINGLE_BUFFER_BYTES + 1) as CK_ULONG;
+    let rv = C_VerifyFinal(session, sig.as_ptr() as CK_BYTE_PTR, oversize_len);
+    assert_eq!(
+        rv, CKR_DATA_LEN_RANGE,
+        "C_VerifyFinal must reject signature_len > MAX_SINGLE_BUFFER (got 0x{:08X})",
+        rv
+    );
+
+    // Operation must be terminated — a follow-up Final without re-init fails.
+    let rv = C_VerifyFinal(session, sig.as_ptr() as CK_BYTE_PTR, sig.len() as CK_ULONG);
+    assert_eq!(
+        rv, CKR_OPERATION_NOT_INITIALIZED,
+        "operation should be cleared after oversize rejection"
+    );
+
+    // Sanity: a normal verify still works after the failed call.
+    let rv = single_shot_verify(session, CKM_SHA256_RSA_PKCS, rsa_pub, message, &sig);
+    assert_eq!(rv, CKR_OK, "subsequent verify should succeed");
+
+    let _ = C_Logout(session);
+    let _ = C_CloseSession(session);
+}

@@ -5082,6 +5082,16 @@ pub extern "C" fn C_VerifyFinal(
         };
         let mut sess = sess.write();
 
+        // Bounds-check caller-supplied signature_len BEFORE constructing a
+        // slice from the raw pointer. Mirrors the cap enforced by C_Verify;
+        // without it, a pathological signature_len (e.g. 2^60) would alias
+        // unrelated memory in the resulting slice. Terminate the operation
+        // on error, matching C_Verify's behavior.
+        if (signature_len as usize) > MAX_SINGLE_BUFFER {
+            sess.active_operation = None;
+            return CKR_DATA_LEN_RANGE;
+        }
+
         let (mechanism, key_handle, hasher, data, cached_object) = match &mut sess.active_operation
         {
             Some(ActiveOperation::Verify {
