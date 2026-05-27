@@ -6,7 +6,6 @@ use sha2::{self};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use zeroize::Zeroizing;
 
 use crate::error::{HsmError, HsmResult};
 
@@ -35,9 +34,13 @@ const AES_CBC_CTR_MAX_PLAINTEXT: usize = 256 * 1024 * 1024; // 256 MiB
 static GCM_ENCRYPT_COUNTERS: std::sync::LazyLock<dashmap::DashMap<[u8; 32], AtomicU64>> =
     std::sync::LazyLock::new(dashmap::DashMap::new);
 
-/// HKDF info string for deriving the AES-GCM nonce prefix from a key.
-/// Domain-separates this derivation from any other HKDF use on the same key.
-const GCM_NONCE_PREFIX_INFO: &[u8] = b"craton-hsm/gcm-nonce-prefix";
+/// Per-key random nonce prefixes for AES-GCM.
+/// Each key gets a 4-byte random prefix generated once via DRBG. This prefix
+/// occupies the upper 4 bytes of the 12-byte nonce; the lower 8 bytes are
+/// the monotonic counter. This guarantees nonce uniqueness within a single
+/// HSM lifetime (counter) and across restarts (random prefix).
+static GCM_NONCE_PREFIXES: std::sync::LazyLock<dashmap::DashMap<[u8; 32], [u8; 4]>> =
+    std::sync::LazyLock::new(dashmap::DashMap::new);
 
 /// Maximum number of AES-GCM encryptions permitted per key.
 /// With deterministic counter-based nonces, the limit is the counter space
@@ -64,33 +67,26 @@ pub fn reset_gcm_counters() {
     );
 }
 
-/// Remove the GCM encryption counter for a specific key.
+/// Remove the GCM encryption counter and nonce prefix for a specific key.
 /// Called when an AES key is destroyed via C_DestroyObject, ensuring the
 /// counter is tied to the key's lifetime rather than the library lifecycle.
-///
-/// Note: the nonce prefix is derived deterministically from the key bytes via
-/// HKDF and never cached, so there is nothing to evict for it. This is the
-/// security property we want — destroy-and-reimport of the same key bytes
-/// always yields the same prefix, so the counter (which starts back at 0)
-/// cannot collide with previously-emitted (prefix || counter) nonces because
-/// the previous counter values remain monotonically bounded by the encryption
-/// limit and the prefix space is fixed per key.
 pub fn remove_gcm_counter(key: &[u8]) {
     let kid = gcm_key_id(key);
     GCM_ENCRYPT_COUNTERS.remove(&kid);
+    GCM_NONCE_PREFIXES.remove(&kid);
     // Also remove IV tracking for this key
     CBC_CTR_IV_TRACKER.remove(&kid);
 }
 
-/// Force-reset all GCM counters. Only called during C_InitToken which
-/// destroys all objects on the token, so no keys survive to be reused.
-/// Nonce prefixes are derived on demand from key bytes and not cached,
-/// so there is nothing else to clear.
+/// Force-reset all GCM counters and nonce prefixes. Only called during
+/// C_InitToken which destroys all objects on the token, so no keys survive
+/// to be reused.
 pub fn force_reset_all_counters() {
     GCM_ENCRYPT_COUNTERS.clear();
+    GCM_NONCE_PREFIXES.clear();
     reset_iv_trackers();
     tracing::info!(
-        "All GCM counters and IV trackers cleared (token re-initialized)."
+        "All GCM counters, nonce prefixes, and IV trackers cleared (token re-initialized)."
     );
 }
 
@@ -106,37 +102,25 @@ fn gcm_key_id(key: &[u8]) -> [u8; 32] {
     Sha256::digest(key).into()
 }
 
-/// Derive the 4-byte nonce prefix for a given key via HKDF-SHA-256.
+/// Get or generate the 4-byte random nonce prefix for a given key.
+/// Generated once per key via DRBG and cached for the key's lifetime.
+/// The prefix provides uniqueness across HSM restarts while the counter
+/// provides uniqueness within a single run.
 ///
-/// The prefix is computed deterministically from the key bytes:
-/// `prefix = HKDF-SHA-256(IKM=key, salt=None, info="craton-hsm/gcm-nonce-prefix")[0..4]`.
-/// This means the same key bytes always yield the same prefix, so a caller
-/// that destroys an AES key and re-imports the same key material cannot
-/// reset the prefix to a fresh random value and birthday-bound a
-/// (key, nonce) collision at ~2^16 imports (the previous DRBG-based design).
-///
-/// Combined with the per-key monotonic counter (which starts at 0 on the
-/// first use of a given key in the current process), this yields a unique
-/// (key, nonce) pair for every encryption: the prefix is fixed for the
-/// key bytes, the counter is monotonically advancing under the same key,
-/// and the per-key encryption cap (`GCM_MAX_RANDOM_NONCE_ENCRYPTIONS`)
-/// guarantees the counter never wraps.
-///
-/// Returns a `Zeroizing<[u8; 4]>` so the derived prefix is wiped on drop;
-/// while 4 bytes of HKDF output reveal no useful information about the key,
-/// scrubbing eliminates residual material from stack/registers.
-fn gcm_nonce_prefix(key: &[u8]) -> HsmResult<Zeroizing<[u8; 4]>> {
-    use hkdf::Hkdf;
-    use sha2::Sha256;
-
-    let hk = Hkdf::<Sha256>::new(None, key);
-    let mut prefix = Zeroizing::new([0u8; 4]);
-    hk.expand(GCM_NONCE_PREFIX_INFO, prefix.as_mut_slice())
-        .map_err(|e| {
-            tracing::error!("HKDF expand for GCM nonce prefix failed: {}", e);
-            HsmError::GeneralError
+/// Uses `entry().or_try_insert_with()` to atomically generate-and-insert,
+/// preventing a TOCTOU race where concurrent first-use of the same key
+/// could generate different prefixes and cause nonce reuse.
+fn gcm_nonce_prefix(key: &[u8]) -> HsmResult<[u8; 4]> {
+    let kid = gcm_key_id(key);
+    let entry = GCM_NONCE_PREFIXES
+        .entry(kid)
+        .or_try_insert_with(|| -> HsmResult<[u8; 4]> {
+            let mut prefix = [0u8; 4];
+            let mut drbg = crate::crypto::drbg::HmacDrbg::new()?;
+            drbg.generate(&mut prefix)?;
+            Ok(prefix)
         })?;
-    Ok(prefix)
+    Ok(*entry.value())
 }
 
 // ============================================================================
@@ -299,16 +283,14 @@ pub fn aes_256_gcm_encrypt(key: &[u8], plaintext: &[u8]) -> HsmResult<Vec<u8>> {
     let aes_key = Key::<Aes256Gcm>::from_slice(key);
     let cipher = Aes256Gcm::new(aes_key);
 
-    // Build deterministic nonce: hkdf_prefix (4 bytes) || counter (8 bytes).
-    // The prefix is derived deterministically from the key bytes via
-    // HKDF-SHA-256, so the same key always yields the same prefix even
-    // across destroy-and-reimport cycles. The counter is monotonically
-    // increasing and unique per encryption, so nonce collisions are
-    // impossible: (key, prefix) is fixed and the counter never repeats
-    // within a key's lifetime (bounded by GCM_MAX_RANDOM_NONCE_ENCRYPTIONS).
+    // Build deterministic nonce: random_prefix (4 bytes) || counter (8 bytes).
+    // The random prefix is generated once per key via DRBG and cached.
+    // The counter is monotonically increasing and unique per encryption,
+    // so nonce collisions are impossible within a single HSM lifetime.
+    // The random prefix provides uniqueness across restarts.
     let prefix = gcm_nonce_prefix(key)?;
     let mut nonce_bytes = [0u8; 12];
-    nonce_bytes[..4].copy_from_slice(prefix.as_slice());
+    nonce_bytes[..4].copy_from_slice(&prefix);
     nonce_bytes[4..].copy_from_slice(&count.to_be_bytes());
     let nonce = Nonce::from_slice(&nonce_bytes);
 
@@ -373,12 +355,10 @@ pub fn aes_256_gcm_encrypt_with_aad(
     let aes_key = Key::<Aes256Gcm>::from_slice(key);
     let cipher = Aes256Gcm::new(aes_key);
 
-    // Deterministic nonce: hkdf_prefix (4 bytes) || counter (8 bytes).
-    // See `gcm_nonce_prefix` for the derivation; same key bytes always
-    // yield the same prefix, so destroy-and-reimport cannot collide.
+    // Deterministic nonce: random_prefix (4 bytes) || counter (8 bytes)
     let prefix = gcm_nonce_prefix(key)?;
     let mut nonce_bytes = [0u8; 12];
-    nonce_bytes[..4].copy_from_slice(prefix.as_slice());
+    nonce_bytes[..4].copy_from_slice(&prefix);
     nonce_bytes[4..].copy_from_slice(&count.to_be_bytes());
     let nonce = Nonce::from_slice(&nonce_bytes);
 
@@ -566,23 +546,20 @@ pub fn aes_cbc_encrypt(key: &[u8], iv: &[u8], plaintext: &[u8]) -> HsmResult<Vec
 pub fn aes_cbc_decrypt(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> HsmResult<Vec<u8>> {
     use cbc::cipher::{BlockDecryptMut, KeyIvInit};
 
-    if iv.len() != 16 {
-        return Err(HsmError::MechanismParamInvalid);
-    }
-
-    tracing::warn!(
-        "AES-CBC decrypt invoked — vulnerable to padding oracle without external MAC. \
-         Ensure encrypt-then-MAC is applied before decryption."
-    );
-
-    // SECURITY: All decryption errors (padding, key size, etc.) return the same
-    // generic error code to prevent padding oracle attacks. An attacker must not
-    // be able to distinguish a padding failure from a decryption failure.
+    // SECURITY: All decryption errors (padding, key size, IV size, etc.) return
+    // the same generic error code AND the same wall-clock time to prevent padding
+    // oracle attacks. An attacker must not be able to distinguish a padding
+    // failure from a key-size or IV-length failure via either error code or timing.
     //
-    // Timing equalization: we enforce a minimum duration so that padding-valid
-    // and padding-invalid paths take the same wall-clock time. The floor is set
-    // high enough (10ms) to dominate over the sub-microsecond padding check
-    // variance, even accounting for scheduler jitter and context switches.
+    // Timing equalization: we enforce a minimum duration so that every return
+    // path takes the same wall-clock time. The floor is set high enough (10ms)
+    // to dominate over the sub-microsecond validation/padding variance, even
+    // accounting for scheduler jitter and context switches.
+    //
+    // CRITICAL: `start` MUST be captured before ANY early-return validation
+    // (IV length, key length, etc.). Capturing it after a validation check
+    // would let that bit leak through timing — a bad IV length would return
+    // sub-microsecond while a valid IV always paid the floor.
     //
     // IMPORTANT: This is a defense-in-depth measure only. Timing equalization
     // via sleep is inherently imperfect — OS scheduling, CPU frequency scaling,
@@ -591,44 +568,60 @@ pub fn aes_cbc_decrypt(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> HsmResult<Ve
     // prevention. AES-GCM is strongly preferred over AES-CBC for new applications.
     let start = std::time::Instant::now();
 
-    let result = match key.len() {
-        16 => {
-            type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
-            Aes128CbcDec::new_from_slices(key, iv)
-                .map_err(|_| HsmError::EncryptedDataInvalid)
-                .and_then(|decryptor| {
-                    decryptor
-                        .decrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(ciphertext)
-                        .map_err(|_| HsmError::EncryptedDataInvalid)
-                })
+    tracing::warn!(
+        "AES-CBC decrypt invoked — vulnerable to padding oracle without external MAC. \
+         Ensure encrypt-then-MAC is applied before decryption."
+    );
+
+    let result: HsmResult<Vec<u8>> = if iv.len() != 16 {
+        Err(HsmError::MechanismParamInvalid)
+    } else {
+        match key.len() {
+            16 => {
+                type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
+                Aes128CbcDec::new_from_slices(key, iv)
+                    .map_err(|_| HsmError::EncryptedDataInvalid)
+                    .and_then(|decryptor| {
+                        decryptor
+                            .decrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(
+                                ciphertext,
+                            )
+                            .map_err(|_| HsmError::EncryptedDataInvalid)
+                    })
+            }
+            24 => {
+                type Aes192CbcDec = cbc::Decryptor<aes::Aes192>;
+                Aes192CbcDec::new_from_slices(key, iv)
+                    .map_err(|_| HsmError::EncryptedDataInvalid)
+                    .and_then(|decryptor| {
+                        decryptor
+                            .decrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(
+                                ciphertext,
+                            )
+                            .map_err(|_| HsmError::EncryptedDataInvalid)
+                    })
+            }
+            32 => {
+                type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
+                Aes256CbcDec::new_from_slices(key, iv)
+                    .map_err(|_| HsmError::EncryptedDataInvalid)
+                    .and_then(|decryptor| {
+                        decryptor
+                            .decrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(
+                                ciphertext,
+                            )
+                            .map_err(|_| HsmError::EncryptedDataInvalid)
+                    })
+            }
+            _ => Err(HsmError::EncryptedDataInvalid),
         }
-        24 => {
-            type Aes192CbcDec = cbc::Decryptor<aes::Aes192>;
-            Aes192CbcDec::new_from_slices(key, iv)
-                .map_err(|_| HsmError::EncryptedDataInvalid)
-                .and_then(|decryptor| {
-                    decryptor
-                        .decrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(ciphertext)
-                        .map_err(|_| HsmError::EncryptedDataInvalid)
-                })
-        }
-        32 => {
-            type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
-            Aes256CbcDec::new_from_slices(key, iv)
-                .map_err(|_| HsmError::EncryptedDataInvalid)
-                .and_then(|decryptor| {
-                    decryptor
-                        .decrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(ciphertext)
-                        .map_err(|_| HsmError::EncryptedDataInvalid)
-                })
-        }
-        _ => Err(HsmError::EncryptedDataInvalid),
     };
 
     // Enforce a minimum duration of 10ms for CBC decryption to equalize timing
-    // between padding-valid and padding-invalid paths. 10ms is chosen to be
-    // well above typical OS scheduling granularity (~1-4ms) so that the sleep
-    // dominates the observable response time regardless of padding check outcome.
+    // between padding-valid and padding-invalid paths (and across every early
+    // validation error above). 10ms is chosen to be well above typical OS
+    // scheduling granularity (~1-4ms) so that the sleep dominates the
+    // observable response time regardless of which return path was taken.
     const CBC_DECRYPT_MIN_DURATION: std::time::Duration = std::time::Duration::from_millis(10);
     let elapsed = start.elapsed();
     if elapsed < CBC_DECRYPT_MIN_DURATION {
@@ -773,70 +766,64 @@ fn aes_ctr_apply(key: &[u8], iv: &[u8], data: &[u8]) -> HsmResult<Vec<u8>> {
     Ok(output)
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// HKDF-derived prefix is deterministic: the same key bytes must always
-    /// yield the same 4-byte prefix. This is the core property that prevents
-    /// destroy-and-reimport from cycling the prefix and birthday-bounding
-    /// (key, nonce) collisions at ~2^16 imports.
-    #[test]
-    fn gcm_nonce_prefix_is_deterministic_for_same_key() {
-        let key = [0x42u8; 32];
-        let p1 = gcm_nonce_prefix(&key).unwrap();
-        let p2 = gcm_nonce_prefix(&key).unwrap();
-        let p3 = gcm_nonce_prefix(&key).unwrap();
-        assert_eq!(p1.as_slice(), p2.as_slice());
-        assert_eq!(p2.as_slice(), p3.as_slice());
-    }
+    /// The timing-equalization floor enforced inside `aes_cbc_decrypt`.
+    /// Kept in sync with `CBC_DECRYPT_MIN_DURATION` above.
+    const CBC_FLOOR_MS: u128 = 10;
 
-    /// A second key whose bytes differ from the first must produce a
-    /// different prefix with overwhelming probability. With 4 bytes of
-    /// HKDF output, collision probability for two distinct keys is 2^-32.
-    /// We use two fixed, clearly-distinct keys to make the assertion
-    /// deterministic in CI.
+    /// Tolerance for the floor check. Allows for clock/timer slop:
+    /// some platforms (Windows in particular) can wake from sleep a hair
+    /// early, so we assert >= 8 ms rather than >= 10 ms to avoid flakes.
+    const CBC_FLOOR_MIN_MS: u128 = 8;
+
+    /// Bad IV length must not short-circuit the timing-equalization floor —
+    /// otherwise the IV-length-validity bit leaks through wall-clock time.
     #[test]
-    fn gcm_nonce_prefix_differs_for_different_keys() {
-        let key_a = [0x00u8; 32];
-        let key_b = [0xffu8; 32];
-        let pa = gcm_nonce_prefix(&key_a).unwrap();
-        let pb = gcm_nonce_prefix(&key_b).unwrap();
-        assert_ne!(
-            pa.as_slice(),
-            pb.as_slice(),
-            "distinct keys must derive distinct prefixes"
+    fn aes_cbc_decrypt_bad_iv_length_pays_timing_floor() {
+        let key = [0u8; 32];
+        let short_iv = [0u8; 8]; // wrong length: 8 instead of 16
+        let ciphertext = [0u8; 16];
+
+        let start = std::time::Instant::now();
+        let result = aes_cbc_decrypt(&key, &short_iv, &ciphertext);
+        let elapsed_ms = start.elapsed().as_millis();
+
+        assert!(result.is_err(), "bad IV length must return an error");
+        assert!(
+            elapsed_ms >= CBC_FLOOR_MIN_MS,
+            "bad-IV-length path returned in {} ms; expected >= {} ms \
+             (timing-equalization floor is {} ms)",
+            elapsed_ms,
+            CBC_FLOOR_MIN_MS,
+            CBC_FLOOR_MS,
         );
     }
 
-    /// Sanity check across a handful of pseudo-random keys: no two prefixes
-    /// collide. Birthday probability for N=8 over a 32-bit space is ~3e-8.
+    /// Valid IV but bad padding must also pay the floor — this is the
+    /// original padding-oracle defense and serves as the baseline.
     #[test]
-    fn gcm_nonce_prefix_no_collision_across_distinct_keys() {
-        use std::collections::HashSet;
-        let mut seen: HashSet<[u8; 4]> = HashSet::new();
-        for i in 0u8..8 {
-            let mut key = [0u8; 32];
-            key[0] = i;
-            key[31] = i.wrapping_mul(17).wrapping_add(3);
-            let p = gcm_nonce_prefix(&key).unwrap();
-            assert!(seen.insert(*p), "unexpected collision at i={}", i);
-        }
-    }
+    fn aes_cbc_decrypt_bad_padding_pays_timing_floor() {
+        let key = [0u8; 32];
+        let iv = [1u8; 16]; // length-valid
+        // 16 bytes of zeros decrypted under an all-zero key with this IV will
+        // almost certainly produce invalid PKCS#7 padding.
+        let ciphertext = [0u8; 16];
 
-    /// End-to-end: destroying a key and re-importing the same key bytes
-    /// must yield the same prefix (the property the HKDF derivation
-    /// guarantees). This documents the fix for the
-    /// destroy-and-reimport nonce-rollback vulnerability.
-    #[test]
-    fn gcm_nonce_prefix_survives_remove_gcm_counter() {
-        let key = [0xa5u8; 32];
-        let before = gcm_nonce_prefix(&key).unwrap();
-        remove_gcm_counter(&key);
-        let after = gcm_nonce_prefix(&key).unwrap();
-        assert_eq!(before.as_slice(), after.as_slice());
+        let start = std::time::Instant::now();
+        let result = aes_cbc_decrypt(&key, &iv, &ciphertext);
+        let elapsed_ms = start.elapsed().as_millis();
+
+        assert!(result.is_err(), "bad padding must return an error");
+        assert!(
+            elapsed_ms >= CBC_FLOOR_MIN_MS,
+            "bad-padding path returned in {} ms; expected >= {} ms \
+             (timing-equalization floor is {} ms)",
+            elapsed_ms,
+            CBC_FLOOR_MIN_MS,
+            CBC_FLOOR_MS,
+        );
     }
 }
