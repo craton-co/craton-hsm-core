@@ -3560,7 +3560,10 @@ pub extern "C" fn C_GetOperationState(
             }
         }
 
-        let state_blob = match op.serialize_state(&hsm.state_hmac_key) {
+        // Bind the serialized state to (session_handle, slot_id) so it
+        // cannot be replayed into a different session — including across
+        // user boundaries within the same process.
+        let state_blob = match op.serialize_state(&hsm.state_hmac_key, sess.handle, sess.slot_id) {
             Ok(v) => v,
             Err(_) => return CKR_STATE_UNSAVEABLE,
         };
@@ -3620,8 +3623,25 @@ pub extern "C" fn C_SetOperationState(
 
         let blob = unsafe { slice::from_raw_parts(pOperationState, ulOperationStateLen as usize) };
 
+        // Resolve the caller's session up front so the blob's embedded
+        // session/slot binding can be verified inside deserialize_state.
+        // Any blob that wasn't produced by this exact session is rejected.
+        let sess_arc = match hsm.session_manager.get_session(hSession) {
+            Ok(s) => s,
+            Err(e) => return err_to_rv(e),
+        };
+        let (caller_session, caller_slot) = {
+            let sess = sess_arc.read();
+            (sess.handle, sess.slot_id)
+        };
+
         let (op_type, mechanism, key_handle, _mechanism_param, data) =
-            match ActiveOperation::deserialize_state(blob, &hsm.state_hmac_key) {
+            match ActiveOperation::deserialize_state(
+                blob,
+                &hsm.state_hmac_key,
+                caller_session,
+                caller_slot,
+            ) {
                 Ok(v) => v,
                 Err(_) => return CKR_SAVED_STATE_INVALID,
             };
@@ -3709,11 +3729,7 @@ pub extern "C" fn C_SetOperationState(
             _ => return CKR_SAVED_STATE_INVALID,
         };
 
-        let sess = match hsm.session_manager.get_session(hSession) {
-            Ok(s) => s,
-            Err(e) => return err_to_rv(e),
-        };
-        let mut sess = sess.write();
+        let mut sess = sess_arc.write();
         sess.active_operation = Some(active_op);
         CKR_OK
     })

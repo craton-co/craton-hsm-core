@@ -133,9 +133,31 @@ const OP_STATE_MAX_PARAM_LEN: usize = 64 * 1024;
 /// Maximum allowed data size in deserialized operation state (4 MB).
 const OP_STATE_MAX_DATA_LEN: usize = 4 * 1024 * 1024;
 
+/// Magic / format-version prefix for operation state blobs.
+///
+/// `OPS1` = "Operation State, version 1". Format v1 binds the serialized
+/// blob to the originating `session_handle` and `slot_id` via the
+/// authenticated payload, preventing a `C_GetOperationState` blob from
+/// session A being replayed into session B (potentially across user
+/// boundaries in a multi-tenant process).
+///
+/// Any pre-v1 blob would have started with `op_type` in `0..=4`, so it
+/// will fail this magic check and be rejected by `deserialize_state`.
+const OP_STATE_MAGIC: [u8; 4] = *b"OPS1";
+
 impl ActiveOperation {
     /// Serialize the operation state into a portable blob.
-    /// Format: \[1:type\]\[8:mechanism\]\[8:key_handle\]\[4:param_len\]\[N:param\]\[4:data_len\]\[M:data\]\[32:hmac\]
+    ///
+    /// Format (v1):
+    /// `[4:magic "OPS1"][8:session_handle][8:slot_id][1:type][8:mechanism][8:key_handle][4:param_len][N:param][4:data_len][M:data][32:hmac]`
+    ///
+    /// `session_handle` and `slot_id` are included in the MAC'd payload to
+    /// bind the saved state to the originating session — `deserialize_state`
+    /// will reject a blob whose binding fields do not match the caller's
+    /// session/slot. Without this binding, an attacker who can call
+    /// `C_GetOperationState` on session A could replay the blob into
+    /// `C_SetOperationState` on session B in the same process (potentially
+    /// crossing user boundaries in a multi-tenant deployment).
     ///
     /// Returns `Err` if param or data lengths exceed the deserialization
     /// limits (`OP_STATE_MAX_PARAM_LEN` / `OP_STATE_MAX_DATA_LEN`),
@@ -144,9 +166,25 @@ impl ActiveOperation {
     /// The buffer is `Zeroizing` from the start so intermediate CSPs
     /// are zeroized even if an early return or panic occurs
     /// (FIPS 140-3 §7.7).
-    pub fn serialize_state(&self, state_hmac_key: &[u8; 32]) -> HsmResult<Zeroizing<Vec<u8>>> {
+    pub fn serialize_state(
+        &self,
+        state_hmac_key: &[u8; 32],
+        session_handle: CK_SESSION_HANDLE,
+        slot_id: CK_SLOT_ID,
+    ) -> HsmResult<Zeroizing<Vec<u8>>> {
         // Use Zeroizing from the start so CSPs are zeroized on panic/drop.
         let mut buf = Zeroizing::new(Vec::new());
+
+        // Magic / format-version prefix (must be authenticated, so write
+        // before the rest of the payload and MAC over the whole thing).
+        buf.extend_from_slice(&OP_STATE_MAGIC);
+
+        // Session/slot binding fields. Stored as u64 LE regardless of the
+        // platform width of CK_ULONG (32-bit on Windows, 64-bit on Linux)
+        // so blobs are deterministically sized and the MAC covers a
+        // canonical representation of the binding.
+        buf.extend_from_slice(&(session_handle as u64).to_le_bytes());
+        buf.extend_from_slice(&(slot_id as u64).to_le_bytes());
 
         /// Validate and write a length-prefixed field, returning
         /// `HsmError::DataLenRange` if the length exceeds `max`.
@@ -237,16 +275,26 @@ impl ActiveOperation {
     }
 
     /// Deserialize an operation state blob into its components.
-    /// Verifies the HMAC-SHA256 tag to detect tampering before parsing.
-    /// Validates `op_type` against known operation constants.
-    /// Returns (op_type, mechanism, key_handle, mechanism_param, data) with
-    /// `Zeroizing` wrappers on param/data to ensure CSPs are zeroized on drop
-    /// (FIPS 140-3 §7.7).
     ///
-    /// Header format: \[1:type\]\[8:mechanism\]\[8:key_handle\]\[4:param_len\]...
+    /// Verifies the HMAC-SHA256 tag to detect tampering before parsing,
+    /// rejects blobs whose 4-byte magic does not match the current
+    /// format version (`OPS1`), and rejects blobs whose embedded
+    /// `session_handle` / `slot_id` do not match the caller-supplied
+    /// `expected_session` / `expected_slot`. This binding prevents an
+    /// attacker from replaying a `C_GetOperationState` blob from
+    /// session A into `C_SetOperationState` on session B.
+    ///
+    /// Returns `(op_type, mechanism, key_handle, mechanism_param, data)`
+    /// with `Zeroizing` wrappers on param/data so CSPs are zeroized on
+    /// drop (FIPS 140-3 §7.7).
+    ///
+    /// Header format (v1):
+    /// `[4:magic "OPS1"][8:session_handle][8:slot_id][1:type][8:mechanism][8:key_handle][4:param_len]...`
     pub fn deserialize_state(
         blob: &[u8],
         state_hmac_key: &[u8; 32],
+        expected_session: CK_SESSION_HANDLE,
+        expected_slot: CK_SLOT_ID,
     ) -> HsmResult<(
         u8,
         CK_MECHANISM_TYPE,
@@ -254,13 +302,19 @@ impl ActiveOperation {
         Zeroizing<Vec<u8>>,
         Zeroizing<Vec<u8>>,
     )> {
-        // Minimum: 21 bytes header (1+8+8+4) + 32 bytes HMAC
-        const HEADER_LEN: usize = 1 + 8 + 8 + 4; // 21
+        // Header layout (pre-payload):
+        //   [4: magic][8: session_handle][8: slot_id]
+        //   [1: type][8: mechanism][8: key_handle][4: param_len]
+        const BIND_LEN: usize = 4 + 8 + 8; // magic + session + slot = 20
+        const INNER_HEADER_LEN: usize = 1 + 8 + 8 + 4; // type+mech+key+param_len = 21
+        const HEADER_LEN: usize = BIND_LEN + INNER_HEADER_LEN; // 41
+
         if blob.len() < HEADER_LEN + OP_STATE_HMAC_LEN {
             return Err(HsmError::DataInvalid);
         }
 
-        // Verify HMAC tag (last 32 bytes)
+        // Verify HMAC tag (last 32 bytes) over the entire preceding payload,
+        // which includes the magic and the session/slot binding.
         let payload = &blob[..blob.len() - OP_STATE_HMAC_LEN];
         let provided_tag = &blob[blob.len() - OP_STATE_HMAC_LEN..];
 
@@ -273,8 +327,33 @@ impl ActiveOperation {
         mac.verify_slice(provided_tag)
             .map_err(|_| HsmError::DataInvalid)?;
 
+        // Reject anything that isn't the current format version. Legacy
+        // (pre-binding) blobs had op_type in 0..=4 as their first byte,
+        // which cannot collide with "OPS1" = [0x4F, 0x50, 0x53, 0x31].
+        if payload[..4] != OP_STATE_MAGIC {
+            return Err(HsmError::DataInvalid);
+        }
+
+        // Authenticated session/slot binding. After the HMAC check, both
+        // values are known to be exactly what `serialize_state` wrote, so
+        // any mismatch with the caller's session/slot indicates an attempted
+        // cross-session replay and must be rejected.
+        let blob_session = u64::from_le_bytes(
+            payload[4..12]
+                .try_into()
+                .map_err(|_| HsmError::DataInvalid)?,
+        );
+        let blob_slot = u64::from_le_bytes(
+            payload[12..20]
+                .try_into()
+                .map_err(|_| HsmError::DataInvalid)?,
+        );
+        if blob_session != expected_session as u64 || blob_slot != expected_slot as u64 {
+            return Err(HsmError::DataInvalid);
+        }
+
         // Parse the verified payload — u64 for mechanism and key_handle
-        let op_type = payload[0];
+        let op_type = payload[BIND_LEN];
 
         // Validate op_type against known operation constants
         match op_type {
@@ -283,17 +362,17 @@ impl ActiveOperation {
         }
 
         let mechanism = u64::from_le_bytes(
-            payload[1..9]
+            payload[BIND_LEN + 1..BIND_LEN + 9]
                 .try_into()
                 .map_err(|_| HsmError::DataInvalid)?,
         ) as CK_MECHANISM_TYPE;
         let key_handle = u64::from_le_bytes(
-            payload[9..17]
+            payload[BIND_LEN + 9..BIND_LEN + 17]
                 .try_into()
                 .map_err(|_| HsmError::DataInvalid)?,
         ) as CK_OBJECT_HANDLE;
         let param_len = u32::from_le_bytes(
-            payload[17..21]
+            payload[BIND_LEN + 17..BIND_LEN + 21]
                 .try_into()
                 .map_err(|_| HsmError::DataInvalid)?,
         ) as usize;
@@ -489,5 +568,123 @@ impl Session {
             flags: self.flags,
             device_error: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Tests for the `ActiveOperation` state serialization, focusing on the
+    //! session/slot binding added in format version 1. These tests use a
+    //! `Digest` operation because it does not carry a key handle that has
+    //! to exist in the object store, which keeps them independent of any
+    //! HsmCore setup.
+    use super::*;
+
+    fn fixed_key() -> [u8; 32] {
+        // Deterministic test key — not used for any real CSP.
+        let mut k = [0u8; 32];
+        for (i, b) in k.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        k
+    }
+
+    fn sample_digest_op() -> ActiveOperation {
+        ActiveOperation::Digest {
+            mechanism: CKM_SHA256,
+            hasher: None,
+            accumulated_input: Zeroizing::new(b"hello world".to_vec()),
+        }
+    }
+
+    #[test]
+    fn roundtrip_matching_session_and_slot_ok() {
+        let key = fixed_key();
+        let op = sample_digest_op();
+        let blob = op
+            .serialize_state(&key, 1, 2)
+            .expect("serialize_state should succeed");
+
+        let (op_type, mechanism, key_handle, param, data) =
+            ActiveOperation::deserialize_state(&blob, &key, 1, 2)
+                .expect("matching session/slot must deserialize cleanly");
+
+        assert_eq!(op_type, OP_TYPE_DIGEST);
+        assert_eq!(mechanism, CKM_SHA256);
+        assert_eq!(key_handle, 0);
+        assert!(param.is_empty());
+        assert_eq!(&data[..], b"hello world");
+    }
+
+    #[test]
+    fn mismatched_session_handle_is_rejected() {
+        let key = fixed_key();
+        let op = sample_digest_op();
+        let blob = op.serialize_state(&key, 1, 2).unwrap();
+
+        // Same slot, different session handle — must reject to prevent
+        // cross-session replay within the same slot/process.
+        let err = ActiveOperation::deserialize_state(&blob, &key, 3, 2)
+            .expect_err("mismatched session_handle must be rejected");
+        assert!(matches!(err, HsmError::DataInvalid));
+    }
+
+    #[test]
+    fn mismatched_slot_id_is_rejected() {
+        let key = fixed_key();
+        let op = sample_digest_op();
+        let blob = op.serialize_state(&key, 1, 2).unwrap();
+
+        // Same session handle, different slot — must reject to prevent
+        // cross-slot replay (e.g. across tokens in a multi-tenant process).
+        let err = ActiveOperation::deserialize_state(&blob, &key, 1, 5)
+            .expect_err("mismatched slot_id must be rejected");
+        assert!(matches!(err, HsmError::DataInvalid));
+    }
+
+    #[test]
+    fn legacy_pre_binding_blob_is_rejected() {
+        // Synthesize a pre-v1 blob (no magic prefix, just the old header
+        // starting with op_type) MAC'd with the right key, and confirm the
+        // new deserializer rejects it. This locks in the format-version
+        // bump: legacy callers cannot silently downgrade past the binding.
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        type HmacSha256 = Hmac<Sha256>;
+
+        let key = fixed_key();
+        let mut legacy = Vec::new();
+        legacy.push(OP_TYPE_DIGEST);
+        legacy.extend_from_slice(&(CKM_SHA256 as u64).to_le_bytes());
+        legacy.extend_from_slice(&0u64.to_le_bytes()); // key_handle
+        legacy.extend_from_slice(&0u32.to_le_bytes()); // param_len
+        legacy.extend_from_slice(&0u32.to_le_bytes()); // data_len
+
+        let mut mac = HmacSha256::new_from_slice(&key).unwrap();
+        mac.update(&legacy);
+        let tag = mac.finalize().into_bytes();
+        legacy.extend_from_slice(&tag);
+
+        let err = ActiveOperation::deserialize_state(&legacy, &key, 1, 2)
+            .expect_err("legacy blob without magic must be rejected");
+        assert!(matches!(err, HsmError::DataInvalid));
+    }
+
+    #[test]
+    fn tampered_binding_fails_hmac() {
+        // Flipping the embedded session_handle inside an otherwise valid
+        // blob must fail the HMAC check (caught before the binding check
+        // even runs). This guards against an attacker who notices the
+        // binding fields and tries to overwrite them without re-MACing.
+        let key = fixed_key();
+        let op = sample_digest_op();
+        let mut blob = op.serialize_state(&key, 1, 2).unwrap().to_vec();
+
+        // Magic occupies bytes 0..4; session_handle is bytes 4..12.
+        blob[4] ^= 0xFF;
+
+        let err = ActiveOperation::deserialize_state(&blob, &key, 1, 2)
+            .expect_err("HMAC must catch in-blob tampering of the binding");
+        assert!(matches!(err, HsmError::DataInvalid));
     }
 }
