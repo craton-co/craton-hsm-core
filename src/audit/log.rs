@@ -144,6 +144,12 @@ enum AuditCommand {
         operation: AuditOperation,
         result: AuditResult,
         key_id: Option<String>,
+        /// Optional completion channel. When `Some`, the worker sends the
+        /// I/O / chain result *after* the event has been written and fsynced
+        /// to disk (or after a non-disk record is committed to in-memory
+        /// state). Used by `record_sync()` to provide durable-write
+        /// guarantees to sensitive callers.
+        done: Option<std::sync::mpsc::SyncSender<Result<(), crate::error::HsmError>>>,
     },
     Flush {
         done: std::sync::mpsc::Sender<()>,
@@ -352,8 +358,11 @@ impl AuditLog {
                 let mut last_hash = initial_hash;
                 let mut last_timestamp = initial_timestamp;
 
-                /// Process a single Record command. Returns the updated
-                /// (last_hash, last_timestamp) on success.
+                /// Process a single Record command. Returns `Ok(())` once the
+                /// event has been chained, written, and fsynced to disk (when
+                /// disk logging is configured) and committed to the in-memory
+                /// state. Returns `Err(...)` if any step fails — propagated to
+                /// `record_sync` callers via the optional completion channel.
                 #[allow(clippy::too_many_arguments)]
                 fn process_record(
                     state: &Arc<RwLock<AuditLogState>>,
@@ -365,9 +374,11 @@ impl AuditLog {
                     operation: AuditOperation,
                     result: AuditResult,
                     key_id: Option<String>,
-                ) {
+                ) -> Result<(), crate::error::HsmError> {
                     if tamper_flag.load(Ordering::Acquire) {
-                        return;
+                        return Err(crate::error::HsmError::AuditChainBroken(
+                            "audit chain tamper previously detected".to_string(),
+                        ));
                     }
 
                     let duration = SystemTime::now()
@@ -385,7 +396,9 @@ impl AuditLog {
                                      Cannot guarantee monotonicity."
                                 );
                                 tamper_flag.store(true, Ordering::Release);
-                                return;
+                                return Err(crate::error::HsmError::AuditChainBroken(
+                                    "timestamp space exhausted".to_string(),
+                                ));
                             }
                         }
                     } else {
@@ -405,9 +418,9 @@ impl AuditLog {
                     // Compute chain hash: SHA-256(previous_hash || payload)
                     let new_hash = match compute_chain_hash(last_hash, &event) {
                         Ok(h) => h,
-                        Err(_) => {
+                        Err(e) => {
                             tracing::error!("Audit worker: chain hash computation failed");
-                            return;
+                            return Err(e);
                         }
                     };
                     *last_hash = new_hash;
@@ -442,6 +455,10 @@ impl AuditLog {
 
                         if let Err(e) = io_result {
                             tracing::error!("Audit worker: disk I/O failed: {}", e);
+                            // Do not commit the failed event to in-memory state:
+                            // the on-disk and in-memory chains would diverge
+                            // and break subsequent recovery. Propagate the error.
+                            return Err(e);
                         }
                     }
 
@@ -458,6 +475,8 @@ impl AuditLog {
                             s.entries.drain(..excess);
                         }
                     }
+
+                    Ok(())
                 }
 
                 loop {
@@ -467,8 +486,9 @@ impl AuditLog {
                             operation,
                             result,
                             key_id,
+                            done,
                         }) => {
-                            process_record(
+                            let outcome = process_record(
                                 &state,
                                 &log_path,
                                 &tamper_flag,
@@ -479,6 +499,12 @@ impl AuditLog {
                                 result,
                                 key_id,
                             );
+                            if let Some(tx) = done {
+                                // Notify the synchronous caller; if it has
+                                // already given up (timed out / dropped its
+                                // receiver) we silently move on.
+                                let _ = tx.send(outcome);
+                            }
                         }
                         Ok(AuditCommand::Flush { done }) => {
                             // Drain any pending records before acknowledging.
@@ -489,8 +515,9 @@ impl AuditLog {
                                         operation,
                                         result,
                                         key_id,
+                                        done: inner_done,
                                     } => {
-                                        process_record(
+                                        let outcome = process_record(
                                             &state,
                                             &log_path,
                                             &tamper_flag,
@@ -501,6 +528,9 @@ impl AuditLog {
                                             result,
                                             key_id,
                                         );
+                                        if let Some(tx) = inner_done {
+                                            let _ = tx.send(outcome);
+                                        }
                                     }
                                     AuditCommand::Flush { done: inner_done } => {
                                         let _ = inner_done.send(());
@@ -740,6 +770,14 @@ impl AuditLog {
     /// worker thread. The expensive work (hash chain computation, JSON
     /// serialization, file I/O with fsync) happens off the caller's hot path.
     ///
+    /// **Durability:** This method returns `Ok(())` as soon as the event has
+    /// been enqueued — it does **not** wait for the worker to write or fsync
+    /// the event to disk. On `SIGKILL`, panic, or sudden power loss before the
+    /// worker drains the queue, an enqueued event may be lost. For
+    /// security-relevant operations (login, key destruction, init_token, …)
+    /// use [`AuditLog::record_sync`] instead, which blocks until the event is
+    /// durably on disk and propagates any write/fsync error.
+    ///
     /// Returns `Err(AuditChainBroken)` if tamper has been detected — the
     /// HSM must not continue normal operations with a compromised audit trail.
     pub fn record(
@@ -748,6 +786,61 @@ impl AuditLog {
         operation: AuditOperation,
         result: AuditResult,
         key_id: Option<String>,
+    ) -> crate::error::HsmResult<()> {
+        self.record_internal(session_handle, operation, result, key_id, None)
+    }
+
+    /// Record an audit event **synchronously**. Blocks until the background
+    /// worker has chained the event, written its NDJSON line, and `fsync`-ed
+    /// the audit log file. Propagates write / fsync / serialization failures
+    /// as `Err(...)` to the caller so security-relevant call sites can refuse
+    /// to proceed when the forensic trail is not durable.
+    ///
+    /// Use this for sensitive operations where treating `record()` as durable
+    /// would be unsafe (login, init_token/init_pin/set_pin, destroy_object,
+    /// generate_key/keypair, sign/verify/encrypt/decrypt, session lifecycle,
+    /// finalize). Non-sensitive call sites (heartbeats, generate_random
+    /// telemetry, …) may continue to use the cheaper [`AuditLog::record`].
+    pub fn record_sync(
+        &self,
+        session_handle: u64,
+        operation: AuditOperation,
+        result: AuditResult,
+        key_id: Option<String>,
+    ) -> crate::error::HsmResult<()> {
+        // One-shot completion channel (capacity 1 — the worker sends exactly
+        // one result per Record command).
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(), crate::error::HsmError>>(1);
+        self.record_internal(session_handle, operation, result, key_id, Some(tx))?;
+
+        // Wait for the worker to commit the event. We block indefinitely
+        // here: an unresponsive audit worker should manifest as a stuck
+        // sensitive operation (visible to operators) rather than a silent
+        // loss of the forensic record. The caller's request timeout (gRPC
+        // deadline, PKCS#11 caller, etc.) provides the upper bound.
+        match rx.recv() {
+            Ok(result) => result,
+            Err(_) => {
+                // Worker dropped the sender without responding — typically
+                // means the worker thread panicked or exited.
+                tracing::error!(
+                    "Audit worker disconnected before acknowledging record_sync — \
+                     event durability cannot be guaranteed."
+                );
+                Err(crate::error::HsmError::GeneralError)
+            }
+        }
+    }
+
+    /// Shared implementation for `record` and `record_sync`. Sanitizes the
+    /// key_id, rejects on tamper, and dispatches the command to the worker.
+    fn record_internal(
+        &self,
+        session_handle: u64,
+        operation: AuditOperation,
+        result: AuditResult,
+        key_id: Option<String>,
+        done: Option<std::sync::mpsc::SyncSender<Result<(), crate::error::HsmError>>>,
     ) -> crate::error::HsmResult<()> {
         // Fast-path rejection via atomic flag — no lock needed.
         if self.tamper_flag.load(Ordering::Acquire) {
@@ -766,6 +859,7 @@ impl AuditLog {
                     operation,
                     result,
                     key_id,
+                    done,
                 })
                 .map_err(|_| crate::error::HsmError::GeneralError)?;
         }
@@ -776,12 +870,30 @@ impl AuditLog {
     /// Flush all pending audit events synchronously. Blocks until the
     /// background worker has processed every queued command, or until
     /// a 5-second timeout expires.
-    pub fn flush(&self) {
+    ///
+    /// Returns `Err(GeneralError)` if the worker is unresponsive (timeout
+    /// or disconnect) — previously this silently swallowed the timeout,
+    /// hiding worker stalls. Callers that previously relied on
+    /// fire-and-forget semantics should ignore the return value.
+    pub fn flush(&self) -> crate::error::HsmResult<()> {
         if let Some(sender) = &self.sender {
             let (tx, rx) = std::sync::mpsc::channel();
-            let _ = sender.send(AuditCommand::Flush { done: tx });
-            let _ = rx.recv_timeout(std::time::Duration::from_secs(5));
+            sender
+                .send(AuditCommand::Flush { done: tx })
+                .map_err(|_| {
+                    tracing::error!("Audit flush: worker channel closed");
+                    crate::error::HsmError::GeneralError
+                })?;
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .map_err(|e| {
+                    tracing::error!(
+                        "Audit flush: worker did not acknowledge within timeout: {}",
+                        e
+                    );
+                    crate::error::HsmError::GeneralError
+                })?;
         }
+        Ok(())
     }
 
     /// # Security

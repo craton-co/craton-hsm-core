@@ -311,9 +311,9 @@ pub extern "C" fn C_Initialize(p_init_args: CK_VOID_PTR) -> CK_RV {
 
         // Record the PID for fork detection
         INIT_PID.store(current_pid(), Ordering::Release);
-        let _ = core
-            .audit_log
-            .record(0, AuditOperation::Initialize, AuditResult::Success, None);
+        let _ =
+            core.audit_log
+                .record_sync(0, AuditOperation::Initialize, AuditResult::Success, None);
         *guard = Some(core);
         // Bump generation so any stale TLS caches from a prior init/finalize
         // cycle are invalidated.
@@ -337,10 +337,10 @@ pub extern "C" fn C_Finalize(p_reserved: CK_VOID_PTR) -> CK_RV {
             None => return CKR_CRYPTOKI_NOT_INITIALIZED,
         };
 
-        let _ = hsm
-            .audit_log
-            .record(0, AuditOperation::Finalize, AuditResult::Success, None);
-        hsm.audit_log.flush();
+        let _ =
+            hsm.audit_log
+                .record_sync(0, AuditOperation::Finalize, AuditResult::Success, None);
+        let _ = hsm.audit_log.flush();
 
         // Flush parsed RSA key caches so they do not survive across an
         // initialize/finalize cycle (matching the GCM-counter reset semantics
@@ -986,7 +986,7 @@ pub extern "C" fn C_Login(
             Ok(()) => {
                 // Update all sessions for this slot
                 let _ = hsm.session_manager.login_all(slot_id, user_type);
-                let _ = hsm.audit_log.record(
+                let _ = hsm.audit_log.record_sync(
                     u64::from(session),
                     AuditOperation::Login {
                         user_type: u64::from(user_type),
@@ -998,7 +998,7 @@ pub extern "C" fn C_Login(
             }
             Err(e) => {
                 let rv = err_to_rv(e);
-                let _ = hsm.audit_log.record(
+                let _ = hsm.audit_log.record_sync(
                     u64::from(session),
                     AuditOperation::Login {
                         user_type: u64::from(user_type),
@@ -1034,7 +1034,7 @@ pub extern "C" fn C_Logout(session: CK_SESSION_HANDLE) -> CK_RV {
         match token.logout() {
             Ok(()) => {
                 let _ = hsm.session_manager.logout_all(slot_id);
-                let _ = hsm.audit_log.record(
+                let _ = hsm.audit_log.record_sync(
                     session as u64,
                     AuditOperation::Logout,
                     AuditResult::Success,
@@ -1161,7 +1161,7 @@ pub extern "C" fn C_DestroyObject(session: CK_SESSION_HANDLE, object: CK_OBJECT_
                 // Evict any cached parsed RSA keys for this handle so the
                 // cache does not retain key material past destruction.
                 crate::crypto::sign::evict_cached_keys(slot_id as u64, object as u64);
-                let _ = hsm.audit_log.record(
+                let _ = hsm.audit_log.record_sync(
                     session as u64,
                     AuditOperation::DestroyObject,
                     AuditResult::Success,
@@ -1770,7 +1770,7 @@ pub extern "C" fn C_Encrypt(
                     *pul_encrypted_data_len = encrypted.len() as CK_ULONG;
                 }
 
-                let _ = hsm.audit_log.record(
+                let _ = hsm.audit_log.record_sync(
                     session as u64,
                     AuditOperation::Encrypt {
                         mechanism: mechanism as u64,
@@ -1785,7 +1785,7 @@ pub extern "C" fn C_Encrypt(
             }
             Err(e) => {
                 let rv = err_to_rv(e);
-                let _ = hsm.audit_log.record(
+                let _ = hsm.audit_log.record_sync(
                     session as u64,
                     AuditOperation::Encrypt {
                         mechanism: mechanism as u64,
@@ -2010,7 +2010,7 @@ pub extern "C" fn C_Decrypt(
                     *pul_data_len = decrypted.len() as CK_ULONG;
                 }
 
-                let _ = hsm.audit_log.record(
+                let _ = hsm.audit_log.record_sync(
                     session as u64,
                     AuditOperation::Decrypt {
                         mechanism: mechanism as u64,
@@ -2025,7 +2025,7 @@ pub extern "C" fn C_Decrypt(
             }
             Err(e) => {
                 let rv = err_to_rv(e);
-                let _ = hsm.audit_log.record(
+                let _ = hsm.audit_log.record_sync(
                     session as u64,
                     AuditOperation::Decrypt {
                         mechanism: mechanism as u64,
@@ -2224,7 +2224,7 @@ pub extern "C" fn C_Sign(
                     *pul_signature_len = signature.len() as CK_ULONG;
                 }
 
-                let _ = hsm.audit_log.record(
+                let _ = hsm.audit_log.record_sync(
                     session as u64,
                     AuditOperation::Sign {
                         mechanism: mechanism as u64,
@@ -2239,7 +2239,7 @@ pub extern "C" fn C_Sign(
             }
             Err(e) => {
                 let rv = err_to_rv(e);
-                let _ = hsm.audit_log.record(
+                let _ = hsm.audit_log.record_sync(
                     session as u64,
                     AuditOperation::Sign {
                         mechanism: mechanism as u64,
@@ -2621,7 +2621,7 @@ pub extern "C" fn C_Verify(
 
         match result {
             Ok(true) => {
-                let _ = hsm.audit_log.record(
+                let _ = hsm.audit_log.record_sync(
                     session as u64,
                     AuditOperation::Verify {
                         mechanism: mechanism as u64,
@@ -2633,7 +2633,7 @@ pub extern "C" fn C_Verify(
                 CKR_OK
             }
             Ok(false) => {
-                let _ = hsm.audit_log.record(
+                let _ = hsm.audit_log.record_sync(
                     session as u64,
                     AuditOperation::Verify {
                         mechanism: mechanism as u64,
@@ -2646,7 +2646,7 @@ pub extern "C" fn C_Verify(
             }
             Err(e) => {
                 let rv = err_to_rv(e);
-                let _ = hsm.audit_log.record(
+                let _ = hsm.audit_log.record_sync(
                     session as u64,
                     AuditOperation::Verify {
                         mechanism: mechanism as u64,
@@ -2837,7 +2837,7 @@ pub extern "C" fn C_GenerateKey(
             return err_to_rv(e);
         }
 
-        let _ = hsm.audit_log.record(
+        let _ = hsm.audit_log.record_sync(
             session as u64,
             AuditOperation::GenerateKey {
                 mechanism: mechanism as u64,
@@ -2939,7 +2939,7 @@ pub extern "C" fn C_GenerateKeyPair(
             Err(rv) => return rv,
         };
 
-        let _ = hsm.audit_log.record(
+        let _ = hsm.audit_log.record_sync(
             session as u64,
             AuditOperation::GenerateKeyPair {
                 mechanism: mechanism as u64,
@@ -4236,7 +4236,7 @@ pub extern "C" fn C_EncryptFinal(
                     *pul_last_encrypted_part_len = encrypted.len() as CK_ULONG;
                 }
 
-                let _ = hsm.audit_log.record(
+                let _ = hsm.audit_log.record_sync(
                     session as u64,
                     AuditOperation::Encrypt {
                         mechanism: mechanism as u64,
@@ -4448,7 +4448,7 @@ pub extern "C" fn C_DecryptFinal(
                     *pul_last_part_len = decrypted.len() as CK_ULONG;
                 }
 
-                let _ = hsm.audit_log.record(
+                let _ = hsm.audit_log.record_sync(
                     session as u64,
                     AuditOperation::Decrypt {
                         mechanism: mechanism as u64,
@@ -4989,7 +4989,7 @@ pub extern "C" fn C_SignFinal(
                     *pul_signature_len = signature.len() as CK_ULONG;
                 }
 
-                let _ = hsm.audit_log.record(
+                let _ = hsm.audit_log.record_sync(
                     session as u64,
                     AuditOperation::Sign {
                         mechanism: mechanism as u64,
@@ -5180,7 +5180,7 @@ pub extern "C" fn C_VerifyFinal(
 
         match result {
             Ok(true) => {
-                let _ = hsm.audit_log.record(
+                let _ = hsm.audit_log.record_sync(
                     session as u64,
                     AuditOperation::Verify {
                         mechanism: mechanism as u64,
@@ -5192,7 +5192,7 @@ pub extern "C" fn C_VerifyFinal(
                 CKR_OK
             }
             Ok(false) => {
-                let _ = hsm.audit_log.record(
+                let _ = hsm.audit_log.record_sync(
                     session as u64,
                     AuditOperation::Verify {
                         mechanism: mechanism as u64,
@@ -5205,7 +5205,7 @@ pub extern "C" fn C_VerifyFinal(
             }
             Err(e) => {
                 let rv = err_to_rv(e);
-                let _ = hsm.audit_log.record(
+                let _ = hsm.audit_log.record_sync(
                     session as u64,
                     AuditOperation::Verify {
                         mechanism: mechanism as u64,

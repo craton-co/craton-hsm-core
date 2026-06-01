@@ -251,9 +251,18 @@ impl HsmServiceImpl {
         attempts.remove(&slot_id);
     }
 
-    /// Record an audit event and propagate failures as gRPC errors.
-    /// FIPS 140-3 requires that security-relevant events are recorded; if the
-    /// audit log cannot write, the operation must be blocked.
+    /// Record an audit event **synchronously** and propagate failures as gRPC
+    /// errors. Blocks until the event has been chained, written, and fsynced
+    /// to the audit log file.
+    ///
+    /// FIPS 140-3 requires that security-relevant events are durably recorded
+    /// before the corresponding operation is acknowledged to the client. The
+    /// daemon RPCs that call this helper (login/logout, init_token, key
+    /// generation, sign/verify/encrypt/decrypt, destroy_object, …) are all
+    /// security-relevant, so the synchronous path is appropriate for every
+    /// call site. If you add an RPC that emits high-volume, low-value events
+    /// where fsync latency dominates (telemetry, heartbeats), introduce a
+    /// separate `audit_async` helper rather than weakening this one.
     fn audit(
         &self,
         session_handle: u64,
@@ -263,7 +272,7 @@ impl HsmServiceImpl {
     ) -> Result<(), Status> {
         self.hsm
             .audit_log()
-            .record(session_handle, operation, result, key_id)
+            .record_sync(session_handle, operation, result, key_id)
             .map_err(|e| {
                 tracing::error!("Audit log write failed: {:?}", e);
                 Status::internal("Audit system failure")

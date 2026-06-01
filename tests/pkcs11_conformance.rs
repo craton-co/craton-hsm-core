@@ -1213,7 +1213,7 @@ fn test_audit_log_chain_integrity() {
 
     // record() dispatches to a background worker; flush so the entries are
     // visible before we read.
-    log.flush();
+    log.flush().unwrap();
 
     // Verify the chain
     let result = log.verify_chain();
@@ -1245,7 +1245,7 @@ fn test_audit_log_injection_prevention() {
     )
     .unwrap();
 
-    log.flush();
+    log.flush().unwrap();
     let entries = log.get_entries();
     assert_eq!(entries.len(), 1);
     let key_id = entries[0].key_id.as_ref().unwrap();

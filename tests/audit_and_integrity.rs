@@ -21,7 +21,7 @@ fn test_audit_log_record_increments_count() {
     let log = AuditLog::new();
     log.record(1, AuditOperation::Initialize, AuditResult::Success, None)
         .unwrap();
-    log.flush();
+    log.flush().unwrap();
     assert_eq!(log.entry_count(), 1);
 }
 
@@ -48,7 +48,7 @@ fn test_audit_log_multiple_entries() {
         Some("key1".to_string()),
     )
     .unwrap();
-    log.flush();
+    log.flush().unwrap();
     assert_eq!(log.entry_count(), 3);
 }
 
@@ -62,7 +62,7 @@ fn test_audit_log_failure_event() {
         None,
     )
     .unwrap();
-    log.flush();
+    log.flush().unwrap();
     assert_eq!(log.entry_count(), 1);
 }
 
@@ -195,7 +195,7 @@ fn test_audit_log_all_operation_types() {
         Some("k9".into()),
     )
     .unwrap();
-    log.flush();
+    log.flush().unwrap();
     assert_eq!(
         log.entry_count(),
         17,
@@ -216,7 +216,7 @@ fn test_audit_log_fips_non_approved() {
         Some("pqc".into()),
     )
     .unwrap();
-    log.flush();
+    log.flush().unwrap();
     assert_eq!(log.entry_count(), 1);
 }
 
@@ -233,7 +233,7 @@ fn test_audit_log_with_key_id() {
         AuditResult::Success,
         Some("my-aes-key-id-123".to_string()),
     );
-    log.flush();
+    log.flush().unwrap();
     assert_eq!(log.entry_count(), 1);
 }
 
@@ -251,7 +251,7 @@ fn test_audit_log_different_sessions() {
         None,
     )
     .unwrap();
-    log.flush();
+    log.flush().unwrap();
     assert_eq!(log.entry_count(), 3);
 }
 
@@ -267,7 +267,7 @@ fn test_audit_log_rapid_recording() {
         )
         .unwrap();
     }
-    log.flush();
+    log.flush().unwrap();
     assert_eq!(log.entry_count(), 100, "Should handle 100 rapid entries");
 }
 
@@ -287,7 +287,7 @@ fn test_audit_log_get_entries() {
         None,
     )
     .unwrap();
-    log.flush();
+    log.flush().unwrap();
     let entries = log.get_entries();
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].session_handle, 1);
@@ -305,7 +305,7 @@ fn test_audit_log_get_recent_entries() {
         )
         .unwrap();
     }
-    log.flush();
+    log.flush().unwrap();
     let recent = log.get_recent_entries(3);
     assert_eq!(recent.len(), 3);
     assert_eq!(recent[0].session_handle, 7);
@@ -317,7 +317,7 @@ fn test_audit_log_export_json() {
     let log = AuditLog::new();
     log.record(1, AuditOperation::Initialize, AuditResult::Success, None)
         .unwrap();
-    log.flush();
+    log.flush().unwrap();
     let json = log.export_json();
     assert!(json.starts_with('['));
     assert!(json.ends_with(']'));
@@ -336,7 +336,7 @@ fn test_audit_log_export_ndjson() {
         None,
     )
     .unwrap();
-    log.flush();
+    log.flush().unwrap();
     let ndjson = log.export_ndjson();
     let lines: Vec<&str> = ndjson.lines().collect();
     assert_eq!(lines.len(), 2, "NDJSON should have one line per entry");
@@ -367,7 +367,7 @@ fn test_audit_log_export_syslog() {
         AuditResult::Failure(0xA0),
         None,
     );
-    log.flush();
+    log.flush().unwrap();
     let syslog = log.export_syslog();
     assert_eq!(syslog.len(), 2);
     // Success = severity 6, facility 10 → priority 86
@@ -408,7 +408,7 @@ fn test_audit_log_verify_chain_valid() {
         AuditResult::Success,
         Some("k1".into()),
     );
-    log.flush();
+    log.flush().unwrap();
     assert_eq!(log.verify_chain(), Ok(3));
 }
 
@@ -424,6 +424,95 @@ fn test_audit_log_export_ndjson_empty() {
     let log = AuditLog::new();
     let ndjson = log.export_ndjson();
     assert_eq!(ndjson, "");
+}
+
+// ----------------------------------------------------------------------------
+// record_sync durability — the event MUST be on disk before record_sync
+// returns. Regression test for the issue where `record()` returned Ok() before
+// the background worker had written / fsynced the line, allowing sensitive
+// events (login, key destruction, init_token, …) to be lost on SIGKILL / panic
+// between enqueue and drain.
+// ----------------------------------------------------------------------------
+
+#[test]
+fn test_audit_log_record_sync_is_durable_on_disk() {
+    use std::io::Read as _;
+
+    // Use a process-unique path so concurrent tests don't collide. We avoid a
+    // `tempfile` dependency: the OS temp dir + PID + a counter is sufficient
+    // for a single-shot test.
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!(
+        "craton_hsm_audit_record_sync_{}_{}.log",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    ));
+    // Belt-and-braces cleanup in case a previous run aborted mid-test.
+    let _ = std::fs::remove_file(&path);
+
+    let log = AuditLog::new_with_path(path.clone())
+        .expect("audit log construction with disk path should succeed");
+
+    // record_sync MUST block until the line is durable on disk. Read the file
+    // immediately after — without any explicit flush() — and assert the event
+    // is present. With the old fire-and-forget record(), this would flake
+    // (the worker may not have drained yet).
+    log.record_sync(
+        42,
+        AuditOperation::Login { user_type: 1 },
+        AuditResult::Success,
+        Some("durability-test".to_string()),
+    )
+    .expect("record_sync should succeed for a valid event");
+
+    let mut file =
+        std::fs::File::open(&path).expect("audit log file should exist after record_sync");
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .expect("audit log file should be readable");
+
+    assert!(
+        contents.contains("\"Login\""),
+        "audit file must contain the Login event after record_sync returns, got: {:?}",
+        contents,
+    );
+    assert!(
+        contents.contains("durability-test"),
+        "audit file must contain the key_id after record_sync returns, got: {:?}",
+        contents,
+    );
+    assert!(
+        contents.ends_with('\n'),
+        "audit file should end with a newline (NDJSON), got: {:?}",
+        contents,
+    );
+
+    // Drop the log so the worker exits, then remove the temp file.
+    drop(log);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn test_audit_log_record_sync_in_memory_only() {
+    // Without a disk path, record_sync should still block until the in-memory
+    // state has been updated — i.e. entry_count() must reflect the new event
+    // immediately, without a subsequent flush().
+    let log = AuditLog::new();
+    log.record_sync(
+        7,
+        AuditOperation::DestroyObject,
+        AuditResult::Success,
+        None,
+    )
+    .expect("record_sync should succeed on an in-memory audit log");
+    assert_eq!(
+        log.entry_count(),
+        1,
+        "record_sync must commit to in-memory state before returning",
+    );
 }
 
 // ============================================================================
