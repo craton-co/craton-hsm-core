@@ -16,6 +16,9 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::{HsmError, HsmResult};
+use crate::store::encrypted_store::set_restrictive_permissions;
+
 /// Persisted lockout state for a single token.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LockoutData {
@@ -95,36 +98,84 @@ impl LockoutStore {
     }
 
     /// Persist lockout data atomically (write-to-temp + rename).
-    pub fn save(&self, data: &LockoutData) {
-        let json = match serde_json::to_string_pretty(data) {
-            Ok(j) => j,
-            Err(e) => {
-                tracing::error!("failed to serialize lockout state: {}", e);
-                return;
-            }
-        };
+    ///
+    /// The on-disk file is locked down to owner-only (Unix mode 0o600 / Windows
+    /// owner-only DACL) so that a local attacker cannot reset
+    /// `user_pin_locked=false` and brute-force PINs. Permission-set failure is
+    /// treated as **fatal** — a save that cannot be locked down is worse than
+    /// no save at all, because subsequent boots would read attacker-controlled
+    /// state. The temp file is also locked down before any data is written so
+    /// that a racing attacker cannot observe or rewrite it during the brief
+    /// window before `rename`.
+    pub fn save(&self, data: &LockoutData) -> HsmResult<()> {
+        let json = serde_json::to_string_pretty(data).map_err(|e| {
+            tracing::error!("failed to serialize lockout state: {}", e);
+            HsmError::GeneralError
+        })?;
 
         // Ensure parent directory exists
         if let Some(parent) = self.path.parent() {
             if !parent.exists() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
+                std::fs::create_dir_all(parent).map_err(|e| {
                     tracing::error!("failed to create lockout state directory: {}", e);
-                    return;
-                }
+                    HsmError::GeneralError
+                })?;
             }
         }
 
-        // Atomic write: write to temp file, then rename
+        // Atomic write: create temp file with owner-only mode (Unix), then
+        // tighten permissions explicitly on both platforms before writing,
+        // then rename, then re-tighten the final path.
         let tmp_path = self.path.with_extension("json.tmp");
-        if let Err(e) = std::fs::write(&tmp_path, json.as_bytes()) {
-            tracing::error!("failed to write lockout state temp file: {}", e);
-            return;
+        {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut file = opts.open(&tmp_path).map_err(|e| {
+                tracing::error!("failed to open lockout state temp file: {}", e);
+                HsmError::GeneralError
+            })?;
+
+            // Belt-and-suspenders: on Unix this is a no-op if `mode(0o600)`
+            // already took effect; on Windows it is the only thing that sets
+            // a restrictive DACL. Failure here is fatal — we must not write
+            // potentially sensitive lockout state to a world-readable file.
+            if let Err(e) = set_restrictive_permissions(&tmp_path) {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(e);
+            }
+
+            use std::io::Write;
+            if let Err(e) = file.write_all(json.as_bytes()) {
+                tracing::error!("failed to write lockout state temp file: {}", e);
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(HsmError::GeneralError);
+            }
+            if let Err(e) = file.sync_all() {
+                tracing::error!("failed to fsync lockout state temp file: {}", e);
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(HsmError::GeneralError);
+            }
         }
+
         if let Err(e) = std::fs::rename(&tmp_path, &self.path) {
             tracing::error!("failed to rename lockout state file: {}", e);
             // Clean up temp file on failure
             let _ = std::fs::remove_file(&tmp_path);
+            return Err(HsmError::GeneralError);
         }
+
+        // Re-apply restrictive permissions on the final path. On Unix the
+        // rename preserves the source inode's mode (already 0o600). On
+        // Windows the new path may inherit DACLs from the parent directory,
+        // so we must set them explicitly. Fatal on failure.
+        set_restrictive_permissions(&self.path)?;
+
+        Ok(())
     }
 
     /// Remove the lockout state file (called during token re-initialization).
@@ -134,5 +185,34 @@ impl LockoutStore {
                 tracing::warn!("failed to remove lockout state file: {}", e);
             }
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// After `save()`, the lockout state file MUST have mode 0o600 (no group
+    /// or world bits). A world- or group-readable lockout file lets a local
+    /// attacker reset `user_pin_locked` and brute-force PINs — exactly the
+    /// regression this test guards against.
+    #[test]
+    fn save_writes_owner_only_permissions() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let store = LockoutStore::new(dir.path());
+        store
+            .save(&LockoutData::default())
+            .expect("save must succeed");
+
+        let meta = std::fs::metadata(dir.path().join("lockout_state.json"))
+            .expect("stat lockout file");
+        let mode = meta.permissions().mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "lockout file mode {:o} grants group/world access — must be 0o600",
+            mode & 0o777,
+        );
     }
 }

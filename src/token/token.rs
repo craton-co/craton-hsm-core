@@ -193,13 +193,24 @@ impl Token {
     fn persist_lockout(&self, auth: &AuthState) {
         if let Some(ref store) = self.lockout_store {
             use crate::store::lockout_store::LockoutData;
-            store.save(&LockoutData {
+            if let Err(e) = store.save(&LockoutData {
                 failed_user_logins: auth.failed_user_logins,
                 failed_so_logins: auth.failed_so_logins,
                 failed_init_token_logins: auth.failed_init_token_logins,
                 user_pin_locked: auth.user_pin_locked,
                 so_pin_locked: auth.so_pin_locked,
-            });
+            }) {
+                // Permission-set or I/O failure: log loudly. We do not bubble
+                // the error up to the PKCS#11 caller (keeping `persist_lockout`
+                // infallible matches the existing call-site contract), but
+                // operators MUST treat this as a security incident — without
+                // a persisted, locked-down lockout file, brute-force counters
+                // do not survive a restart.
+                tracing::error!(
+                    "lockout state save failed: {:?} — lockout counters will not survive restart",
+                    e,
+                );
+            }
         }
     }
 
