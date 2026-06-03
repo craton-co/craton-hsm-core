@@ -566,8 +566,21 @@ pub extern "C" fn C_InitToken(
         // Close all sessions for this slot first
         hsm.session_manager.close_all_sessions(slot_id, &token);
 
-        // Per PKCS#11 spec: C_InitToken destroys all objects on the token
-        hsm.object_store.clear();
+        // Per PKCS#11 spec: C_InitToken destroys all objects on the token.
+        // Rotate the in-memory persist key alongside the wipe so any
+        // residual ciphertext left in the redb data file becomes
+        // cryptographically inaccessible (FIPS 140-3 §7.7 logical
+        // zeroization of CSPs). A failure to rotate is logged but does
+        // not abort C_InitToken — the redb table has already been
+        // deleted, and refusing to proceed after a partial wipe would
+        // leave the caller unable to recover. The previous key remains
+        // active only in the failure path.
+        if let Err(e) = hsm.object_store.clear_and_rotate() {
+            tracing::error!(
+                "C_InitToken: persist key rotation failed after wipe: {:?}",
+                e
+            );
+        }
         // All keys are destroyed — safe to reset all GCM/IV counters
         crate::crypto::encrypt::force_reset_all_counters();
         // Flush parsed RSA key caches so a re-imported key with identical DER

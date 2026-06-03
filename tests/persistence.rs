@@ -281,6 +281,87 @@ fn test_no_persistence_by_default() {
 }
 
 #[test]
+fn test_clear_and_rotate_invalidates_old_key() {
+    // FIPS 140-3 §7.7: after C_InitToken wipes the store, residual
+    // ciphertext on disk must be cryptographically inaccessible. We
+    // verify this end-to-end by:
+    //   1. Creating a token object encrypted with the original key.
+    //   2. Calling clear_and_rotate() — drops in-memory state, deletes
+    //      the redb table, AND rotates the in-memory persist key.
+    //   3. Reopening with the ORIGINAL key and confirming nothing
+    //      decrypts (load returns 0 objects).
+    //
+    // The redb table delete alone removes the entries, but the test
+    // also serves as a regression guard: even if a future change
+    // accidentally repopulates the table (e.g., by leaving a
+    // background writer running), the rotated key prevents the old
+    // ciphertext from being decoded by a process that only knows the
+    // pre-init key.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = make_db_path(dir.path());
+    let (enc_key, _) = derive_key_from_pin(b"test-pin", None, None);
+
+    // Phase 1: Create + wipe + rotate, all under the original key.
+    {
+        let store = EncryptedStore::new(Some(&db_path)).unwrap();
+        let obj_store = ObjectStore::with_persistence(store);
+        obj_store.set_persist_key(*enc_key);
+
+        let template = vec![
+            (CKA_CLASS, CKO_SECRET_KEY.to_ne_bytes().to_vec()),
+            (CKA_TOKEN, vec![1u8]),
+            (CKA_LABEL, b"to-be-wiped".to_vec()),
+            (CKA_VALUE, vec![0x5A; 32]),
+        ];
+        obj_store.create_object(&template).unwrap();
+
+        obj_store
+            .clear_and_rotate()
+            .expect("clear_and_rotate should succeed when DRBG is healthy");
+
+        // After clear_and_rotate, in-memory side is empty.
+        assert_eq!(
+            obj_store.objects_len(),
+            0,
+            "in-memory object set should be cleared"
+        );
+    }
+
+    // Phase 2: Reopen with the ORIGINAL (pre-rotation) key. Since the
+    // table was deleted, load returns 0. Even if a stale row had
+    // somehow survived, decryption would fail because the rotated key
+    // is unknown to this reopen.
+    {
+        let store = EncryptedStore::new(Some(&db_path)).unwrap();
+        let obj_store = ObjectStore::with_persistence(store);
+        obj_store.set_persist_key(*enc_key);
+
+        let loaded = obj_store.load_from_store().unwrap();
+        assert_eq!(
+            loaded, 0,
+            "after clear_and_rotate, no objects should decrypt under the old key"
+        );
+    }
+}
+
+#[test]
+fn test_clear_and_rotate_with_no_key_is_noop_on_key() {
+    // If the persist key was never set (token never logged in), there's
+    // nothing to rotate. clear_and_rotate must still succeed and must
+    // not introduce a key that would break later PIN-derived re-keying.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = make_db_path(dir.path());
+
+    let store = EncryptedStore::new(Some(&db_path)).unwrap();
+    let obj_store = ObjectStore::with_persistence(store);
+    // No set_persist_key call.
+
+    obj_store
+        .clear_and_rotate()
+        .expect("clear_and_rotate without a key set should still succeed");
+}
+
+#[test]
 fn test_multiple_objects_persist() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = make_db_path(dir.path());

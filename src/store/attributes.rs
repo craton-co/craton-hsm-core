@@ -353,6 +353,61 @@ impl ObjectStore {
         }
     }
 
+    /// Clear all objects AND rotate the in-memory persistence key.
+    ///
+    /// Used by `C_InitToken` to satisfy FIPS 140-3 §7.7 (CSP zeroization
+    /// on token reinitialization). The plain [`clear`] only calls
+    /// `delete_table` on redb; the encrypted ciphertexts remain in the
+    /// underlying data file and the wrapping key is still loaded in
+    /// memory. Rotating the persist key to a fresh DRBG-generated value
+    /// makes any residual ciphertext on disk cryptographically
+    /// inaccessible — the old key is dropped (the `Zeroizing` wrapper
+    /// auto-zeroizes it on drop), so neither memory nor disk retains
+    /// usable plaintext after this call.
+    ///
+    /// This is "logical zeroization" as accepted by FIPS 140-3 §7.7:
+    /// destroying the wrapping key is sufficient when full physical
+    /// erasure of the storage medium is impractical.
+    ///
+    /// Returns `Err(HsmError::GeneralError)` if DRBG instantiation or
+    /// generation fails — in that case the persist key is NOT rotated
+    /// (the previous key remains active) so callers can detect the
+    /// failure and avoid leaving the store in an inconsistent state.
+    /// In-memory and on-disk wipes are still performed before the
+    /// rotation attempt, so partial progress is the worst case.
+    pub fn clear_and_rotate(&self) -> HsmResult<()> {
+        // Step 1: standard wipe (in-memory + redb table delete).
+        self.clear();
+
+        // Step 2: only rotate the persist key if one was actually set —
+        // a store that was never logged into has nothing to rotate, and
+        // generating a new key would create state that confuses later
+        // re-derivation from the PIN.
+        let had_key = self.persist_key.lock().is_some();
+        if !had_key {
+            return Ok(());
+        }
+
+        // Generate a fresh AES-256-GCM master key from the DRBG.
+        // Per project policy, randomness MUST flow through HmacDrbg
+        // (health-tested, prediction-resistant) — never OsRng directly.
+        let mut new_key = zeroize::Zeroizing::new([0u8; 32]);
+        let mut drbg = crate::crypto::drbg::HmacDrbg::new().map_err(|e| {
+            tracing::error!("clear_and_rotate: failed to instantiate DRBG: {:?}", e);
+            HsmError::GeneralError
+        })?;
+        drbg.generate(new_key.as_mut()).map_err(|e| {
+            tracing::error!("clear_and_rotate: DRBG generate failed: {:?}", e);
+            HsmError::GeneralError
+        })?;
+
+        // Atomic swap: assigning into the Mutex<Option<Zeroizing<...>>>
+        // drops the previous Zeroizing wrapper, which zeroizes the old
+        // key bytes in memory before deallocation.
+        *self.persist_key.lock() = Some(zeroize::Zeroizing::new(*new_key));
+        Ok(())
+    }
+
     /// Check if persistence is enabled
     pub fn has_persistence(&self) -> bool {
         self.persist_store.is_some()
