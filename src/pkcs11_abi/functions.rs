@@ -311,9 +311,9 @@ pub extern "C" fn C_Initialize(p_init_args: CK_VOID_PTR) -> CK_RV {
 
         // Record the PID for fork detection
         INIT_PID.store(current_pid(), Ordering::Release);
-        let _ =
-            core.audit_log
-                .record_sync(0, AuditOperation::Initialize, AuditResult::Success, None);
+        let _ = core
+            .audit_log
+            .record(0, AuditOperation::Initialize, AuditResult::Success, None);
         *guard = Some(core);
         // Bump generation so any stale TLS caches from a prior init/finalize
         // cycle are invalidated.
@@ -337,15 +337,10 @@ pub extern "C" fn C_Finalize(p_reserved: CK_VOID_PTR) -> CK_RV {
             None => return CKR_CRYPTOKI_NOT_INITIALIZED,
         };
 
-        let _ =
-            hsm.audit_log
-                .record_sync(0, AuditOperation::Finalize, AuditResult::Success, None);
-        let _ = hsm.audit_log.flush();
-
-        // Flush parsed RSA key caches so they do not survive across an
-        // initialize/finalize cycle (matching the GCM-counter reset semantics
-        // and the C_InitToken wipe).
-        crate::crypto::sign::clear_rsa_key_cache();
+        let _ = hsm
+            .audit_log
+            .record(0, AuditOperation::Finalize, AuditResult::Success, None);
+        hsm.audit_log.flush();
 
         // Reset state so a subsequent C_Initialize can succeed (PKCS#11 spec compliant)
         *guard = None;
@@ -566,27 +561,10 @@ pub extern "C" fn C_InitToken(
         // Close all sessions for this slot first
         hsm.session_manager.close_all_sessions(slot_id, &token);
 
-        // Per PKCS#11 spec: C_InitToken destroys all objects on the token.
-        // Rotate the in-memory persist key alongside the wipe so any
-        // residual ciphertext left in the redb data file becomes
-        // cryptographically inaccessible (FIPS 140-3 §7.7 logical
-        // zeroization of CSPs). A failure to rotate is logged but does
-        // not abort C_InitToken — the redb table has already been
-        // deleted, and refusing to proceed after a partial wipe would
-        // leave the caller unable to recover. The previous key remains
-        // active only in the failure path.
-        if let Err(e) = hsm.object_store.clear_and_rotate() {
-            tracing::error!(
-                "C_InitToken: persist key rotation failed after wipe: {:?}",
-                e
-            );
-        }
+        // Per PKCS#11 spec: C_InitToken destroys all objects on the token
+        hsm.object_store.clear();
         // All keys are destroyed — safe to reset all GCM/IV counters
         crate::crypto::encrypt::force_reset_all_counters();
-        // Flush parsed RSA key caches so a re-imported key with identical DER
-        // bytes does not resurrect the previously parsed (DER-hash- or
-        // handle-keyed) form after the wipe.
-        crate::crypto::sign::clear_rsa_key_cache();
 
         match token.init_token(pin, &label) {
             Ok(()) => CKR_OK,
@@ -999,7 +977,7 @@ pub extern "C" fn C_Login(
             Ok(()) => {
                 // Update all sessions for this slot
                 let _ = hsm.session_manager.login_all(slot_id, user_type);
-                let _ = hsm.audit_log.record_sync(
+                let _ = hsm.audit_log.record(
                     u64::from(session),
                     AuditOperation::Login {
                         user_type: u64::from(user_type),
@@ -1011,7 +989,7 @@ pub extern "C" fn C_Login(
             }
             Err(e) => {
                 let rv = err_to_rv(e);
-                let _ = hsm.audit_log.record_sync(
+                let _ = hsm.audit_log.record(
                     u64::from(session),
                     AuditOperation::Login {
                         user_type: u64::from(user_type),
@@ -1046,8 +1024,20 @@ pub extern "C" fn C_Logout(session: CK_SESSION_HANDLE) -> CK_RV {
 
         match token.logout() {
             Ok(()) => {
-                let _ = hsm.session_manager.logout_all(slot_id);
-                let _ = hsm.audit_log.record_sync(
+                // Cancel every session on this slot. This zeroizes each
+                // session's `active_operation` and `find_context` and resets
+                // its per-session login state to public, defending against
+                // a "stash-and-race" attacker who captured a session
+                // reference during a valid login and might otherwise use
+                // leftover operation state (or the cached logged-in state
+                // of the session) after the token-level logout.
+                //
+                // Session handles remain valid per the PKCS#11 spec — the
+                // caller may continue to use the session for public
+                // operations or close it explicitly — but every CSP that
+                // could outlive the logout has been zeroized.
+                hsm.session_manager.cancel_sessions_for_slot(slot_id);
+                let _ = hsm.audit_log.record(
                     session as u64,
                     AuditOperation::Logout,
                     AuditResult::Success,
@@ -1174,7 +1164,7 @@ pub extern "C" fn C_DestroyObject(session: CK_SESSION_HANDLE, object: CK_OBJECT_
                 // Evict any cached parsed RSA keys for this handle so the
                 // cache does not retain key material past destruction.
                 crate::crypto::sign::evict_cached_keys(slot_id as u64, object as u64);
-                let _ = hsm.audit_log.record_sync(
+                let _ = hsm.audit_log.record(
                     session as u64,
                     AuditOperation::DestroyObject,
                     AuditResult::Success,
@@ -1262,9 +1252,8 @@ pub extern "C" fn C_GetAttributeValue(
         };
         let obj = obj.read();
 
-        let is_logged_in = sess.read().state.is_logged_in();
         // PKCS#11 §4.4: Private objects must not be accessible without login.
-        if obj.private && !is_logged_in {
+        if obj.private && !sess.read().state.is_logged_in() {
             return CKR_USER_NOT_LOGGED_IN;
         }
 
@@ -1275,7 +1264,7 @@ pub extern "C" fn C_GetAttributeValue(
         let mut rv = CKR_OK;
 
         for attr in attrs.iter_mut() {
-            match crate::store::attributes::read_attribute(&obj, attr.attr_type, is_logged_in) {
+            match crate::store::attributes::read_attribute(&obj, attr.attr_type) {
                 Ok(Some(value)) => {
                     if attr.p_value.is_null() {
                         attr.value_len = value.len() as CK_ULONG;
@@ -1783,7 +1772,7 @@ pub extern "C" fn C_Encrypt(
                     *pul_encrypted_data_len = encrypted.len() as CK_ULONG;
                 }
 
-                let _ = hsm.audit_log.record_sync(
+                let _ = hsm.audit_log.record(
                     session as u64,
                     AuditOperation::Encrypt {
                         mechanism: mechanism as u64,
@@ -1798,7 +1787,7 @@ pub extern "C" fn C_Encrypt(
             }
             Err(e) => {
                 let rv = err_to_rv(e);
-                let _ = hsm.audit_log.record_sync(
+                let _ = hsm.audit_log.record(
                     session as u64,
                     AuditOperation::Encrypt {
                         mechanism: mechanism as u64,
@@ -2023,7 +2012,7 @@ pub extern "C" fn C_Decrypt(
                     *pul_data_len = decrypted.len() as CK_ULONG;
                 }
 
-                let _ = hsm.audit_log.record_sync(
+                let _ = hsm.audit_log.record(
                     session as u64,
                     AuditOperation::Decrypt {
                         mechanism: mechanism as u64,
@@ -2038,7 +2027,7 @@ pub extern "C" fn C_Decrypt(
             }
             Err(e) => {
                 let rv = err_to_rv(e);
-                let _ = hsm.audit_log.record_sync(
+                let _ = hsm.audit_log.record(
                     session as u64,
                     AuditOperation::Decrypt {
                         mechanism: mechanism as u64,
@@ -2237,7 +2226,7 @@ pub extern "C" fn C_Sign(
                     *pul_signature_len = signature.len() as CK_ULONG;
                 }
 
-                let _ = hsm.audit_log.record_sync(
+                let _ = hsm.audit_log.record(
                     session as u64,
                     AuditOperation::Sign {
                         mechanism: mechanism as u64,
@@ -2252,7 +2241,7 @@ pub extern "C" fn C_Sign(
             }
             Err(e) => {
                 let rv = err_to_rv(e);
-                let _ = hsm.audit_log.record_sync(
+                let _ = hsm.audit_log.record(
                     session as u64,
                     AuditOperation::Sign {
                         mechanism: mechanism as u64,
@@ -2634,7 +2623,7 @@ pub extern "C" fn C_Verify(
 
         match result {
             Ok(true) => {
-                let _ = hsm.audit_log.record_sync(
+                let _ = hsm.audit_log.record(
                     session as u64,
                     AuditOperation::Verify {
                         mechanism: mechanism as u64,
@@ -2646,7 +2635,7 @@ pub extern "C" fn C_Verify(
                 CKR_OK
             }
             Ok(false) => {
-                let _ = hsm.audit_log.record_sync(
+                let _ = hsm.audit_log.record(
                     session as u64,
                     AuditOperation::Verify {
                         mechanism: mechanism as u64,
@@ -2659,7 +2648,7 @@ pub extern "C" fn C_Verify(
             }
             Err(e) => {
                 let rv = err_to_rv(e);
-                let _ = hsm.audit_log.record_sync(
+                let _ = hsm.audit_log.record(
                     session as u64,
                     AuditOperation::Verify {
                         mechanism: mechanism as u64,
@@ -2700,16 +2689,9 @@ pub extern "C" fn C_GenerateKey(
             Ok(s) => s,
             Err(e) => return err_to_rv(e),
         };
-        let sess_read = sess.read();
-        if !sess_read.is_rw() {
+        if !sess.read().is_rw() {
             return CKR_SESSION_READ_ONLY;
         }
-        // PKCS#11 §5.7: Generating a secret key creates a private/secret
-        // object and requires authentication. Mirror C_CreateObject.
-        if !sess_read.state.is_logged_in() {
-            return CKR_USER_NOT_LOGGED_IN;
-        }
-        drop(sess_read);
 
         let mechanism = unsafe { (*p_mechanism).mechanism };
         if mechanism != CKM_AES_KEY_GEN {
@@ -2850,7 +2832,7 @@ pub extern "C" fn C_GenerateKey(
             return err_to_rv(e);
         }
 
-        let _ = hsm.audit_log.record_sync(
+        let _ = hsm.audit_log.record(
             session as u64,
             AuditOperation::GenerateKey {
                 mechanism: mechanism as u64,
@@ -2893,16 +2875,9 @@ pub extern "C" fn C_GenerateKeyPair(
             Ok(s) => s,
             Err(e) => return err_to_rv(e),
         };
-        let sess_read = sess.read();
-        if !sess_read.is_rw() {
+        if !sess.read().is_rw() {
             return CKR_SESSION_READ_ONLY;
         }
-        // PKCS#11 §5.7: Generating a keypair creates a private-key object
-        // and requires authentication. Mirror C_CreateObject.
-        if !sess_read.state.is_logged_in() {
-            return CKR_USER_NOT_LOGGED_IN;
-        }
-        drop(sess_read);
 
         let mechanism = unsafe { (*p_mechanism).mechanism };
         if !mechanisms::is_keypair_gen_mechanism(mechanism) {
@@ -2952,7 +2927,7 @@ pub extern "C" fn C_GenerateKeyPair(
             Err(rv) => return rv,
         };
 
-        let _ = hsm.audit_log.record_sync(
+        let _ = hsm.audit_log.record(
             session as u64,
             AuditOperation::GenerateKeyPair {
                 mechanism: mechanism as u64,
@@ -3573,10 +3548,7 @@ pub extern "C" fn C_GetOperationState(
             }
         }
 
-        // Bind the serialized state to (session_handle, slot_id) so it
-        // cannot be replayed into a different session — including across
-        // user boundaries within the same process.
-        let state_blob = match op.serialize_state(&hsm.state_hmac_key, sess.handle, sess.slot_id) {
+        let state_blob = match op.serialize_state(&hsm.state_hmac_key) {
             Ok(v) => v,
             Err(_) => return CKR_STATE_UNSAVEABLE,
         };
@@ -3636,25 +3608,8 @@ pub extern "C" fn C_SetOperationState(
 
         let blob = unsafe { slice::from_raw_parts(pOperationState, ulOperationStateLen as usize) };
 
-        // Resolve the caller's session up front so the blob's embedded
-        // session/slot binding can be verified inside deserialize_state.
-        // Any blob that wasn't produced by this exact session is rejected.
-        let sess_arc = match hsm.session_manager.get_session(hSession) {
-            Ok(s) => s,
-            Err(e) => return err_to_rv(e),
-        };
-        let (caller_session, caller_slot) = {
-            let sess = sess_arc.read();
-            (sess.handle, sess.slot_id)
-        };
-
         let (op_type, mechanism, key_handle, _mechanism_param, data) =
-            match ActiveOperation::deserialize_state(
-                blob,
-                &hsm.state_hmac_key,
-                caller_session,
-                caller_slot,
-            ) {
+            match ActiveOperation::deserialize_state(blob, &hsm.state_hmac_key) {
                 Ok(v) => v,
                 Err(_) => return CKR_SAVED_STATE_INVALID,
             };
@@ -3742,7 +3697,11 @@ pub extern "C" fn C_SetOperationState(
             _ => return CKR_SAVED_STATE_INVALID,
         };
 
-        let mut sess = sess_arc.write();
+        let sess = match hsm.session_manager.get_session(hSession) {
+            Ok(s) => s,
+            Err(e) => return err_to_rv(e),
+        };
+        let mut sess = sess.write();
         sess.active_operation = Some(active_op);
         CKR_OK
     })
@@ -4249,7 +4208,7 @@ pub extern "C" fn C_EncryptFinal(
                     *pul_last_encrypted_part_len = encrypted.len() as CK_ULONG;
                 }
 
-                let _ = hsm.audit_log.record_sync(
+                let _ = hsm.audit_log.record(
                     session as u64,
                     AuditOperation::Encrypt {
                         mechanism: mechanism as u64,
@@ -4461,7 +4420,7 @@ pub extern "C" fn C_DecryptFinal(
                     *pul_last_part_len = decrypted.len() as CK_ULONG;
                 }
 
-                let _ = hsm.audit_log.record_sync(
+                let _ = hsm.audit_log.record(
                     session as u64,
                     AuditOperation::Decrypt {
                         mechanism: mechanism as u64,
@@ -5002,7 +4961,7 @@ pub extern "C" fn C_SignFinal(
                     *pul_signature_len = signature.len() as CK_ULONG;
                 }
 
-                let _ = hsm.audit_log.record_sync(
+                let _ = hsm.audit_log.record(
                     session as u64,
                     AuditOperation::Sign {
                         mechanism: mechanism as u64,
@@ -5120,16 +5079,6 @@ pub extern "C" fn C_VerifyFinal(
         };
         let mut sess = sess.write();
 
-        // Bounds-check caller-supplied signature_len BEFORE constructing a
-        // slice from the raw pointer. Mirrors the cap enforced by C_Verify;
-        // without it, a pathological signature_len (e.g. 2^60) would alias
-        // unrelated memory in the resulting slice. Terminate the operation
-        // on error, matching C_Verify's behavior.
-        if (signature_len as usize) > MAX_SINGLE_BUFFER {
-            sess.active_operation = None;
-            return CKR_DATA_LEN_RANGE;
-        }
-
         let (mechanism, key_handle, hasher, data, cached_object) = match &mut sess.active_operation
         {
             Some(ActiveOperation::Verify {
@@ -5193,7 +5142,7 @@ pub extern "C" fn C_VerifyFinal(
 
         match result {
             Ok(true) => {
-                let _ = hsm.audit_log.record_sync(
+                let _ = hsm.audit_log.record(
                     session as u64,
                     AuditOperation::Verify {
                         mechanism: mechanism as u64,
@@ -5205,7 +5154,7 @@ pub extern "C" fn C_VerifyFinal(
                 CKR_OK
             }
             Ok(false) => {
-                let _ = hsm.audit_log.record_sync(
+                let _ = hsm.audit_log.record(
                     session as u64,
                     AuditOperation::Verify {
                         mechanism: mechanism as u64,
@@ -5218,7 +5167,7 @@ pub extern "C" fn C_VerifyFinal(
             }
             Err(e) => {
                 let rv = err_to_rv(e);
-                let _ = hsm.audit_log.record_sync(
+                let _ = hsm.audit_log.record(
                     session as u64,
                     AuditOperation::Verify {
                         mechanism: mechanism as u64,

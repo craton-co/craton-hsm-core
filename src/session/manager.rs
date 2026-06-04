@@ -188,6 +188,13 @@ impl SessionManager {
             let mut s = session.write();
             if s.slot_id == slot_id {
                 s.closed = true;
+                // Eagerly zeroize CSPs held in active operations rather than
+                // relying on Arc refcount reaching zero — another thread may
+                // still hold a clone (e.g. a stashed reference captured before
+                // C_CloseAllSessions). Mirrors close_session()'s zeroization
+                // behavior (FIPS 140-3 §7.7).
+                s.active_operation = None;
+                s.find_context = None;
                 // Best-effort: log decrement errors but continue closing
                 if let Err(e) = token.decrement_session_count(s.is_rw()) {
                     tracing::error!("close_all_sessions: decrement failed: {:?}", e);
@@ -331,6 +338,43 @@ impl SessionManager {
             }
         }
         Ok(())
+    }
+
+    /// Cancel all active operations on every session of a given slot.
+    ///
+    /// Unlike `logout_all` (which only transitions logged-in sessions back
+    /// to the public state and clears CSPs as a side effect of `on_logout`),
+    /// this method runs on *every* session regardless of its login state and
+    /// unconditionally:
+    ///   - Drops `active_operation` (zeroizes any held CSPs via `Zeroizing`).
+    ///   - Drops `find_context`.
+    ///   - Transitions any session still in a logged-in state back to public.
+    ///
+    /// Called from `C_Logout` to defend against a "stash-and-race" attack
+    /// where an attacker who captured a session reference during a valid
+    /// login tries to use leftover operation state (or the now-stale logged-
+    /// in state of the session itself) after the token-level logout. The
+    /// session **handle remains valid** per the PKCS#11 spec — callers can
+    /// keep using the session for public operations or close it explicitly —
+    /// but any cached operation context the attacker hoped to exploit is
+    /// gone, and the session's per-session login state has been reset.
+    pub fn cancel_sessions_for_slot(&self, slot_id: CK_SLOT_ID) {
+        for entry in self.sessions.iter() {
+            let session = entry.value();
+            let mut s = session.write();
+            if s.slot_id != slot_id {
+                continue;
+            }
+            // Zeroize CSPs unconditionally — even on sessions that were
+            // never logged in (they may still hold operation state from
+            // public-key operations).
+            s.active_operation = None;
+            s.find_context = None;
+            // Transition logged-in sessions back to public. `on_logout`
+            // returns Err for already-public sessions; that's expected
+            // and we ignore it.
+            let _ = s.on_logout();
+        }
     }
 
     /// Logout across all sessions for a given slot.

@@ -701,6 +701,22 @@ impl Token {
         Ok(())
     }
 
+    /// Log the user out of this token.
+    ///
+    /// Resets the login state to `Public` and clears the per-account failed-login
+    /// counters and rate-limit deadlines for both the user and SO accounts. A
+    /// successful logout means the caller was authenticated as one of those
+    /// roles, so the lockout-attempt slate for that role is cleared; the *other*
+    /// role's counters are also cleared because logout is a higher-trust event
+    /// than any single failed attempt and any remaining failures would only
+    /// rate-limit a legitimate operator.
+    ///
+    /// Note: this does *not* zeroize the active-operation state of open
+    /// sessions on the slot — `Token` has no back-reference to the
+    /// `SessionManager` and adding one would risk an `Arc` cycle. Callers
+    /// (the ABI layer's `C_Logout`) are responsible for invoking
+    /// `SessionManager::cancel_sessions_for_slot` after this returns so
+    /// CSPs cached in a stashed session reference cannot outlive the logout.
     pub fn logout(&self) -> HsmResult<()> {
         let mut auth = self.auth.lock();
         if auth.login == LoginState::Public {
@@ -708,6 +724,15 @@ impl Token {
         }
         tracing::info!("logout from {:?}", auth.login);
         auth.login = LoginState::Public;
+        // A successful logout means the caller was authenticated, so the
+        // failed-attempt slate is cleared for both roles. Persisting via
+        // LockoutStore so the reset survives a restart and an attacker cannot
+        // use a crash to revert the counters to a pre-logout state.
+        auth.failed_user_logins = 0;
+        auth.failed_so_logins = 0;
+        auth.user_next_allowed = None;
+        auth.so_next_allowed = None;
+        self.persist_lockout(&auth);
         Ok(())
     }
 

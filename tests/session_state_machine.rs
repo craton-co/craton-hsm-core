@@ -754,6 +754,187 @@ fn test_pin_lockout_counter_not_bypassed_by_concurrency() {
 }
 
 // ============================================================================
+// Token::logout: failure-counter reset and session cancellation
+//
+// Regression coverage for the security fix: a successful logout must reset the
+// failed-login counters (so brute-force progress doesn't leak across a normal
+// login boundary) and the ABI-layer C_Logout must cancel every session on the
+// slot (so an attacker holding a stashed handle cannot outlive the logout).
+// ============================================================================
+
+/// After failing the user PIN twice, a successful login followed by `logout`
+/// must zero the user failure counter. The next round of failed attempts
+/// starts fresh — proving the counter was reset, not merely paused.
+#[test]
+fn test_logout_resets_failed_user_counter() {
+    let token = Token::new();
+    token
+        .init_token(b"sopin123", &padded_label(b"LogoutR1"))
+        .unwrap();
+    token.login(CKU_SO, b"sopin123").unwrap();
+    token.init_pin(b"userpin1").unwrap();
+    token.logout().unwrap();
+
+    // Two failed attempts (well below max_failed_logins = 5)
+    for _ in 0..2 {
+        let _ = token.login(CKU_USER, b"wrongpin");
+    }
+    // Wait for backoff to expire (100ms * 2^1 = 200ms)
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    // Successful login + logout should clear the failure slate
+    token.login(CKU_USER, b"userpin1").unwrap();
+    token.logout().unwrap();
+
+    // Now we should be able to fail 4 more times without locking
+    // (would lock at 5 if the prior 2 had been retained).
+    for i in 0..4 {
+        let err = token.login(CKU_USER, b"wrongpin").unwrap_err();
+        assert!(
+            matches!(err, HsmError::PinIncorrect | HsmError::PinRateLimited),
+            "iter {i}: counter was not reset by logout, got {err:?}"
+        );
+    }
+    // Wait for backoff, then succeed — confirms account is *not* locked.
+    std::thread::sleep(std::time::Duration::from_secs(6));
+    token.login(CKU_USER, b"userpin1").unwrap();
+}
+
+/// Symmetric counter-reset check for the SO role: an SO logout must zero
+/// `failed_so_logins` too.
+#[test]
+fn test_logout_resets_failed_so_counter() {
+    let token = Token::new();
+    token
+        .init_token(b"sopin123", &padded_label(b"LogoutR2"))
+        .unwrap();
+
+    // Two failed SO attempts
+    for _ in 0..2 {
+        let _ = token.login(CKU_SO, b"wrongpin");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    // Correct login + logout
+    token.login(CKU_SO, b"sopin123").unwrap();
+    token.logout().unwrap();
+
+    // 4 more failures must NOT lock — confirms counter is at 0, not 2.
+    for _ in 0..4 {
+        let err = token.login(CKU_SO, b"wrongpin").unwrap_err();
+        assert!(matches!(
+            err,
+            HsmError::PinIncorrect | HsmError::PinRateLimited
+        ));
+    }
+    std::thread::sleep(std::time::Duration::from_secs(6));
+    // Account still unlocked after 4 post-reset failures.
+    token.login(CKU_SO, b"sopin123").unwrap();
+}
+
+/// Sessions opened during a valid login must have their per-session login
+/// state reset by `C_Logout` so a stashed reference cannot continue to act
+/// as authenticated. The session handle stays valid (PKCS#11 conformance —
+/// callers may keep using it for public operations) but its in-memory
+/// authenticated state is dropped. This is the "stash-and-race" defense.
+#[test]
+fn test_logout_cancels_session_login_state_on_slot() {
+    let mgr = SessionManager::new();
+    let token = Token::new();
+    token
+        .init_token(b"sopin123", &padded_label(b"LogoutSC"))
+        .unwrap();
+    token.login(CKU_SO, b"sopin123").unwrap();
+    token.init_pin(b"userpin1").unwrap();
+    token.logout().unwrap();
+    token.login(CKU_USER, b"userpin1").unwrap();
+
+    // Open two sessions while logged in — the "stashed handles".
+    let h_ro = mgr.open_session(0, CKF_SERIAL_SESSION, &token).unwrap();
+    let h_rw = mgr
+        .open_session(0, CKF_RW_SESSION | CKF_SERIAL_SESSION, &token)
+        .unwrap();
+    assert!(mgr.get_session(h_ro).unwrap().read().state.is_logged_in());
+    assert!(mgr.get_session(h_rw).unwrap().read().state.is_logged_in());
+
+    // Apply the C_Logout sequence: token.logout() + cancel_sessions_for_slot().
+    token.logout().unwrap();
+    mgr.cancel_sessions_for_slot(0);
+
+    // Handles remain valid (PKCS#11 spec) — but per-session login state is
+    // now public, so any operation that requires login will be rejected.
+    let s_ro = mgr.get_session(h_ro).expect("RO handle still valid after logout");
+    assert!(
+        !s_ro.read().state.is_logged_in(),
+        "RO session must be in public state after logout-cancel"
+    );
+    let s_rw = mgr.get_session(h_rw).expect("RW handle still valid after logout");
+    assert!(
+        !s_rw.read().state.is_logged_in(),
+        "RW session must be in public state after logout-cancel"
+    );
+}
+
+/// After logout-with-cancel, the per-session zeroization path must have run:
+/// `active_operation` and `find_context` must be `None` on every session on
+/// the slot — even on a session that was already in the public state when
+/// `C_Logout` was issued (defense in depth: nothing held on the slot may
+/// survive a successful logout). The handle remains valid per spec.
+#[test]
+fn test_logout_zeroizes_active_operation_on_open_session() {
+    use craton_hsm::session::session::ActiveOperation;
+
+    let mgr = SessionManager::new();
+    let token = Token::new();
+    token
+        .init_token(b"sopin123", &padded_label(b"LogoutZ"))
+        .unwrap();
+    token.login(CKU_SO, b"sopin123").unwrap();
+    token.init_pin(b"userpin1").unwrap();
+    token.logout().unwrap();
+    token.login(CKU_USER, b"userpin1").unwrap();
+
+    let h = mgr
+        .open_session(0, CKF_RW_SESSION | CKF_SERIAL_SESSION, &token)
+        .unwrap();
+
+    // Plant an active operation carrying CSP-like material.
+    {
+        let session_arc = mgr.get_session(h).unwrap();
+        let mut s = session_arc.write();
+        s.active_operation = Some(ActiveOperation::Digest {
+            mechanism: CKM_SHA256,
+            hasher: None,
+            accumulated_input: zeroize::Zeroizing::new(vec![0xAA; 64]),
+        });
+        s.find_context = Some(craton_hsm::session::session::FindContext {
+            results: vec![1, 2, 3],
+            position: 0,
+        });
+    }
+
+    // Run the C_Logout sequence.
+    token.logout().unwrap();
+    mgr.cancel_sessions_for_slot(0);
+
+    // Handle is still valid, but per-session state is fully scrubbed.
+    let session_arc = mgr.get_session(h).expect("handle should remain valid");
+    let s = session_arc.read();
+    assert!(
+        s.active_operation.is_none(),
+        "active_operation must be zeroized/cleared after logout-cancel"
+    );
+    assert!(
+        s.find_context.is_none(),
+        "find_context must be cleared after logout-cancel"
+    );
+    assert!(
+        !s.state.is_logged_in(),
+        "session login state must be reset to public after logout-cancel"
+    );
+}
+
+// ============================================================================
 // Helper
 // ============================================================================
 
