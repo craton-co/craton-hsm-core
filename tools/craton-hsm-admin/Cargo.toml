@@ -17,3 +17,6 @@ serde_json = "1"
 comfy-table = "7"
 rpassword = "7"
 zeroize = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
