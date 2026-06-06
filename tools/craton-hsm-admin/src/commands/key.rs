@@ -4,8 +4,10 @@ use crate::output;
 use craton_hsm::config::config::HsmConfig;
 use craton_hsm::core::HsmCore;
 use craton_hsm::pkcs11_abi::constants::*;
-use craton_hsm::pkcs11_abi::types::{CK_ATTRIBUTE_TYPE, CK_OBJECT_HANDLE};
-use zeroize::Zeroizing;
+use craton_hsm::pkcs11_abi::types::{CK_ATTRIBUTE_TYPE, CK_OBJECT_HANDLE, CK_ULONG};
+use zeroize::{Zeroize, Zeroizing};
+
+use super::import_parse::ParsedKey;
 
 type CliResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -154,52 +156,154 @@ pub fn list(config_path: &str, json: bool) -> CliResult {
     Ok(())
 }
 
-/// Import a key from file (PEM or DER).
-pub fn import(config_path: &str, file: &str, label: &str, key_type: &str) -> CliResult {
-    let config = load_config(config_path)?;
-    let hsm = HsmCore::new(&config);
+/// Encode a `CK_ULONG`-typed attribute value the way the lib expects.
+/// The store uses `from_ne_bytes::<CK_ULONG>` when reading these attrs, so
+/// we MUST emit native-endian bytes sized to the platform's `c_ulong`.
+fn ck_ulong_bytes(val: CK_ULONG) -> Vec<u8> {
+    val.to_ne_bytes().to_vec()
+}
 
-    // Require authentication before importing keys
-    authenticate_user(&hsm)?;
+/// Import a key from a PEM or DER file.
+///
+/// Parses the input first (PKCS#8, PKCS#1, SPKI, SEC1) so the import emits
+/// the correct PKCS#11 attribute template for the key form. The object class
+/// is inferred from the parsed structure: `--class`, when supplied, only
+/// confirms that inference and triggers a clear error on mismatch — it never
+/// overrides the parser. For AES, `--class` is ignored (always secret key).
+pub fn import(
+    config_path: &str,
+    file: &str,
+    label: &str,
+    key_type: &str,
+    class: Option<&str>,
+    yes: bool,
+) -> CliResult {
+    let upper_type = key_type.to_uppercase();
 
-    // Wrap key data in Zeroizing so it is scrubbed from memory after use.
-    // Without this, the raw key bytes from std::fs::read persist in freed
-    // heap memory until the allocator reuses the pages.
+    // Wrap raw file bytes in Zeroizing — without it the bytes (and any
+    // intermediate copies) persist in freed heap until the allocator reuses
+    // the pages.
     let key_data = Zeroizing::new(std::fs::read(file).map_err(|_| "Failed to read key file.")?);
 
-    // Determine CKA_KEY_TYPE and CKA_CLASS based on --type argument
-    let (ck_key_type, ck_class) = match key_type.to_uppercase().as_str() {
-        "RSA" => (CKK_RSA, CKO_PRIVATE_KEY),
-        "EC" => (CKK_EC, CKO_PRIVATE_KEY),
-        "AES" => (CKK_AES, CKO_SECRET_KEY),
+    // Parse the input and build the attribute template. AES is special-cased:
+    // there is no standard PEM/DER container for raw AES key bytes, so we
+    // keep the historical "file contents are the key bytes" behaviour for
+    // it but enforce CKO_SECRET_KEY.
+    let (mut template, display): (Vec<(CK_ATTRIBUTE_TYPE, Vec<u8>)>, String) = match upper_type
+        .as_str()
+    {
+        "AES" => {
+            if class.is_some_and(|c| !c.eq_ignore_ascii_case("secret")) {
+                return Err(format!(
+                    "AES keys are always class=secret; got --class {}",
+                    class.unwrap()
+                )
+                .into());
+            }
+            // Defense-in-depth: refuse obviously-wrong AES key sizes.
+            // PKCS#11 requires CKA_VALUE_LEN in bytes for secret keys.
+            let len = key_data.len();
+            if !matches!(len, 16 | 24 | 32) {
+                return Err(format!(
+                    "AES key file must contain 16, 24, or 32 raw bytes; got {}",
+                    len
+                )
+                .into());
+            }
+            let mut tpl: Vec<(CK_ATTRIBUTE_TYPE, Vec<u8>)> = vec![
+                (CKA_CLASS, ck_ulong_bytes(CKO_SECRET_KEY)),
+                (CKA_KEY_TYPE, ck_ulong_bytes(CKK_AES)),
+                (CKA_LABEL, label.as_bytes().to_vec()),
+                (CKA_TOKEN, vec![1u8]),
+                (CKA_PRIVATE, vec![1u8]),
+                (CKA_SENSITIVE, vec![1u8]),
+                (CKA_VALUE_LEN, ck_ulong_bytes(len as CK_ULONG)),
+                (CKA_VALUE, key_data.as_slice().to_vec()),
+            ];
+            // Sanity: nothing in `tpl` should outlive the function. The
+            // outer for-loop at the end will zeroize each value buffer.
+            let _ = &mut tpl;
+            (tpl, format!("AES (secret, {} bits)", len * 8))
+        }
+        "RSA" | "EC" => {
+            // Parse — fails fast on garbage input rather than silently
+            // creating an unusable HSM object.
+            let parsed = ParsedKey::from_bytes(&key_data).map_err(|e| {
+                format!(
+                    "Failed to parse key file as PEM/DER: {}. \
+                     Supported: PKCS#8 PRIVATE KEY, SPKI PUBLIC KEY, \
+                     PKCS#1 RSA PRIVATE/PUBLIC KEY, SEC1 EC PRIVATE KEY.",
+                    e
+                )
+            })?;
+
+            // Enforce --type matches the parsed structure.
+            let parsed_type = parsed.key_type_name();
+            if parsed_type != upper_type {
+                return Err(format!(
+                    "--type {} does not match parsed key (got {}). Refusing to import.",
+                    upper_type, parsed_type
+                )
+                .into());
+            }
+
+            // Infer class from structure; reject if --class disagrees.
+            // The parser is authoritative; --class is merely a confirmation.
+            parsed
+                .confirm_class(class)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+
+            let display = parsed.display_summary();
+            let template = parsed.into_template(label);
+            (template, display)
+        }
         other => {
             return Err(format!("Unsupported key type: '{}'. Use RSA, EC, or AES", other).into())
         }
     };
 
-    // Build attribute template.
-    // SECURITY: key_data.to_vec() creates an unprotected copy of the raw key bytes.
-    // We must explicitly zeroize the template after create_object consumes it.
-    let mut template: Vec<(CK_ATTRIBUTE_TYPE, Vec<u8>)> = vec![
-        (CKA_CLASS, (ck_class as u64).to_le_bytes().to_vec()),
-        (CKA_KEY_TYPE, (ck_key_type as u64).to_le_bytes().to_vec()),
-        (CKA_LABEL, label.as_bytes().to_vec()),
-        (CKA_TOKEN, vec![1u8]), // token object
-        (CKA_PRIVATE, vec![1u8]),
-        (CKA_SENSITIVE, vec![1u8]),
-        (CKA_VALUE, key_data.to_vec()),
-    ];
-    // key_data (Zeroizing<Vec<u8>>) is dropped here, scrubbing the file contents.
+    // Show what we're about to import and require explicit confirmation
+    // (or --yes). Importing a private key is irreversible and visible to
+    // everyone with token access, so we make the user agree to the parsed
+    // identity, not just the on-disk file name.
+    eprintln!("About to import key:");
+    eprintln!("  File:   {}", file);
+    eprintln!("  Label:  {}", label);
+    eprintln!("  {}", display);
+    if !yes {
+        eprint!("Proceed with import? [y/N] ");
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if !input.trim().eq_ignore_ascii_case("y") {
+            // Zero out the staged template before we bail.
+            for (_attr, ref mut value) in &mut template {
+                value.zeroize();
+            }
+            return Err("Import cancelled.".into());
+        }
+    }
+
+    // Now authenticate. We deliberately parse and confirm BEFORE prompting
+    // for the PIN — there is no reason to harvest a PIN when we already
+    // know the input is bogus or the user changed their mind.
+    let config = load_config(config_path)?;
+    let hsm = HsmCore::new(&config);
+    if let Err(e) = authenticate_user(&hsm) {
+        for (_attr, ref mut value) in &mut template {
+            value.zeroize();
+        }
+        return Err(e);
+    }
 
     let handle = hsm
         .object_store()
         .create_object(&template)
         .map_err(|e| format!("Failed to import key: {:?}", e));
 
-    // Zeroize all template value buffers — especially CKA_VALUE which contains
-    // the raw key material that was copied out of the Zeroizing wrapper.
+    // Zero all template value buffers — especially CKA_VALUE / CKA_PRIVATE_EXPONENT
+    // / CKA_PRIME_* which contain unprotected copies of the secret material.
     for (_attr, ref mut value) in &mut template {
-        zeroize::Zeroize::zeroize(value.as_mut_slice());
+        value.zeroize();
     }
     drop(template);
 
@@ -208,7 +312,7 @@ pub fn import(config_path: &str, file: &str, label: &str, key_type: &str) -> Cli
     println!("Key imported successfully.");
     println!("  Handle: {}", handle);
     println!("  Label:  {}", label);
-    println!("  Type:   {}", key_type.to_uppercase());
+    println!("  {}", display);
 
     logout(&hsm);
     Ok(())

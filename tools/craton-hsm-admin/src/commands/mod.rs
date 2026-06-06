@@ -2,6 +2,7 @@
 // Copyright 2026 Craton Software Company
 pub mod audit;
 pub mod backup;
+pub mod import_parse;
 pub mod key;
 pub mod pin;
 pub mod token;

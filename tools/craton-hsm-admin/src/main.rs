@@ -85,6 +85,17 @@ enum KeyAction {
         /// Key type (RSA, EC, AES)
         #[arg(long, name = "type")]
         key_type: String,
+        /// Object class: public, private, or secret.
+        ///
+        /// Optional — when omitted, the class is inferred from the parsed
+        /// input (PKCS#8 -> private, SPKI -> public). When supplied, the
+        /// inferred class MUST match or the import is rejected. AES is
+        /// always a secret key and `--class` is ignored for it.
+        #[arg(long)]
+        class: Option<String>,
+        /// Skip the interactive confirmation prompt
+        #[arg(long, default_value_t = false)]
+        yes: bool,
     },
     /// Delete a key
     Delete {
@@ -141,7 +152,16 @@ fn main() {
                 file,
                 label,
                 key_type,
-            } => commands::key::import(&cli.config, &file, &label, &key_type),
+                class,
+                yes,
+            } => commands::key::import(
+                &cli.config,
+                &file,
+                &label,
+                &key_type,
+                class.as_deref(),
+                yes,
+            ),
             KeyAction::Delete { handle, force } => {
                 commands::key::delete(&cli.config, handle, force)
             }
