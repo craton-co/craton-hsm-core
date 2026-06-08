@@ -31,6 +31,21 @@ pub struct DaemonConfig {
     /// Default: false (TLS is mandatory).
     #[serde(default)]
     pub allow_insecure: bool,
+    /// Allow TLS without client certificate authentication (no mTLS).
+    /// When `false` (the default), the daemon refuses to start unless
+    /// `tls_client_ca` is configured.
+    ///
+    /// This flag exists only to support gradual rollout of mTLS in
+    /// environments that cannot yet provision client certificates.
+    /// Setting it to `true` degrades the login-throttle key from
+    /// `(slot_id, client_cert_thumbprint)` to `(slot_id, peer_ip)`,
+    /// which is materially weaker — any source that can reach the
+    /// daemon over TLS can attempt logins against any slot, and the
+    /// only attribution available for audit is the source IP.
+    ///
+    /// Default: `false` (mTLS is mandatory).
+    #[serde(default)]
+    pub allow_unauthenticated_tls: bool,
     /// Maximum failed login attempts before the daemon imposes a cooldown.
     /// Default: 5. Set to 0 to disable daemon-level lockout (relies on token).
     ///
@@ -133,6 +148,7 @@ impl Default for DaemonConfig {
             max_random_length: default_max_random_length(),
             max_digest_length: default_max_digest_length(),
             allow_insecure: false,
+            allow_unauthenticated_tls: false,
             max_login_attempts: default_max_login_attempts(),
             login_cooldown_secs: default_login_cooldown_secs(),
             max_connections: default_max_connections(),

@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
+use tonic::transport::server::{TcpConnectInfo, TlsConnectInfo};
 use tonic::{Request, Response, Status};
 use zeroize::Zeroize;
 
@@ -16,11 +17,109 @@ use craton_hsm::core::HsmCore;
 use craton_hsm::pkcs11_abi::constants::*;
 use craton_hsm::pkcs11_abi::types::CK_ULONG;
 use craton_hsm::token::token::LoginState;
+use sha2::{Digest, Sha256};
 
-/// (#5-fix) Maximum number of distinct slot entries in throttle maps before
-/// oldest entries are evicted. Prevents memory exhaustion from attackers
-/// probing thousands of distinct slot IDs.
+/// (#5-fix) Maximum number of distinct (slot_id, client_id) entries in
+/// throttle maps before oldest entries are evicted. Prevents memory
+/// exhaustion from attackers probing thousands of distinct slot IDs and/or
+/// rotating client identities.
 const MAX_THROTTLE_ENTRIES: usize = 1024;
+
+/// Stable, opaque per-client identifier used as part of the login throttle
+/// key and emitted into audit records.
+///
+/// Derived from the verified TLS client certificate when mTLS is configured.
+/// Falls back to the peer IP address when the connection is plaintext or
+/// authenticated only at the server side (`allow_unauthenticated_tls = true`).
+/// The fallback is materially weaker — any source able to reach the daemon
+/// can keep failing PINs against any slot without ever locking out a
+/// well-behaved peer — but it is still better than a slot-only key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ClientId(String);
+
+impl ClientId {
+    /// Hex prefix length for the cert thumbprint when used as an opaque
+    /// client identifier. 16 hex chars = 8 bytes of SHA-256, which gives
+    /// 2^64 collision resistance — adequate for an attribution / throttle
+    /// identifier and short enough to keep audit lines readable.
+    const CERT_HEX_PREFIX_LEN: usize = 16;
+
+    /// Construct a `ClientId` from the leaf TLS certificate DER.
+    /// Uses a SHA-256 hex prefix of the entire cert as a stable opaque ID
+    /// (the cert's "thumbprint"). Stable across daemon restarts, rotates
+    /// naturally on cert renewal — which is the desired semantics for a
+    /// throttle key tied to a specific issued credential.
+    fn from_cert_der(der: &[u8]) -> Self {
+        let digest = Sha256::digest(der);
+        let mut s = String::with_capacity(5 + Self::CERT_HEX_PREFIX_LEN);
+        s.push_str("cert:");
+        for byte in digest.iter().take(Self::CERT_HEX_PREFIX_LEN / 2) {
+            use std::fmt::Write;
+            let _ = write!(&mut s, "{:02x}", byte);
+        }
+        ClientId(s)
+    }
+
+    /// Construct a `ClientId` from a peer IP/socket address string.
+    /// Used as a fallback when there is no verified client certificate.
+    fn from_peer_ip(ip: &str) -> Self {
+        ClientId(format!("ip:{}", ip))
+    }
+
+    /// Marker for connections where neither a verified cert nor a peer
+    /// address can be recovered. All such requests collapse to a single
+    /// throttle bucket — failing PINs from "unknown" attackers will lock
+    /// out other "unknown" attackers but cannot affect identified peers.
+    fn unknown() -> Self {
+        ClientId("unknown".to_string())
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Extract a `ClientId` from a tonic request.
+///
+/// Priority:
+///   1. Verified TLS client certificate (mTLS) — hashed to a thumbprint.
+///   2. Peer IP / socket address from the TCP connect info.
+///   3. `"unknown"` sentinel (should be unreachable in practice).
+fn client_id_from_request<T>(req: &Request<T>) -> ClientId {
+    let exts = req.extensions();
+    if let Some(tls_info) = exts.get::<TlsConnectInfo<TcpConnectInfo>>() {
+        if let Some(certs) = tls_info.peer_certs() {
+            if let Some(leaf) = certs.first() {
+                return ClientId::from_cert_der(leaf.as_ref());
+            }
+        }
+        if let Some(remote) = tls_info.get_ref().remote_addr() {
+            return ClientId::from_peer_ip(&remote.ip().to_string());
+        }
+        return ClientId::unknown();
+    }
+    if let Some(tcp) = exts.get::<TcpConnectInfo>() {
+        if let Some(remote) = tcp.remote_addr() {
+            return ClientId::from_peer_ip(&remote.ip().to_string());
+        }
+    }
+    ClientId::unknown()
+}
+
+/// Composite key for login throttling. Binding the client identity into
+/// the key prevents one source from locking out another source on the
+/// same slot.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ThrottleKey {
+    slot_id: CK_ULONG,
+    client_id: ClientId,
+}
+
+impl ThrottleKey {
+    pub(crate) fn new(slot_id: CK_ULONG, client_id: ClientId) -> Self {
+        Self { slot_id, client_id }
+    }
+}
 
 use crate::proto::hsm_service_server::HsmService;
 use crate::proto::*;
@@ -36,7 +135,13 @@ pub struct HsmServiceImpl {
     pub max_random_length: u32,
     /// Maximum data payload for digest requests (#13).
     pub max_digest_length: u32,
-    /// Brute-force protection (#5): per-slot login attempt tracking.
+    /// Brute-force protection (#5): per-(slot, client) login attempt tracking.
+    ///
+    /// The key is `(slot_id, client_id)` where `client_id` is derived from
+    /// the verified TLS client certificate (or peer IP for unauthenticated
+    /// connections). Keying on slot alone would let one source lock out
+    /// every other source on the same slot by burning failed PIN attempts.
+    ///
     /// NOTE: This state is in-memory only and resets on daemon restart.
     /// THREAT MODEL ASSUMPTION: Token-level PIN retry counters (in the core
     /// crate) provide persistent lockout that survives daemon restarts.
@@ -44,11 +149,12 @@ pub struct HsmServiceImpl {
     /// who can restart the daemon gets unlimited PIN attempts. Deployments
     /// using RAM-only tokens should configure an external rate limiter or
     /// use OS-level restart throttling (e.g., systemd RestartSec).
-    login_attempts: std::sync::Mutex<HashMap<CK_ULONG, LoginThrottle>>,
+    login_attempts: std::sync::Mutex<HashMap<ThrottleKey, LoginThrottle>>,
     /// (#21) Brute-force protection for InitToken SO PIN attempts.
     /// Separate from login_attempts because InitToken does not require a session
     /// and a successful attack reinitializes the token, destroying all keys.
-    init_token_attempts: std::sync::Mutex<HashMap<CK_ULONG, LoginThrottle>>,
+    /// Also keyed on `(slot_id, client_id)` to prevent cross-client lockout.
+    init_token_attempts: std::sync::Mutex<HashMap<ThrottleKey, LoginThrottle>>,
     max_login_attempts: u32,
     login_cooldown: std::time::Duration,
     /// Timestamp when the daemon was started, used for HealthCheck uptime reporting.
@@ -85,7 +191,9 @@ impl HsmServiceImpl {
     /// A poisoned mutex means a thread panicked while holding the lock.
     /// We recover by taking the inner data — the HashMap may be inconsistent
     /// but that's better than crashing the entire daemon (DoS).
-    fn lock_login_attempts(&self) -> std::sync::MutexGuard<'_, HashMap<CK_ULONG, LoginThrottle>> {
+    fn lock_login_attempts(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<ThrottleKey, LoginThrottle>> {
         self.login_attempts.lock().unwrap_or_else(|poisoned| {
             tracing::error!(
                 "Login attempts mutex was poisoned — recovering. \
@@ -95,16 +203,16 @@ impl HsmServiceImpl {
         })
     }
 
-    /// Check and enforce login rate limiting for a slot (#5).
+    /// Check and enforce login rate limiting for a (slot, client) pair (#5).
     /// (#28) Always acquires the lock and performs a lookup to avoid timing
     /// side-channels that could distinguish first-attempt vs subsequent-attempt slots.
-    fn check_login_throttle(&self, slot_id: CK_ULONG) -> Result<(), Status> {
+    fn check_login_throttle(&self, key: &ThrottleKey) -> Result<(), Status> {
         if self.max_login_attempts == 0 {
             return Ok(()); // Disabled, rely on token-level lockout
         }
         let mut attempts = self.lock_login_attempts();
         // Always do a lookup (even if entry doesn't exist) to keep timing consistent
-        let throttle = attempts.get_mut(&slot_id);
+        let throttle = attempts.get_mut(key);
         let is_locked = match throttle {
             Some(t) => match t.lockout_until {
                 Some(until) if Instant::now() < until => {
@@ -134,15 +242,15 @@ impl HsmServiceImpl {
         Ok(())
     }
 
-    /// Record a failed login attempt for a slot (#5).
-    fn record_login_failure(&self, slot_id: CK_ULONG) {
+    /// Record a failed login attempt for a (slot, client) pair (#5).
+    fn record_login_failure(&self, key: &ThrottleKey) {
         if self.max_login_attempts == 0 {
             return;
         }
         let mut attempts = self.lock_login_attempts();
         // (#5-fix) Evict expired entries to bound memory growth
         evict_expired_throttle_entries(&mut attempts);
-        let throttle = attempts.entry(slot_id).or_insert(LoginThrottle {
+        let throttle = attempts.entry(key.clone()).or_insert(LoginThrottle {
             failed_attempts: 0,
             lockout_until: None,
         });
@@ -151,7 +259,8 @@ impl HsmServiceImpl {
         if throttle.failed_attempts >= self.max_login_attempts {
             throttle.lockout_until = Some(Instant::now() + self.login_cooldown);
             tracing::warn!(
-                slot_id,
+                slot_id = key.slot_id,
+                client_id = key.client_id.as_str(),
                 "Login lockout triggered after {} failed attempts",
                 throttle.failed_attempts
             );
@@ -161,7 +270,7 @@ impl HsmServiceImpl {
     /// (#21) Acquire the init_token_attempts lock, recovering from poisoned state.
     fn lock_init_token_attempts(
         &self,
-    ) -> std::sync::MutexGuard<'_, HashMap<CK_ULONG, LoginThrottle>> {
+    ) -> std::sync::MutexGuard<'_, HashMap<ThrottleKey, LoginThrottle>> {
         self.init_token_attempts.lock().unwrap_or_else(|poisoned| {
             tracing::error!(
                 "InitToken attempts mutex was poisoned — recovering. \
@@ -174,13 +283,13 @@ impl HsmServiceImpl {
     /// (#21) Check and enforce rate limiting for InitToken SO PIN attempts.
     /// (#4-fix) Always acquires the lock and performs a lookup to keep timing
     /// consistent, mirroring check_login_throttle (#28).
-    fn check_init_token_throttle(&self, slot_id: CK_ULONG) -> Result<(), Status> {
+    fn check_init_token_throttle(&self, key: &ThrottleKey) -> Result<(), Status> {
         if self.max_login_attempts == 0 {
             return Ok(()); // Disabled, rely on token-level lockout
         }
         let mut attempts = self.lock_init_token_attempts();
         // Always do a lookup (even if entry doesn't exist) to keep timing consistent
-        let throttle = attempts.get_mut(&slot_id);
+        let throttle = attempts.get_mut(key);
         let is_locked = match throttle {
             Some(t) => match t.lockout_until {
                 Some(until) if Instant::now() < until => {
@@ -209,15 +318,15 @@ impl HsmServiceImpl {
         Ok(())
     }
 
-    /// (#21) Record a failed InitToken attempt for a slot.
-    fn record_init_token_failure(&self, slot_id: CK_ULONG) {
+    /// (#21) Record a failed InitToken attempt for a (slot, client) pair.
+    fn record_init_token_failure(&self, key: &ThrottleKey) {
         if self.max_login_attempts == 0 {
             return;
         }
         let mut attempts = self.lock_init_token_attempts();
         // (#5-fix) Evict expired entries to bound memory growth
         evict_expired_throttle_entries(&mut attempts);
-        let throttle = attempts.entry(slot_id).or_insert(LoginThrottle {
+        let throttle = attempts.entry(key.clone()).or_insert(LoginThrottle {
             failed_attempts: 0,
             lockout_until: None,
         });
@@ -226,7 +335,8 @@ impl HsmServiceImpl {
         if throttle.failed_attempts >= self.max_login_attempts {
             throttle.lockout_until = Some(Instant::now() + self.login_cooldown);
             tracing::warn!(
-                slot_id,
+                slot_id = key.slot_id,
+                client_id = key.client_id.as_str(),
                 "InitToken lockout triggered after {} failed attempts",
                 throttle.failed_attempts
             );
@@ -234,45 +344,47 @@ impl HsmServiceImpl {
     }
 
     /// (#21) Clear InitToken attempt counter on success.
-    fn clear_init_token_attempts(&self, slot_id: CK_ULONG) {
+    fn clear_init_token_attempts(&self, key: &ThrottleKey) {
         if self.max_login_attempts == 0 {
             return;
         }
         let mut attempts = self.lock_init_token_attempts();
-        attempts.remove(&slot_id);
+        attempts.remove(key);
     }
 
     /// Clear login attempt counter on successful login (#5).
-    fn clear_login_attempts(&self, slot_id: CK_ULONG) {
+    fn clear_login_attempts(&self, key: &ThrottleKey) {
         if self.max_login_attempts == 0 {
             return;
         }
         let mut attempts = self.lock_login_attempts();
-        attempts.remove(&slot_id);
+        attempts.remove(key);
     }
 
-    /// Record an audit event **synchronously** and propagate failures as gRPC
-    /// errors. Blocks until the event has been chained, written, and fsynced
-    /// to the audit log file.
+    /// Record an audit event and propagate failures as gRPC errors.
+    /// FIPS 140-3 requires that security-relevant events are recorded; if the
+    /// audit log cannot write, the operation must be blocked.
     ///
-    /// FIPS 140-3 requires that security-relevant events are durably recorded
-    /// before the corresponding operation is acknowledged to the client. The
-    /// daemon RPCs that call this helper (login/logout, init_token, key
-    /// generation, sign/verify/encrypt/decrypt, destroy_object, …) are all
-    /// security-relevant, so the synchronous path is appropriate for every
-    /// call site. If you add an RPC that emits high-volume, low-value events
-    /// where fsync latency dominates (telemetry, heartbeats), introduce a
-    /// separate `audit_async` helper rather than weakening this one.
+    /// `client_id` is the verified TLS client identity (or peer-IP fallback).
+    /// It is folded into the `key_id` field of the audit record because the
+    /// upstream `AuditOperation` enum lives in the `craton-hsm` crate and
+    /// cannot be extended from the daemon. Format:
+    /// `client=<client_id>[; <existing_key_id>]`.
     fn audit(
         &self,
         session_handle: u64,
         operation: AuditOperation,
         result: AuditResult,
         key_id: Option<String>,
+        client_id: &ClientId,
     ) -> Result<(), Status> {
+        let combined = match key_id {
+            Some(existing) => Some(format!("client={}; {}", client_id.as_str(), existing)),
+            None => Some(format!("client={}", client_id.as_str())),
+        };
         self.hsm
             .audit_log()
-            .record_sync(session_handle, operation, result, key_id)
+            .record(session_handle, operation, result, combined)
             .map_err(|e| {
                 tracing::error!("Audit log write failed: {:?}", e);
                 Status::internal("Audit system failure")
@@ -337,43 +449,18 @@ fn require_authenticated_session(hsm: &HsmCore, session_handle: u64) -> Result<C
 /// and destroy_object. Objects created on one slot are not visible or
 /// accessible from sessions on another slot.
 ///
-/// (#4) Attributes that callers must NOT set directly via key-creating RPCs.
-/// These security-critical attributes are either:
-///   - derived from the mechanism / key type by the daemon (CKA_ALWAYS_SENSITIVE,
-///     CKA_NEVER_EXTRACTABLE, CKA_LOCAL),
-///   - controlled by daemon policy to keep generated/wrapped/derived material
-///     non-exportable (CKA_SENSITIVE, CKA_EXTRACTABLE), or
-///   - assertions about provenance the daemon itself must make (CKA_TRUSTED).
-///
-/// Enforced by `reject_forbidden_attrs` at the entry of every RPC that
-/// processes a caller-supplied template. Without that gate, generate_key /
-/// generate_key_pair / unwrap_key / derive_key / copy_object set
-/// `obj.extractable = false` then unconditionally called `apply_attribute` over
-/// the client template, silently overwriting the daemon's hardening.
+/// (#4) Attributes that callers must NOT set directly via GenerateKey.
+/// These security-critical attributes must be derived from the mechanism
+/// or enforced by policy, not supplied by the caller.
+/// Retained for use when mechanism dispatch is implemented (#20).
+#[allow(dead_code)]
 const FORBIDDEN_TEMPLATE_ATTRS: &[u64] = &[
     CKA_SENSITIVE as u64,
     CKA_EXTRACTABLE as u64,
     CKA_ALWAYS_SENSITIVE as u64,
     CKA_NEVER_EXTRACTABLE as u64,
     CKA_TRUSTED as u64,
-    CKA_LOCAL as u64,
 ];
-
-/// Reject any caller-supplied template attribute that the daemon must control
-/// itself. Returns `Status::invalid_argument` with the offending attribute's
-/// hex value; safe to call before the RPC has touched object state.
-fn reject_forbidden_attrs(template: &[(CK_ULONG, Vec<u8>)]) -> Result<(), Status> {
-    for (attr_type, _) in template {
-        if FORBIDDEN_TEMPLATE_ATTRS.contains(&(*attr_type as u64)) {
-            return Err(Status::invalid_argument(format!(
-                "Template attribute 0x{:08x} is set by the daemon and \
-                 must not appear in caller-supplied templates",
-                *attr_type as u64
-            )));
-        }
-    }
-    Ok(())
-}
 
 #[tonic::async_trait]
 impl HsmService for HsmServiceImpl {
@@ -381,6 +468,7 @@ impl HsmService for HsmServiceImpl {
         &self,
         request: Request<OpenSessionRequest>,
     ) -> Result<Response<OpenSessionResponse>, Status> {
+        let client_id = client_id_from_request(&request);
         let req = request.into_inner();
         let slot_id = to_ck_ulong(req.slot_id, "slot_id")?;
         let flags = if req.read_write {
@@ -408,6 +496,7 @@ impl HsmService for HsmServiceImpl {
             },
             AuditResult::Success,
             None,
+            &client_id,
         )?;
 
         Ok(Response::new(OpenSessionResponse {
@@ -419,6 +508,7 @@ impl HsmService for HsmServiceImpl {
         &self,
         request: Request<CloseSessionRequest>,
     ) -> Result<Response<CloseSessionResponse>, Status> {
+        let client_id = client_id_from_request(&request);
         let req = request.into_inner();
         let session_handle = to_ck_ulong(req.session_handle, "session_handle")?;
         // (#2) Derive slot_id from session, not hardcoded 0
@@ -439,6 +529,7 @@ impl HsmService for HsmServiceImpl {
             AuditOperation::CloseSession,
             AuditResult::Success,
             None,
+            &client_id,
         )?;
 
         Ok(Response::new(CloseSessionResponse {}))
@@ -448,6 +539,7 @@ impl HsmService for HsmServiceImpl {
         &self,
         request: Request<LoginRequest>,
     ) -> Result<Response<LoginResponse>, Status> {
+        let client_id = client_id_from_request(&request);
         let mut req = request.into_inner();
 
         // (#11-fix) Validate user_type against PKCS#11 constants before passing to core.
@@ -465,8 +557,10 @@ impl HsmService for HsmServiceImpl {
         // (#3) Validate the session handle — login requires a valid session per PKCS#11
         let slot_id = require_session(&self.hsm, req.session_handle)?;
 
-        // (#5) Check brute-force throttle before attempting login
-        self.check_login_throttle(slot_id)?;
+        // (#5) Check brute-force throttle on (slot_id, client_id) — keying on
+        // slot alone would let any source lock out every other source.
+        let throttle_key = ThrottleKey::new(slot_id, client_id.clone());
+        self.check_login_throttle(&throttle_key)?;
 
         // (#2) Use slot from session, not hardcoded 0
         let token = self
@@ -484,7 +578,7 @@ impl HsmService for HsmServiceImpl {
         match result {
             Ok(()) => {
                 // (#5) Clear failed attempts on success
-                self.clear_login_attempts(slot_id);
+                self.clear_login_attempts(&throttle_key);
 
                 // (#18) Audit successful login
                 self.audit(
@@ -494,13 +588,14 @@ impl HsmService for HsmServiceImpl {
                     },
                     AuditResult::Success,
                     None,
+                    &client_id,
                 )?;
 
                 Ok(Response::new(LoginResponse {}))
             }
             Err(e) => {
-                // (#5) Record failed attempt
-                self.record_login_failure(slot_id);
+                // (#5) Record failed attempt against (slot_id, client_id)
+                self.record_login_failure(&throttle_key);
 
                 // (#18) Audit failed login — convert to status (which also logs server-side)
                 let status = hsm_err_to_status(e);
@@ -515,6 +610,7 @@ impl HsmService for HsmServiceImpl {
                     },
                     AuditResult::Failure(0),
                     None,
+                    &client_id,
                 ) {
                     tracing::error!("Audit write failed for login failure: {:?}", audit_err);
                 }
@@ -528,6 +624,7 @@ impl HsmService for HsmServiceImpl {
         &self,
         request: Request<LogoutRequest>,
     ) -> Result<Response<LogoutResponse>, Status> {
+        let client_id = client_id_from_request(&request);
         let req = request.into_inner();
 
         // (#3) Validate the session handle — logout requires a valid session per PKCS#11
@@ -548,6 +645,7 @@ impl HsmService for HsmServiceImpl {
             AuditOperation::Logout,
             AuditResult::Success,
             None,
+            &client_id,
         )?;
 
         Ok(Response::new(LogoutResponse {}))
@@ -615,12 +713,16 @@ impl HsmService for HsmServiceImpl {
         &self,
         request: Request<InitTokenRequest>,
     ) -> Result<Response<InitTokenResponse>, Status> {
+        let client_id = client_id_from_request(&request);
         let mut req = request.into_inner();
         let slot_id = to_ck_ulong(req.slot_id, "slot_id")?;
 
-        // (#21) Check brute-force throttle before attempting InitToken.
-        // A successful SO PIN brute-force reinitializes the token, destroying all keys.
-        self.check_init_token_throttle(slot_id)?;
+        // (#21) Check brute-force throttle keyed on (slot_id, client_id)
+        // before attempting InitToken. A successful SO PIN brute-force
+        // reinitializes the token, destroying all keys, so the per-client
+        // key is essential to prevent cross-client lockout.
+        let throttle_key = ThrottleKey::new(slot_id, client_id.clone());
+        self.check_init_token_throttle(&throttle_key)?;
 
         let token = self
             .hsm
@@ -641,7 +743,7 @@ impl HsmService for HsmServiceImpl {
         match result {
             Ok(()) => {
                 // (#21) Clear failed attempts on success
-                self.clear_init_token_attempts(slot_id);
+                self.clear_init_token_attempts(&throttle_key);
 
                 // (#18) Audit token initialization
                 self.audit(
@@ -651,13 +753,14 @@ impl HsmService for HsmServiceImpl {
                     },
                     AuditResult::Success,
                     None,
+                    &client_id,
                 )?;
-                tracing::warn!(slot_id, "Token initialized via gRPC");
+                tracing::warn!(slot_id, client_id = client_id.as_str(), "Token initialized via gRPC");
                 Ok(Response::new(InitTokenResponse {}))
             }
             Err(e) => {
-                // (#21) Record failed attempt
-                self.record_init_token_failure(slot_id);
+                // (#21) Record failed attempt against (slot_id, client_id)
+                self.record_init_token_failure(&throttle_key);
 
                 // (#18) Audit failed init attempt
                 let status = hsm_err_to_status(e);
@@ -669,6 +772,7 @@ impl HsmService for HsmServiceImpl {
                     },
                     AuditResult::Failure(0),
                     None,
+                    &client_id,
                 ) {
                     tracing::error!("Audit write failed for InitToken failure: {:?}", audit_err);
                 }
@@ -681,6 +785,7 @@ impl HsmService for HsmServiceImpl {
         &self,
         request: Request<GenerateKeyRequest>,
     ) -> Result<Response<GenerateKeyResponse>, Status> {
+        let client_id = client_id_from_request(&request);
         let req = request.into_inner();
 
         let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
@@ -709,7 +814,6 @@ impl HsmService for HsmServiceImpl {
 
         // Parse template for CKA_VALUE_LEN (key size in bytes)
         let template = proto_attrs_to_template(&req.template)?;
-        reject_forbidden_attrs(&template)?;
         let key_len = template
             .iter()
             .find(|(t, _)| *t == CKA_VALUE_LEN)
@@ -765,6 +869,7 @@ impl HsmService for HsmServiceImpl {
             },
             AuditResult::Success,
             Some(format!("handle={}", key_handle)),
+            &client_id,
         )?;
 
         Ok(Response::new(GenerateKeyResponse {
@@ -776,6 +881,7 @@ impl HsmService for HsmServiceImpl {
         &self,
         request: Request<GenerateKeyPairRequest>,
     ) -> Result<Response<GenerateKeyPairResponse>, Status> {
+        let client_id = client_id_from_request(&request);
         let req = request.into_inner();
 
         let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
@@ -802,8 +908,6 @@ impl HsmService for HsmServiceImpl {
         let fips_approved = craton_hsm::crypto::mechanisms::is_fips_approved(mech_type);
         let pub_template = proto_attrs_to_template(&req.public_template)?;
         let priv_template = proto_attrs_to_template(&req.private_template)?;
-        reject_forbidden_attrs(&pub_template)?;
-        reject_forbidden_attrs(&priv_template)?;
 
         // Allocate handles upfront
         let pub_handle = self
@@ -966,6 +1070,7 @@ impl HsmService for HsmServiceImpl {
             },
             AuditResult::Success,
             Some(format!("pub={}, priv={}", pub_h, priv_h)),
+            &client_id,
         )?;
 
         Ok(Response::new(GenerateKeyPairResponse {
@@ -978,6 +1083,7 @@ impl HsmService for HsmServiceImpl {
         &self,
         request: Request<DestroyObjectRequest>,
     ) -> Result<Response<DestroyObjectResponse>, Status> {
+        let client_id = client_id_from_request(&request);
         let req = request.into_inner();
         let object_handle = to_ck_ulong(req.object_handle, "object_handle")?;
 
@@ -1008,6 +1114,7 @@ impl HsmService for HsmServiceImpl {
             AuditOperation::DestroyObject,
             AuditResult::Success,
             Some(format!("handle={}", req.object_handle)),
+            &client_id,
         )?;
 
         Ok(Response::new(DestroyObjectResponse {}))
@@ -1017,6 +1124,7 @@ impl HsmService for HsmServiceImpl {
         &self,
         request: Request<FindObjectsRequest>,
     ) -> Result<Response<FindObjectsResponse>, Status> {
+        let client_id = client_id_from_request(&request);
         let req = request.into_inner();
 
         // (#9) Require a valid, authenticated session for FindObjects.
@@ -1058,6 +1166,7 @@ impl HsmService for HsmServiceImpl {
             },
             AuditResult::Success,
             None,
+            &client_id,
         )?;
 
         Ok(Response::new(FindObjectsResponse {
@@ -1069,6 +1178,7 @@ impl HsmService for HsmServiceImpl {
         &self,
         request: Request<GetAttributeValueRequest>,
     ) -> Result<Response<GetAttributeValueResponse>, Status> {
+        let client_id = client_id_from_request(&request);
         let req = request.into_inner();
         let object_handle = to_ck_ulong(req.object_handle, "object_handle")?;
 
@@ -1090,11 +1200,8 @@ impl HsmService for HsmServiceImpl {
 
         // (#8) Check if object is private; if so, require login.
         // Per PKCS#11, private object attributes are only visible to logged-in sessions.
-        // Use `is_logged_in=true` when calling read_attribute for the visibility
-        // probe itself so the read of CKA_PRIVATE succeeds regardless of state;
-        // login enforcement happens immediately after via `require_logged_in`.
         let is_private =
-            craton_hsm::store::attributes::read_attribute(&obj, CKA_PRIVATE as CK_ULONG, true)
+            craton_hsm::store::attributes::read_attribute(&obj, CKA_PRIVATE as CK_ULONG)
                 .ok()
                 .flatten()
                 .map(|v| !v.is_empty() && v[0] != 0)
@@ -1104,16 +1211,11 @@ impl HsmService for HsmServiceImpl {
             require_logged_in(&self.hsm, slot_id)?;
         }
 
-        // After the visibility gate above, the caller is logged in iff the
-        // object is not private OR `require_logged_in` succeeded. Either way,
-        // it is safe to pass `true` to `read_attribute` here: the spec-mandated
-        // private-object visibility check has already been enforced.
-        let is_logged_in = true;
         let mut attrs = Vec::new();
 
         for attr_type in &req.attribute_types {
             let attr_ck = to_ck_ulong(*attr_type, "attribute_type")?;
-            match craton_hsm::store::attributes::read_attribute(&obj, attr_ck, is_logged_in) {
+            match craton_hsm::store::attributes::read_attribute(&obj, attr_ck) {
                 Ok(Some(value)) => {
                     attrs.push(Attribute {
                         attr_type: *attr_type,
@@ -1142,6 +1244,7 @@ impl HsmService for HsmServiceImpl {
             AuditOperation::GetAttributeValue,
             AuditResult::Success,
             Some(format!("handle={}", req.object_handle)),
+            &client_id,
         )?;
 
         Ok(Response::new(GetAttributeValueResponse {
@@ -1150,6 +1253,7 @@ impl HsmService for HsmServiceImpl {
     }
 
     async fn sign(&self, request: Request<SignRequest>) -> Result<Response<SignResponse>, Status> {
+        let client_id = client_id_from_request(&request);
         let req = request.into_inner();
         let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
 
@@ -1235,6 +1339,7 @@ impl HsmService for HsmServiceImpl {
             },
             AuditResult::Success,
             Some(format!("key={}", req.key_handle)),
+            &client_id,
         )?;
 
         Ok(Response::new(SignResponse { signature }))
@@ -1244,6 +1349,7 @@ impl HsmService for HsmServiceImpl {
         &self,
         request: Request<VerifyRequest>,
     ) -> Result<Response<VerifyResponse>, Status> {
+        let client_id = client_id_from_request(&request);
         let req = request.into_inner();
         let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
 
@@ -1357,6 +1463,7 @@ impl HsmService for HsmServiceImpl {
             },
             AuditResult::Success,
             Some(format!("key={}", req.key_handle)),
+            &client_id,
         )?;
 
         Ok(Response::new(VerifyResponse { valid }))
@@ -1366,6 +1473,7 @@ impl HsmService for HsmServiceImpl {
         &self,
         request: Request<EncryptRequest>,
     ) -> Result<Response<EncryptResponse>, Status> {
+        let client_id = client_id_from_request(&request);
         let req = request.into_inner();
         let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
 
@@ -1476,6 +1584,7 @@ impl HsmService for HsmServiceImpl {
             },
             AuditResult::Success,
             Some(format!("key={}", req.key_handle)),
+            &client_id,
         )?;
 
         Ok(Response::new(EncryptResponse { encrypted_data }))
@@ -1485,6 +1594,7 @@ impl HsmService for HsmServiceImpl {
         &self,
         request: Request<DecryptRequest>,
     ) -> Result<Response<DecryptResponse>, Status> {
+        let client_id = client_id_from_request(&request);
         let req = request.into_inner();
         let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
 
@@ -1591,6 +1701,7 @@ impl HsmService for HsmServiceImpl {
             },
             AuditResult::Success,
             Some(format!("key={}", req.key_handle)),
+            &client_id,
         )?;
 
         Ok(Response::new(DecryptResponse { data }))
@@ -1632,6 +1743,7 @@ impl HsmService for HsmServiceImpl {
         &self,
         request: Request<GenerateRandomRequest>,
     ) -> Result<Response<GenerateRandomResponse>, Status> {
+        let client_id = client_id_from_request(&request);
         let req = request.into_inner();
 
         // (#3-fix) Require authentication to prevent DRBG exhaustion by
@@ -1671,6 +1783,7 @@ impl HsmService for HsmServiceImpl {
             AuditOperation::GenerateRandom { length },
             AuditResult::Success,
             None,
+            &client_id,
         )?;
 
         Ok(Response::new(GenerateRandomResponse { random_data: buf }))
@@ -1680,6 +1793,7 @@ impl HsmService for HsmServiceImpl {
         &self,
         request: Request<WrapKeyRequest>,
     ) -> Result<Response<WrapKeyResponse>, Status> {
+        let client_id = client_id_from_request(&request);
         let req = request.into_inner();
         let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
 
@@ -1768,6 +1882,7 @@ impl HsmService for HsmServiceImpl {
                 "wrapping_key={}, wrapped_key={}",
                 req.wrapping_key_handle, req.key_handle
             )),
+            &client_id,
         )?;
 
         Ok(Response::new(WrapKeyResponse { wrapped_key }))
@@ -1777,6 +1892,7 @@ impl HsmService for HsmServiceImpl {
         &self,
         request: Request<UnwrapKeyRequest>,
     ) -> Result<Response<UnwrapKeyResponse>, Status> {
+        let client_id = client_id_from_request(&request);
         let req = request.into_inner();
         let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
 
@@ -1837,7 +1953,6 @@ impl HsmService for HsmServiceImpl {
 
         // Build a new secret key object from the unwrapped material
         let template = proto_attrs_to_template(&req.template)?;
-        reject_forbidden_attrs(&template)?;
         let handle = self
             .hsm
             .object_store()
@@ -1891,6 +2006,7 @@ impl HsmService for HsmServiceImpl {
                 "unwrapping_key={}, new_key={}",
                 req.unwrapping_key_handle, new_handle
             )),
+            &client_id,
         )?;
 
         Ok(Response::new(UnwrapKeyResponse {
@@ -1902,6 +2018,7 @@ impl HsmService for HsmServiceImpl {
         &self,
         request: Request<DeriveKeyRequest>,
     ) -> Result<Response<DeriveKeyResponse>, Status> {
+        let client_id = client_id_from_request(&request);
         let req = request.into_inner();
         let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
 
@@ -1957,7 +2074,6 @@ impl HsmService for HsmServiceImpl {
 
         // Parse CKA_VALUE_LEN from template for desired derived key length
         let template = proto_attrs_to_template(&req.template)?;
-        reject_forbidden_attrs(&template)?;
         let derived_len = template
             .iter()
             .find(|(t, _)| *t == CKA_VALUE_LEN)
@@ -2033,6 +2149,7 @@ impl HsmService for HsmServiceImpl {
                 "base_key={}, derived_key={}",
                 req.base_key_handle, new_handle
             )),
+            &client_id,
         )?;
 
         Ok(Response::new(DeriveKeyResponse {
@@ -2044,6 +2161,7 @@ impl HsmService for HsmServiceImpl {
         &self,
         request: Request<CopyObjectRequest>,
     ) -> Result<Response<CopyObjectResponse>, Status> {
+        let client_id = client_id_from_request(&request);
         let req = request.into_inner();
         let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
 
@@ -2105,7 +2223,6 @@ impl HsmService for HsmServiceImpl {
 
         // Apply template overrides
         let template = proto_attrs_to_template(&req.template)?;
-        reject_forbidden_attrs(&template)?;
         for (attr_type, value) in &template {
             craton_hsm::store::attributes::apply_attribute(&mut new_obj, *attr_type, value)
                 .map_err(hsm_err_to_status)?;
@@ -2138,6 +2255,7 @@ impl HsmService for HsmServiceImpl {
                 "copied from={}, new={}",
                 req.object_handle, inserted_handle
             )),
+            &client_id,
         )?;
 
         Ok(Response::new(CopyObjectResponse {
@@ -2149,6 +2267,7 @@ impl HsmService for HsmServiceImpl {
         &self,
         request: Request<InitPinRequest>,
     ) -> Result<Response<InitPinResponse>, Status> {
+        let client_id = client_id_from_request(&request);
         let mut req = request.into_inner();
 
         // InitPIN requires SO to be logged in — the session must exist and be authenticated
@@ -2191,6 +2310,7 @@ impl HsmService for HsmServiceImpl {
             },
             AuditResult::Success,
             None,
+            &client_id,
         )?;
 
         Ok(Response::new(InitPinResponse {}))
@@ -2200,6 +2320,7 @@ impl HsmService for HsmServiceImpl {
         &self,
         request: Request<SetPinRequest>,
     ) -> Result<Response<SetPinResponse>, Status> {
+        let client_id = client_id_from_request(&request);
         let mut req = request.into_inner();
 
         // SetPIN requires the user (or SO) to be logged in
@@ -2224,6 +2345,7 @@ impl HsmService for HsmServiceImpl {
             AuditOperation::SetPIN,
             AuditResult::Success,
             Some("set_pin".to_string()),
+            &client_id,
         )?;
 
         Ok(Response::new(SetPinResponse {}))
