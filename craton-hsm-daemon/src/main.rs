@@ -136,6 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             key,
             full_config.daemon.tls_client_ca.as_deref(),
             full_config.daemon.tls_client_crl.as_deref(),
+            full_config.daemon.allow_unauthenticated_tls,
         )?;
 
         let tls_acceptor = TlsAcceptor::from(Arc::new(rustls_config));

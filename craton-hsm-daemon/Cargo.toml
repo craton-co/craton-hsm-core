@@ -26,6 +26,7 @@ serde = { version = "1", features = ["derive"] }
 toml = "1"
 zeroize = "1"
 async-stream = "0.3"
+sha2 = "0.10"
 
 [build-dependencies]
 tonic-prost-build = "0.14"

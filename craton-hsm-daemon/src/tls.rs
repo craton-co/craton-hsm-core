@@ -2,8 +2,9 @@
 // Copyright 2026 Craton Software Company
 //! TLS configuration for the gRPC server.
 //!
-//! Supports mutual TLS (mTLS) when a client CA is configured.
-//! Without mTLS, any TLS client can connect — a warning is logged.
+//! Mutual TLS (mTLS) is mandatory by default — `load_tls_config` refuses to
+//! build a configuration without a client CA unless the caller explicitly
+//! opts in to unauthenticated TLS (`allow_unauthenticated_tls = true`).
 //!
 //! NOTE (#17): This module provides rustls-native TLS configuration as an
 //! alternative to tonic's built-in TLS. Currently main.rs uses tonic's
@@ -23,6 +24,10 @@ use std::sync::Arc;
 /// When `client_ca_path` is provided, mutual TLS (mTLS) is enforced:
 /// clients must present a certificate signed by the given CA.
 ///
+/// When `client_ca_path` is `None`, this function only succeeds if
+/// `allow_unauthenticated_tls` is `true`. Otherwise the call returns an error
+/// — mTLS is mandatory by default.
+///
 /// ## Security Notes
 ///
 /// - **CRL**: When `client_crl_path` is provided, revoked client certificates
@@ -38,6 +43,7 @@ pub fn load_tls_config(
     key_path: &str,
     client_ca_path: Option<&str>,
     client_crl_path: Option<&str>,
+    allow_unauthenticated_tls: bool,
 ) -> Result<ServerConfig, Box<dyn std::error::Error>> {
     let cert_file = std::fs::File::open(cert_path)
         .map_err(|e| format!("Failed to open TLS cert '{}': {}", cert_path, e))?;
@@ -97,9 +103,19 @@ pub fn load_tls_config(
             .with_single_cert(server_certs, key)
             .map_err(|e| format!("TLS config error: {}", e))?
     } else {
-        tracing::warn!(
-            "No client CA configured — mTLS disabled. Any TLS client can connect. \
-             Set [daemon] tls_client_ca to enforce mutual TLS."
+        if !allow_unauthenticated_tls {
+            return Err(
+                "mTLS is mandatory: set [daemon] tls_client_ca to a CA certificate, \
+                 or explicitly set allow_unauthenticated_tls = true to opt out \
+                 (NOT recommended for production)."
+                    .into(),
+            );
+        }
+        tracing::error!(
+            "allow_unauthenticated_tls = true — mTLS DISABLED. Any TLS client can \
+             connect, and the login throttle falls back to per-IP keying instead of \
+             per-client-cert. This is a CRITICAL security risk. Configure \
+             tls_client_ca and remove allow_unauthenticated_tls before production use."
         );
         ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
             .with_no_client_auth()
@@ -119,7 +135,14 @@ pub fn make_tls_acceptor(
     key_path: &str,
     client_ca_path: Option<&str>,
     client_crl_path: Option<&str>,
+    allow_unauthenticated_tls: bool,
 ) -> Result<Arc<ServerConfig>, Box<dyn std::error::Error>> {
-    let config = load_tls_config(cert_path, key_path, client_ca_path, client_crl_path)?;
+    let config = load_tls_config(
+        cert_path,
+        key_path,
+        client_ca_path,
+        client_crl_path,
+        allow_unauthenticated_tls,
+    )?;
     Ok(Arc::new(config))
 }
