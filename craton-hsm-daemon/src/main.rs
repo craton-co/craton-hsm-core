@@ -92,9 +92,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         full_config.daemon.max_login_attempts,
         full_config.daemon.login_cooldown_secs,
     );
-    let addr = full_config.daemon.bind.parse()?;
+    let addr: std::net::SocketAddr = full_config.daemon.bind.parse()?;
 
-    tracing::info!("Craton HSM daemon listening on {}", addr);
+    // Per-listener startup log lives in each branch below — TCP+TLS logs the
+    // bound address, and the UDS path (when allow_insecure=true on Unix) logs
+    // the socket path. We avoid logging `addr` here because in UDS mode it is
+    // a parsed-but-unused fallback.
 
     // gRPC message size limits (#12) — 4 MiB inbound, 16 MiB outbound
     let svc = HsmServiceServer::new(service)
@@ -142,7 +145,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let tls_acceptor = TlsAcceptor::from(Arc::new(rustls_config));
 
         // (#11) Do NOT log the TLS key path — it reveals filesystem layout
-        tracing::info!("TLS enabled (cert: {}, TLS 1.3 enforced)", cert);
+        tracing::info!(
+            "TLS enabled — daemon listening on {} (cert: {}, TLS 1.3 enforced)",
+            addr,
+            cert
+        );
 
         // Bind a TCP listener and wrap accepted connections with TLS using our
         // validated rustls config (TLS 1.3, mTLS, CRL). Each TLS handshake is
@@ -219,28 +226,150 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .serve_with_incoming_shutdown(incoming, shutdown_signal())
             .await?;
     } else if full_config.daemon.allow_insecure {
-        // (#10) Refuse insecure mode on non-loopback addresses
-        if !full_config.daemon.is_loopback_bind() {
+        // (#sec-uds) Plaintext loopback TCP is NOT safe: any local user with
+        // CAP_NET_RAW (or any local process at all) can read PINs by sniffing
+        // `lo` or by simply connecting to the loopback port. Authenticate the
+        // caller via the filesystem instead.
+        //
+        // - Unix: bind a UDS at mode 0600 so only the daemon's UID can connect.
+        // - Windows: there is no SO_PEERCRED equivalent for loopback TCP, and
+        //   named-pipe ACLs would still leave the loopback TCP listener wide
+        //   open. Refuse `allow_insecure` outright and require TLS.
+        #[cfg(windows)]
+        {
             tracing::error!(
-                "allow_insecure = true is only permitted on loopback addresses \
-                 (127.0.0.1 / [::1]). Bind address '{}' is not loopback. \
-                 Either bind to a loopback address or configure TLS.",
-                full_config.daemon.bind
+                "allow_insecure = true is not supported on Windows: there is no \
+                 equivalent of SO_PEERCRED for loopback TCP, so the listener \
+                 cannot authenticate the calling user. Configure tls_cert and \
+                 tls_key in [daemon] (TLS is the only safe option on Windows)."
             );
             std::process::exit(1);
         }
 
-        // (#1) Only allow plaintext if explicitly opted in
-        tracing::error!(
-            "TLS disabled — the daemon is running WITHOUT encryption or authentication. \
-             This is a CRITICAL security risk. Set allow_insecure = false and configure \
-             tls_cert / tls_key in [daemon] for production."
-        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            use tokio::net::UnixListener;
 
-        server
-            .add_service(svc)
-            .serve_with_shutdown(addr, shutdown_signal())
-            .await?;
+            let sock_path = full_config.daemon.resolved_unix_socket_path();
+
+            // (1) Clean up a stale socket from a previous run, but ONLY if the
+            // existing path is actually a socket. Refusing to clobber regular
+            // files prevents the daemon from accidentally truncating an
+            // arbitrary file if `bind_unix` is misconfigured.
+            if let Ok(meta) = std::fs::symlink_metadata(&sock_path) {
+                use std::os::unix::fs::FileTypeExt;
+                if meta.file_type().is_socket() {
+                    if let Err(e) = std::fs::remove_file(&sock_path) {
+                        tracing::error!(
+                            path = %sock_path.display(),
+                            error = %e,
+                            "Failed to remove stale UDS socket file"
+                        );
+                        std::process::exit(1);
+                    }
+                } else {
+                    tracing::error!(
+                        path = %sock_path.display(),
+                        "bind_unix path exists and is NOT a socket — refusing to overwrite. \
+                         Remove the file manually or point bind_unix at a clean path."
+                    );
+                    std::process::exit(1);
+                }
+            }
+
+            // (2) Atomically create the socket with mode 0600 by setting
+            // umask=0o177 before bind(2). Doing chmod *after* bind would
+            // leave a window where another local user could connect with
+            // the default permissive mode.
+            // SAFETY: umask is process-global; we restore it immediately
+            // after bind.
+            let prev_umask = unsafe { libc::umask(0o177) };
+            let listener_result = UnixListener::bind(&sock_path);
+            unsafe {
+                libc::umask(prev_umask);
+            }
+            let listener = listener_result.map_err(|e| {
+                format!(
+                    "Failed to bind UDS '{}': {}. Ensure the parent directory \
+                     exists and is writable by the daemon's UID.",
+                    sock_path.display(),
+                    e
+                )
+            })?;
+
+            // (3) Defense in depth: verify the resulting file mode. If
+            // something defeated the umask (unusual filesystem, ACL),
+            // refuse to expose secrets and chmod down to 0600.
+            match std::fs::metadata(&sock_path) {
+                Ok(meta) => {
+                    let mode = meta.permissions().mode() & 0o777;
+                    if mode != 0o600 {
+                        tracing::warn!(
+                            path = %sock_path.display(),
+                            actual_mode = format!("{:o}", mode),
+                            "UDS socket mode is not 0600 after bind — chmod'ing down"
+                        );
+                        let perms = std::fs::Permissions::from_mode(0o600);
+                        if let Err(e) = std::fs::set_permissions(&sock_path, perms) {
+                            tracing::error!(
+                                path = %sock_path.display(),
+                                error = %e,
+                                "Failed to chmod UDS to 0600 — refusing to expose plaintext socket"
+                            );
+                            let _ = std::fs::remove_file(&sock_path);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        path = %sock_path.display(),
+                        error = %e,
+                        "Failed to stat UDS after bind — refusing to expose plaintext socket"
+                    );
+                    let _ = std::fs::remove_file(&sock_path);
+                    std::process::exit(1);
+                }
+            }
+
+            tracing::warn!(
+                "TLS disabled — daemon is serving plaintext gRPC on UDS '{}' \
+                 (mode 0600). Only the daemon's UID can connect. For production \
+                 deployments configure tls_cert / tls_key in [daemon] and serve \
+                 over TCP+TLS instead.",
+                sock_path.display()
+            );
+
+            // (4) Adapt the listener into a stream of accepted UnixStreams.
+            // Tonic implements `Connected` for `tokio::net::UnixStream`
+            // directly, so no wrapper type is needed.
+            let incoming = async_stream::stream! {
+                loop {
+                    match listener.accept().await {
+                        Ok((stream, _addr)) => yield Ok::<_, std::io::Error>(stream),
+                        Err(e) => {
+                            tracing::error!(error = %e, "UDS accept failed");
+                            yield Err(e);
+                        }
+                    }
+                }
+            };
+            tokio::pin!(incoming);
+
+            let sock_path_for_cleanup = sock_path.clone();
+            let result = server
+                .add_service(svc)
+                .serve_with_incoming_shutdown(incoming, shutdown_signal())
+                .await;
+
+            // Best-effort cleanup of the socket file on shutdown. If this
+            // fails, the next start-up will detect+remove it via the
+            // stale-socket check above.
+            let _ = std::fs::remove_file(&sock_path_for_cleanup);
+
+            result?;
+        }
     } else {
         // (#1) Refuse to start without TLS
         tracing::error!(
@@ -259,3 +388,4 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
     tracing::info!("Shutdown signal received, draining connections...");
 }
+
