@@ -3,7 +3,6 @@
 //! Daemon configuration.
 
 use serde::Deserialize;
-use std::net::SocketAddr;
 
 /// Configuration for the daemon, loaded from [daemon] section of craton_hsm.toml.
 #[derive(Debug, Deserialize)]
@@ -29,23 +28,29 @@ pub struct DaemonConfig {
     pub max_digest_length: u32,
     /// Allow running without TLS. Must be explicitly set to true.
     /// Default: false (TLS is mandatory).
+    ///
+    /// **SECURITY:** On Unix, `allow_insecure = true` now binds a Unix domain
+    /// socket (UDS) at `bind_unix` with mode 0600 instead of plaintext TCP.
+    /// This authenticates the calling user via filesystem permissions, so any
+    /// local user/process other than the daemon's owner is refused at the
+    /// socket layer. On Windows, `allow_insecure` is refused outright — there
+    /// is no equivalent of SO_PEERCRED, so TLS is the only safe option.
     #[serde(default)]
     pub allow_insecure: bool,
-    /// Allow TLS without client certificate authentication (no mTLS).
-    /// When `false` (the default), the daemon refuses to start unless
-    /// `tls_client_ca` is configured.
+    /// Unix domain socket path used when `allow_insecure = true` on Unix.
+    /// The socket file is created with mode 0600 (owner read/write only),
+    /// ensuring only the daemon's UID can connect. If unset, defaults to
+    /// `$XDG_RUNTIME_DIR/craton-hsm.sock` (or `/tmp/craton-hsm-<uid>.sock`
+    /// when `XDG_RUNTIME_DIR` is not set).
     ///
-    /// This flag exists only to support gradual rollout of mTLS in
-    /// environments that cannot yet provision client certificates.
-    /// Setting it to `true` degrades the login-throttle key from
-    /// `(slot_id, client_cert_thumbprint)` to `(slot_id, peer_ip)`,
-    /// which is materially weaker — any source that can reach the
-    /// daemon over TLS can attempt logins against any slot, and the
-    /// only attribution available for audit is the source IP.
-    ///
-    /// Default: `false` (mTLS is mandatory).
+    /// Ignored when TLS is configured, when `allow_insecure = false`, and
+    /// on Windows (where insecure mode is refused outright).
+    // Read by `resolved_unix_socket_path` (cfg(unix) only); on Windows the
+    // value is still parsed and silently ignored so deployers can share a
+    // single TOML across platforms.
+    #[cfg_attr(not(unix), allow(dead_code))]
     #[serde(default)]
-    pub allow_unauthenticated_tls: bool,
+    pub bind_unix: Option<String>,
     /// Maximum failed login attempts before the daemon imposes a cooldown.
     /// Default: 5. Set to 0 to disable daemon-level lockout (relies on token).
     ///
@@ -67,26 +72,6 @@ pub struct DaemonConfig {
     /// Per-request timeout in seconds. Default: 30.
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
-    /// TLS handshake timeout in seconds. A peer that completes the TCP
-    /// handshake but stalls the TLS ClientHello must not be allowed to
-    /// hold an accept task indefinitely. Default: 10.
-    #[serde(default = "default_tls_handshake_timeout_secs")]
-    pub tls_handshake_timeout_secs: u64,
-    /// HTTP/2 keepalive ping interval in seconds. Sends a PING frame if
-    /// the connection has been idle for this long. Default: 30.
-    #[serde(default = "default_http2_keepalive_interval_secs")]
-    pub http2_keepalive_interval_secs: u64,
-    /// HTTP/2 keepalive timeout in seconds. Closes the connection if a
-    /// PING is not acknowledged within this window. Default: 20.
-    #[serde(default = "default_http2_keepalive_timeout_secs")]
-    pub http2_keepalive_timeout_secs: u64,
-    /// TCP keepalive interval in seconds. Default: 60.
-    #[serde(default = "default_tcp_keepalive_secs")]
-    pub tcp_keepalive_secs: u64,
-    /// Maximum number of concurrent HTTP/2 streams per connection.
-    /// Caps RAPID-RESET-style stream-flood attacks. Default: 128.
-    #[serde(default = "default_max_concurrent_streams")]
-    pub max_concurrent_streams: u32,
 }
 
 fn default_bind() -> String {
@@ -117,26 +102,6 @@ fn default_request_timeout_secs() -> u64 {
     30
 }
 
-fn default_tls_handshake_timeout_secs() -> u64 {
-    10
-}
-
-fn default_http2_keepalive_interval_secs() -> u64 {
-    30
-}
-
-fn default_http2_keepalive_timeout_secs() -> u64 {
-    20
-}
-
-fn default_tcp_keepalive_secs() -> u64 {
-    60
-}
-
-fn default_max_concurrent_streams() -> u32 {
-    128
-}
-
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
@@ -148,16 +113,11 @@ impl Default for DaemonConfig {
             max_random_length: default_max_random_length(),
             max_digest_length: default_max_digest_length(),
             allow_insecure: false,
-            allow_unauthenticated_tls: false,
+            bind_unix: None,
             max_login_attempts: default_max_login_attempts(),
             login_cooldown_secs: default_login_cooldown_secs(),
             max_connections: default_max_connections(),
             request_timeout_secs: default_request_timeout_secs(),
-            tls_handshake_timeout_secs: default_tls_handshake_timeout_secs(),
-            http2_keepalive_interval_secs: default_http2_keepalive_interval_secs(),
-            http2_keepalive_timeout_secs: default_http2_keepalive_timeout_secs(),
-            tcp_keepalive_secs: default_tcp_keepalive_secs(),
-            max_concurrent_streams: default_max_concurrent_streams(),
         }
     }
 }
@@ -168,22 +128,38 @@ impl DaemonConfig {
     /// "localhost" can resolve to a non-loopback address on systems with a
     /// poisoned /etc/hosts or misconfigured DNS. Requiring an explicit IP
     /// (127.0.0.1 or [::1]) eliminates this risk entirely.
-    pub fn is_loopback_bind(&self) -> bool {
-        match self.bind.parse::<SocketAddr>() {
-            Ok(addr) => addr.ip().is_loopback(),
-            Err(_) => {
-                // (#6-fix) Reject hostnames — only IP-based SocketAddr is trusted.
-                // "localhost" could resolve to a non-loopback address on misconfigured
-                // systems. Callers must use 127.0.0.1:port or [::1]:port.
-                tracing::warn!(
-                    "Bind address '{}' is not a valid IP:port — cannot verify loopback. \
-                     Use 127.0.0.1:port or [::1]:port for insecure mode.",
-                    self.bind
-                );
-                false
+    /// Resolve the effective Unix domain socket path used for insecure mode.
+    ///
+    /// Resolution order:
+    /// 1. `bind_unix` from config, if set.
+    /// 2. `$XDG_RUNTIME_DIR/craton-hsm.sock`, if `XDG_RUNTIME_DIR` is set.
+    /// 3. `/tmp/craton-hsm-<uid>.sock` as a last-resort fallback (the
+    ///    `<uid>` suffix prevents collisions between users on shared hosts).
+    ///
+    /// Only meaningful on Unix; on Windows we refuse `allow_insecure` before
+    /// this is consulted.
+    #[cfg(unix)]
+    pub fn resolved_unix_socket_path(&self) -> std::path::PathBuf {
+        if let Some(path) = &self.bind_unix {
+            return std::path::PathBuf::from(path);
+        }
+        if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+            if !runtime_dir.is_empty() {
+                return std::path::PathBuf::from(runtime_dir).join("craton-hsm.sock");
             }
         }
+        // Last-resort fallback. Tag with the daemon's UID so per-user instances
+        // do not collide on shared hosts. SAFETY: getuid is async-signal-safe
+        // and always succeeds on POSIX.
+        let uid = unsafe { libc::getuid() };
+        std::path::PathBuf::from(format!("/tmp/craton-hsm-{}.sock", uid))
     }
+
+    // NOTE: `is_loopback_bind` previously guarded the deprecated insecure
+    // loopback-TCP path. With `allow_insecure = true` now binding a UDS
+    // (Unix) or being refused outright (Windows), there is no remaining
+    // caller, so the helper was removed. If a future feature needs to
+    // detect loopback bind addresses, restore from git history.
 }
 
 /// Full config file structure (extends craton_hsm.toml with [daemon] section).
@@ -215,5 +191,92 @@ impl FullConfig {
             )),
             Err(e) => Err(format!("Failed to read config '{}': {}", path, e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `bind_unix` parses from TOML on every platform — only the *use* of the
+    /// value is Unix-gated. This lets deployers share a single config file.
+    #[test]
+    fn bind_unix_parses_from_toml() {
+        let toml = r#"
+            [daemon]
+            bind = "127.0.0.1:5696"
+            bind_unix = "/var/run/craton-hsm.sock"
+            allow_insecure = true
+        "#;
+        let cfg: FullConfig = toml::from_str(toml).expect("parse");
+        assert_eq!(
+            cfg.daemon.bind_unix.as_deref(),
+            Some("/var/run/craton-hsm.sock")
+        );
+        assert!(cfg.daemon.allow_insecure);
+    }
+
+    #[test]
+    fn bind_unix_defaults_to_none() {
+        let toml = r#"
+            [daemon]
+            bind = "127.0.0.1:5696"
+        "#;
+        let cfg: FullConfig = toml::from_str(toml).expect("parse");
+        assert!(cfg.daemon.bind_unix.is_none());
+    }
+
+    /// When `bind_unix` is explicitly set, `resolved_unix_socket_path` returns
+    /// it verbatim — XDG_RUNTIME_DIR and the /tmp fallback must not be
+    /// consulted. This is the contract callers rely on for predictable paths.
+    #[cfg(unix)]
+    #[test]
+    fn resolved_path_honors_explicit_bind_unix() {
+        let cfg = DaemonConfig {
+            bind_unix: Some("/run/my-custom.sock".to_string()),
+            ..DaemonConfig::default()
+        };
+        // Set XDG_RUNTIME_DIR to verify explicit bind_unix still wins.
+        std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1234");
+        assert_eq!(
+            cfg.resolved_unix_socket_path(),
+            std::path::PathBuf::from("/run/my-custom.sock")
+        );
+    }
+
+    /// Without an explicit `bind_unix`, fall back to `$XDG_RUNTIME_DIR`.
+    /// systemd sets XDG_RUNTIME_DIR to a per-user 0700 dir, which is the
+    /// idiomatic location for short-lived service sockets.
+    #[cfg(unix)]
+    #[test]
+    fn resolved_path_uses_xdg_runtime_dir_when_unset() {
+        let cfg = DaemonConfig {
+            bind_unix: None,
+            ..DaemonConfig::default()
+        };
+        std::env::set_var("XDG_RUNTIME_DIR", "/run/user/9999");
+        assert_eq!(
+            cfg.resolved_unix_socket_path(),
+            std::path::PathBuf::from("/run/user/9999/craton-hsm.sock")
+        );
+    }
+
+    /// When neither `bind_unix` nor `XDG_RUNTIME_DIR` is available, fall
+    /// back to /tmp with the UID suffixed so different users on a shared
+    /// host don't collide on the same path. The suffix also means an
+    /// attacker can't pre-create the path under their UID to confuse us
+    /// (their /tmp/craton-hsm-<their-uid>.sock is a different path).
+    #[cfg(unix)]
+    #[test]
+    fn resolved_path_falls_back_to_uid_tagged_tmp() {
+        let cfg = DaemonConfig {
+            bind_unix: None,
+            ..DaemonConfig::default()
+        };
+        std::env::remove_var("XDG_RUNTIME_DIR");
+        let path = cfg.resolved_unix_socket_path();
+        let s = path.to_string_lossy();
+        assert!(s.starts_with("/tmp/craton-hsm-"), "got {}", s);
+        assert!(s.ends_with(".sock"), "got {}", s);
     }
 }

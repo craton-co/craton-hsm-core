@@ -28,5 +28,8 @@ zeroize = "1"
 async-stream = "0.3"
 sha2 = "0.10"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [build-dependencies]
 tonic-prost-build = "0.14"
