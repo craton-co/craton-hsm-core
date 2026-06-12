@@ -2,7 +2,9 @@
 // Copyright 2026 Craton Software Company
 //! JSON-lines logger for PKCS#11 spy calls.
 
-use std::io::Write;
+use std::fs::File;
+use std::io::{self, Write};
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -51,11 +53,7 @@ impl SpyLogger {
                                 );
                                 Box::new(std::io::stderr())
                             } else {
-                                match std::fs::OpenOptions::new()
-                                    .create(true)
-                                    .append(true)
-                                    .open(&full_path)
-                                {
+                                match open_log_file(&full_path) {
                                     Ok(f) => {
                                         // On Unix, set restrictive permissions on the log file
                                         #[cfg(unix)]
@@ -104,6 +102,13 @@ impl SpyLogger {
                                         Box::new(f)
                                     }
                                     Err(e) => {
+                                        // open_log_file refuses symlink targets and
+                                        // uses O_NOFOLLOW / FILE_FLAG_OPEN_REPARSE_POINT
+                                        // to defeat symlink-swap attacks on the log path.
+                                        tracing::error!(
+                                            error = %e,
+                                            "pkcs11-spy: failed to open log file (symlink refused or open failed), using stderr"
+                                        );
                                         eprintln!(
                                             "pkcs11-spy: failed to open log file, using stderr: {}",
                                             e
@@ -136,6 +141,105 @@ impl SpyLogger {
             start: Instant::now(),
             reduced_timing,
         }
+    }
+}
+
+/// Open the log file, refusing symlink targets.
+///
+/// Without `O_NOFOLLOW` (Unix) / `FILE_FLAG_OPEN_REPARSE_POINT` (Windows), an
+/// attacker with write access to the log directory can symlink the log path to
+/// a sensitive file (e.g. `/etc/shadow`) and cause the spy — potentially
+/// running with elevated privilege — to append log lines to that file.
+///
+/// Strategy:
+/// 1. Probe the path with `symlink_metadata`. If it exists and is a symlink,
+///    refuse outright with `tracing::error!` and return `io::ErrorKind::InvalidInput`.
+/// 2. Try `create_new(true)` first so a brand-new log file is created atomically
+///    (`O_EXCL` semantics) and cannot race a symlink in between stat and open.
+/// 3. If the file already exists, open it for append with `O_NOFOLLOW` (Unix) or
+///    `FILE_FLAG_OPEN_REPARSE_POINT` (Windows) + a post-open symlink_metadata
+///    re-check so a TOCTOU symlink swap is still rejected.
+fn open_log_file(path: &Path) -> io::Result<File> {
+    // Up-front symlink check. If the path resolves to a symlink we refuse
+    // before any file handle is created.
+    if let Ok(md) = std::fs::symlink_metadata(path) {
+        if md.file_type().is_symlink() {
+            tracing::error!(
+                path = %path.display(),
+                "pkcs11-spy: refusing to open log file: path is a symlink"
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "pkcs11-spy: refusing to open symlink as log file",
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        // First, attempt atomic create with O_EXCL semantics. This races safely:
+        // if an attacker pre-creates a symlink at the path, create_new fails with
+        // AlreadyExists, and we fall through to the existing-file open below which
+        // sets O_NOFOLLOW and refuses the symlink.
+        let create_flags = libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        match std::fs::OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .custom_flags(create_flags)
+            .open(path)
+        {
+            Ok(f) => Ok(f),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                // File exists — open without O_CREAT, but keep O_NOFOLLOW so the
+                // kernel refuses the open if the path is a symlink.
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(path)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_OPEN_REPARSE_POINT (0x00200000) opens the reparse point
+        // itself rather than following it; combined with the symlink_metadata
+        // re-check below, any symlink target is refused.
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
+
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+
+        // Post-open re-check: if the path became a symlink between the up-front
+        // probe and the open call, refuse now.
+        if let Ok(md) = std::fs::symlink_metadata(path) {
+            if md.file_type().is_symlink() {
+                tracing::error!(
+                    path = %path.display(),
+                    "pkcs11-spy: refusing to open log file: path became a symlink during open"
+                );
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "pkcs11-spy: refusing to open symlink as log file",
+                ));
+            }
+        }
+        Ok(f)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
     }
 }
 
@@ -315,5 +419,53 @@ fn ckr_name(rv: u64) -> &'static str {
         0x00000190 => "CKR_CRYPTOKI_NOT_INITIALIZED",
         0x00000191 => "CKR_CRYPTOKI_ALREADY_INITIALIZED",
         _ => "CKR_UNKNOWN",
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::open_log_file;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn open_log_file_refuses_symlink_targets() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A direct (non-symlink) target should open fine.
+        let direct = dir.path().join("direct.log");
+        let f = open_log_file(&direct).expect("direct path opens");
+        drop(f);
+        assert!(direct.exists());
+
+        // Create a real file and a symlink pointing at it.
+        let real = dir.path().join("real.log");
+        std::fs::write(&real, b"existing\n").expect("write real");
+        let link = dir.path().join("link.log");
+        symlink(&real, &link).expect("create symlink");
+
+        let err = open_log_file(&link)
+            .expect_err("symlinked path must be refused");
+        // The real file's contents must be untouched.
+        let after = std::fs::read(&real).expect("read real");
+        assert_eq!(after, b"existing\n", "symlink target must not be modified");
+        // We don't assert on a specific kind across platforms, but on Unix our
+        // helper returns InvalidInput (refused up-front) or a kernel ELOOP via
+        // O_NOFOLLOW; either is acceptable as long as the open fails.
+        let _ = err;
+    }
+
+    #[test]
+    fn open_log_file_creates_new_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fresh.log");
+        let mut f = open_log_file(&path).expect("create new");
+        use std::io::Write;
+        writeln!(f, "hello").expect("write");
+        drop(f);
+        // Reopen and append should also succeed.
+        let mut f2 = open_log_file(&path).expect("reopen existing");
+        writeln!(f2, "world").expect("append");
+        let contents = std::fs::read_to_string(&path).expect("read");
+        assert!(contents.contains("hello"));
+        assert!(contents.contains("world"));
     }
 }
