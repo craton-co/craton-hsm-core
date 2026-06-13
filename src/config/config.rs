@@ -2,7 +2,7 @@
 // Copyright 2026 Craton Software Company
 use serde::Deserialize;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::error::HsmError;
 
@@ -176,8 +176,104 @@ impl Default for AlgorithmConfig {
 fn default_label() -> String {
     "Craton HSM Token 0".to_string()
 }
+/// Relative fallback used by `default_storage_path` when the platform
+/// default system directory does not exist. Kept as a constant so tests
+/// and other callers can refer to it without duplicating the literal.
+const RELATIVE_STORAGE_FALLBACK: &str = "craton_hsm_store";
+
+/// Default storage path for the encrypted token store.
+///
+/// Picks a platform-appropriate absolute system directory when it exists at
+/// startup:
+///   - Unix:    `/var/lib/craton-hsm/store`
+///   - Windows: `%PROGRAMDATA%\craton-hsm\store`
+///
+/// If that directory is not present we deliberately do *not* try to create
+/// it — provisioning system directories is a deployment concern, not a
+/// library concern. Instead we fall back to the legacy CWD-relative
+/// `craton_hsm_store` and emit a `tracing::warn!` so operators notice that
+/// a non-stable default is in use.
 fn default_storage_path() -> PathBuf {
-    PathBuf::from("craton_hsm_store")
+    if let Some(system_default) = platform_default_storage_dir() {
+        // Use the system directory only when its parent exists, so we do not
+        // hand out a path the daemon cannot create on first run. We check the
+        // parent rather than the leaf so a fresh install that has the parent
+        // (e.g. `/var/lib/craton-hsm`) provisioned but no `store` subdir yet
+        // still gets the stable absolute default.
+        let parent_exists = system_default
+            .parent()
+            .map(|p| p.is_dir())
+            .unwrap_or(false);
+        if parent_exists {
+            return system_default;
+        }
+        tracing::warn!(
+            "default storage parent directory '{}' does not exist — falling back to relative '{}' \
+             (a process-CWD-relative store is a privesc foothold; configure storage_path \
+             explicitly or provision the system directory)",
+            system_default.display(),
+            RELATIVE_STORAGE_FALLBACK
+        );
+    }
+    PathBuf::from(RELATIVE_STORAGE_FALLBACK)
+}
+
+/// Canonicalize the deepest existing prefix of `path` and append the
+/// remaining non-existent tail components verbatim.
+///
+/// `std::fs::canonicalize` fails if any component does not exist, but we
+/// need to validate paths whose leaf (and possibly the last few directories)
+/// have not been created yet — `storage_path` on first run is exactly that
+/// shape. We walk from the leaf up, find the deepest ancestor that exists,
+/// canonicalize *that*, and stitch the non-existent suffix back on.
+///
+/// On any unexpected error we fall back to returning the original path —
+/// the caller's other checks (raw-component `..` scan, symlink walk) still
+/// run, so this never weakens validation.
+fn canonicalize_deepest_existing(path: &Path) -> PathBuf {
+    // Walk up ancestors looking for the first one that exists. `ancestors()`
+    // yields the path itself first, then its parent, then grandparent, …,
+    // ending with the root (or "" for empty/relative-only paths).
+    for ancestor in path.ancestors() {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+        if let Ok(canon) = std::fs::canonicalize(ancestor) {
+            // Strip the existing-prefix from the original path; whatever
+            // remains is the not-yet-created suffix we append back on.
+            if let Ok(suffix) = path.strip_prefix(ancestor) {
+                let mut out = canon;
+                out.push(suffix);
+                return out;
+            }
+            return canon;
+        }
+    }
+    path.to_path_buf()
+}
+
+/// Resolve the platform-default absolute storage directory.
+///
+/// Returns `None` on platforms where we do not have a sensible system-wide
+/// default (so callers fall back to the relative path).
+fn platform_default_storage_dir() -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        Some(PathBuf::from("/var/lib/craton-hsm/store"))
+    }
+    #[cfg(windows)]
+    {
+        std::env::var_os("PROGRAMDATA").map(|pd| {
+            let mut p = PathBuf::from(pd);
+            p.push("craton-hsm");
+            p.push("store");
+            p
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
 }
 fn default_max_sessions() -> u64 {
     100
@@ -285,19 +381,31 @@ impl HsmConfig {
         config
     }
 
-    /// Validate that a filesystem path is safe: no absolute paths, no traversal,
-    /// no UNC paths, no null bytes, no symlinks, no sensitive directory targets.
+    /// Validate that a filesystem path is safe.
+    ///
+    /// Accepts both absolute and CWD-relative paths. Absolute paths are
+    /// required for production deployments (a CWD-relative store is a common
+    /// privesc foothold), but relative paths are still honoured for
+    /// backward compatibility and resolved against the process working
+    /// directory by the consumer.
+    ///
+    /// Rejects:
+    ///   * UNC paths (`\\server\share`, `//server/share`).
+    ///   * Null bytes anywhere in the path string.
+    ///   * `..` traversal components (checked both before and after
+    ///     canonicalization of the deepest existing prefix).
+    ///   * Any component that is a symlink — symlinks are a TOCTOU footgun
+    ///     for security-sensitive state. Operators who need to relocate the
+    ///     store should configure `storage_path` directly instead of
+    ///     introducing a symlink the daemon must trust.
+    ///   * First component matching a known sensitive directory
+    ///     (`.git`, `.ssh`, …) for relative paths.
+    ///
     /// `label` is used in error messages (e.g. "config path", "storage_path").
-    fn validate_path_safety(path: &std::path::Path, label: &str) -> Result<(), Vec<String>> {
+    fn validate_path_safety(path: &Path, label: &str) -> Result<(), Vec<String>> {
         let mut errors: Vec<String> = Vec::new();
         let path_str = path.to_string_lossy();
 
-        if path.is_absolute() {
-            errors.push(format!(
-                "{} '{}' is absolute — must be relative to the working directory",
-                label, path_str
-            ));
-        }
         if path_str.starts_with("\\\\") || path_str.starts_with("//") {
             errors.push(format!(
                 "{} '{}' is a UNC path — not permitted",
@@ -317,30 +425,89 @@ impl HsmConfig {
             errors.push(format!("{} contains null byte", label));
         }
 
-        // Reject paths targeting sensitive directories.
-        if let Some(first) = path.components().next() {
-            let first_str = first.as_os_str().to_string_lossy();
-            for prefix in SENSITIVE_PATH_PREFIXES {
-                if first_str.eq_ignore_ascii_case(prefix) {
-                    errors.push(format!(
-                        "{} '{}' targets sensitive directory '{}'",
-                        label, path_str, prefix
-                    ));
-                    break;
+        // Reject relative paths whose first component targets a known
+        // sensitive directory. We only check this on relative paths because
+        // an absolute path's first component is the root (`/` or `C:\`),
+        // which is never a sensitive-name match.
+        if path.is_relative() {
+            if let Some(first) = path.components().next() {
+                let first_str = first.as_os_str().to_string_lossy();
+                for prefix in SENSITIVE_PATH_PREFIXES {
+                    if first_str.eq_ignore_ascii_case(prefix) {
+                        errors.push(format!(
+                            "{} '{}' targets sensitive directory '{}'",
+                            label, path_str, prefix
+                        ));
+                        break;
+                    }
                 }
             }
         }
 
-        // Reject symlinks (TOCTOU mitigation — check at validation time).
-        if path.exists() {
-            match std::fs::symlink_metadata(path) {
+        // Walk every ancestor that already exists and reject if any link in
+        // the chain is a symlink. This covers the case where the leaf does
+        // not exist yet (typical on first-run for storage_path) but a parent
+        // does, as well as the existing-leaf case the old check handled.
+        // We deliberately reject *any* symlink rather than trying to enforce
+        // an allowed-root policy — operators can configure storage_path
+        // directly to the real location.
+        if let Err(sym_errs) = Self::reject_symlinks_on_path(path, label) {
+            errors.extend(sym_errs);
+        }
+
+        // After resolving symlinks on the deepest existing prefix, ensure no
+        // `..` survives. canonicalize collapses traversal, so a path that
+        // canonicalizes to something different from its lexical join is a
+        // sign of either symlinks (already caught) or weirdness we don't
+        // want. The component-level `..` check above already rejects raw
+        // traversal; this is a belt-and-braces sanity check.
+        let canonical = canonicalize_deepest_existing(path);
+        for component in canonical.components() {
+            if let std::path::Component::ParentDir = component {
+                errors.push(format!(
+                    "{} '{}' canonicalizes to a path containing '..'",
+                    label, path_str
+                ));
+                break;
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Reject the path if any existing component (the leaf or any ancestor)
+    /// is a symlink. Non-existent tail components are skipped — they cannot
+    /// be symlinks yet, and the deepest-existing-prefix is what
+    /// canonicalization would resolve.
+    fn reject_symlinks_on_path(path: &Path, label: &str) -> Result<(), Vec<String>> {
+        let mut errors: Vec<String> = Vec::new();
+        let mut acc = PathBuf::new();
+        for component in path.components() {
+            acc.push(component.as_os_str());
+            // `symlink_metadata` does NOT follow the final component, which
+            // is exactly what we want here — we're checking each step.
+            match std::fs::symlink_metadata(&acc) {
                 Ok(meta) if meta.file_type().is_symlink() => {
                     errors.push(format!(
-                        "{} '{}' is a symlink — not permitted",
-                        label, path_str
+                        "{} '{}' contains a symlink component at '{}' — not permitted",
+                        label,
+                        path.to_string_lossy(),
+                        acc.display()
                     ));
+                    // One error is enough; the path is rejected.
+                    return Err(errors);
                 }
-                _ => {}
+                Ok(_) => {}
+                Err(_) => {
+                    // Component does not exist yet (or is unreadable). Stop
+                    // walking — anything below this point cannot be a
+                    // symlink on disk because it does not exist.
+                    break;
+                }
             }
         }
         if errors.is_empty() {
@@ -702,5 +869,134 @@ impl HsmConfig {
             tracing::error!("Configuration validation failed: {}", msg);
             Err(HsmError::ConfigError(msg))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// Build a unique tempdir path so concurrent tests do not collide.
+    ///
+    /// On Unix we canonicalize the base so the symlink walk does not trip on
+    /// platforms where `/var` or similar is itself a symlink (notably macOS,
+    /// where `/var -> /private/var`). On Windows we deliberately *do not*
+    /// canonicalize, because `std::fs::canonicalize` returns the extended-
+    /// length `\\?\C:\…` form which our validator treats as a UNC path —
+    /// real operators pass `C:\ProgramData\…` style paths, not the `\\?\`
+    /// form, so the test should mirror that.
+    fn unique_tempdir(tag: &str) -> PathBuf {
+        #[cfg(unix)]
+        let base = std::fs::canonicalize(std::env::temp_dir())
+            .expect("temp_dir must exist and be canonicalizable");
+        #[cfg(not(unix))]
+        let base = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = base.join(format!(
+            "craton-hsm-cfg-{}-{}-{}",
+            tag,
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&dir).expect("can create tempdir");
+        dir
+    }
+
+    #[test]
+    fn absolute_path_with_no_symlinks_is_accepted() {
+        // The whole point of this change: a stable absolute storage path
+        // must validate cleanly.
+        let dir = unique_tempdir("abs-ok");
+        let leaf = dir.join("store");
+        // Leaf does not exist; that's fine — first-run shape.
+        let res = HsmConfig::validate_path_safety(&leaf, "storage_path");
+        assert!(res.is_ok(), "expected absolute path to be accepted: {:?}", res);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_path_with_symlink_component_is_rejected() {
+        use std::os::unix::fs::symlink;
+        let dir = unique_tempdir("abs-symlink");
+        // Real target dir and a symlink that points at it.
+        let real = dir.join("real");
+        std::fs::create_dir(&real).expect("create real");
+        let link = dir.join("link");
+        symlink(&real, &link).expect("create symlink");
+
+        // Path that traverses the symlink: should be rejected.
+        let candidate = link.join("store");
+        let res = HsmConfig::validate_path_safety(&candidate, "storage_path");
+        assert!(
+            res.is_err(),
+            "expected symlink-containing path to be rejected: {:?}",
+            res
+        );
+        let errs = res.unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("symlink")),
+            "expected a symlink-related error, got: {:?}",
+            errs
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn relative_path_is_still_accepted() {
+        // Backwards compatibility: the legacy CWD-relative default must
+        // continue to validate.
+        let res = HsmConfig::validate_path_safety(
+            Path::new(RELATIVE_STORAGE_FALLBACK),
+            "storage_path",
+        );
+        assert!(res.is_ok(), "expected relative default to pass: {:?}", res);
+    }
+
+    #[test]
+    fn parent_dir_component_is_rejected() {
+        // Raw `..` traversal is still rejected, regardless of whether the
+        // path is absolute or relative.
+        let res = HsmConfig::validate_path_safety(
+            Path::new("../../etc/shadow"),
+            "storage_path",
+        );
+        assert!(res.is_err(), "expected '..' traversal to be rejected");
+        let errs = res.unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("'..'")),
+            "expected a traversal-related error, got: {:?}",
+            errs
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_path_with_parent_dir_is_rejected() {
+        // `..` in an absolute path is also rejected.
+        let res = HsmConfig::validate_path_safety(
+            Path::new("/var/lib/craton-hsm/../passwd"),
+            "storage_path",
+        );
+        assert!(
+            res.is_err(),
+            "expected absolute '..' traversal to be rejected"
+        );
+    }
+
+    #[test]
+    fn canonicalize_deepest_existing_handles_missing_leaf() {
+        let dir = unique_tempdir("canon");
+        let missing = dir.join("nope").join("deeper");
+        let canon = canonicalize_deepest_existing(&missing);
+        // The existing prefix must be canonicalized (i.e. resolved), and
+        // the missing tail must be preserved verbatim.
+        assert!(canon.ends_with("nope/deeper") || canon.ends_with("nope\\deeper"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

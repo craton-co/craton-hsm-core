@@ -1148,21 +1148,43 @@ fn test_config_path_traversal_rejection() {
 }
 
 #[test]
-fn test_config_absolute_path_rejection() {
+fn test_config_absolute_path_accepted() {
+    // Production HSMs need a stable absolute store directory; a
+    // CWD-relative default is a privesc foothold. validate_path_safety
+    // now accepts absolute paths after canonicalization + symlink checks.
     use craton_hsm::config::HsmConfig;
 
     let mut config = HsmConfig::default();
-    // Use appropriate absolute path for the platform
+    // On Unix canonicalize so we do not accidentally trip the symlink
+    // rejection on platforms where /var or similar is itself a symlink
+    // (notably macOS). On Windows do NOT canonicalize — the verbatim
+    // \\?\C:\... form would be flagged as UNC by validate_path_safety,
+    // which is the correct behavior for real input but inappropriate for
+    // a synthetic test path.
     #[cfg(unix)]
-    {
-        config.token.storage_path = std::path::PathBuf::from("/etc/passwd");
-    }
-    #[cfg(windows)]
-    {
-        config.token.storage_path = std::path::PathBuf::from("C:\\Windows\\system32");
-    }
+    let tmp = std::fs::canonicalize(std::env::temp_dir())
+        .expect("temp_dir must exist and be canonicalizable");
+    #[cfg(not(unix))]
+    let tmp = std::env::temp_dir();
+    let unique = format!(
+        "craton-hsm-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let candidate = tmp.join(&unique);
+    assert!(candidate.is_absolute(), "tempdir must yield an absolute path");
+    config.token.storage_path = candidate;
+    // Audit log_path still uses the relative default, so the only
+    // path-shaped change is storage_path.
     let result = config.validate();
-    assert!(result.is_err(), "Absolute path should be rejected");
+    assert!(
+        result.is_ok(),
+        "absolute storage_path should now be accepted: {:?}",
+        result
+    );
 }
 
 #[test]

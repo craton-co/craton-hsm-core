@@ -29,7 +29,7 @@ The following validation rules are enforced on load:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `label` | string | `"Craton HSM Token 0"` | Token display name (returned by `C_GetTokenInfo`) |
-| `storage_path` | string | `"craton_hsm_store"` | Path to the redb persistent storage database. Must be relative (no absolute paths, no `..` traversal, no UNC paths). |
+| `storage_path` | string | platform default (see below) | Path to the redb persistent storage database. May be absolute or CWD-relative. Rejected: `..` traversal, UNC paths, null bytes, and any component that is a symlink. Default: `/var/lib/craton-hsm/store` on Unix and `%PROGRAMDATA%\craton-hsm\store` on Windows when the parent system directory exists, otherwise falls back to the legacy relative `craton_hsm_store` (with a startup warning). |
 | `max_sessions` | integer | `100` | Maximum concurrent PKCS#11 sessions |
 | `max_rw_sessions` | integer | `10` | Maximum read-write sessions |
 | `persist_objects` | bool | `false` | Persist token objects to disk (AES-256-GCM encrypted) |
