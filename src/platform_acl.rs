@@ -120,15 +120,28 @@ pub(crate) fn restrict_file_to_owner(path: &Path) -> Result<(), String> {
             return Err(format!("InitializeAcl failed (error {})", err));
         }
 
-        // GENERIC_READ | GENERIC_WRITE
-        let access_mask: u32 = 0x80000000 | 0x40000000;
+        // GENERIC_READ | GENERIC_WRITE | DELETE | SYNCHRONIZE.
+        //
+        // DELETE (0x00010000) is required so the owner can rename or unlink
+        // the file — audit log rotation, lockout JSON replacement, and backup
+        // tmp-file rename all call `std::fs::rename`, which fails without it.
+        //
+        // SYNCHRONIZE (0x00100000) is required because Rust's
+        // `std::fs::OpenOptions` requests it implicitly when opening files
+        // for read or write; omitting it would make even basic `File::open`
+        // fail with ERROR_ACCESS_DENIED after the DACL is applied.
+        let access_mask: u32 = 0x80000000 | 0x40000000 | 0x00010000 | 0x00100000;
         if AddAccessAllowedAce(acl_ptr, ACL_REVISION, access_mask, user_sid) == 0 {
             let err = GetLastError();
             return Err(format!("AddAccessAllowedAce failed (error {})", err));
         }
 
         // Step 4: Apply the protected DACL to the file.
-        // SE_FILE_OBJECT=1, DACL_SECURITY_INFORMATION=4, PROTECTED_DACL=0x80000000
+        //
+        // SE_FILE_OBJECT=1, DACL_SECURITY_INFORMATION=4, PROTECTED_DACL=0x80000000.
+        // PROTECTED_DACL_SECURITY_INFORMATION sets SE_DACL_PROTECTED on the
+        // resulting security descriptor, which blocks inheritance from the
+        // parent directory — a parent ACL cannot grant write to others.
         let result = SetNamedSecurityInfoW(
             wide_path.as_ptr() as *const u16,
             1, // SE_FILE_OBJECT
@@ -247,5 +260,40 @@ mod tests {
             // need to add a windows-sys feature for it just to run a test.
             let _ = sd;
         }
+    }
+
+    /// Regression test for the audit-log rotation bug: after
+    /// `restrict_file_to_owner` runs, the owner must still be able to rename
+    /// the file. Without DELETE in the access mask, `std::fs::rename` fails
+    /// with ERROR_ACCESS_DENIED on the second rotation onward, breaking
+    /// `rotate_log_files`, lockout JSON replacement, and backup tmp-file
+    /// rename.
+    #[test]
+    fn restricted_file_can_be_renamed_by_owner() {
+        // Use NamedTempFile to pick a unique path, then drop the handle so the
+        // file is closed before we set the DACL — matches how the production
+        // call sites use restrict_file_to_owner (after close, not while open).
+        let f = NamedTempFile::new().expect("create temp file");
+        let src = f.path().to_path_buf();
+        // Persist so the temp file isn't auto-deleted when `f` is dropped.
+        let _ = f.persist(&src).expect("persist temp file");
+
+        std::fs::write(&src, b"hsm-test").expect("write src");
+        restrict_file_to_owner(&src).expect("restrict_file_to_owner");
+
+        let mut dst = src.clone();
+        dst.set_extension("renamed");
+
+        std::fs::rename(&src, &dst).unwrap_or_else(|e| {
+            panic!(
+                "rename {} -> {} failed after restrict_file_to_owner: {}",
+                src.display(),
+                dst.display(),
+                e,
+            )
+        });
+
+        // Cleanup — best effort; if this fails the OS will reap on reboot.
+        let _ = std::fs::remove_file(&dst);
     }
 }
