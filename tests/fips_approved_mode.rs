@@ -526,6 +526,85 @@ fn fips_mode_blocks_pqc_keygen() {
 }
 
 // =============================================================================
+// Test: RSA-1024 keygen is rejected in FIPS mode.
+//
+// FIPS 140-3 / SP 800-131A Rev.2 forbids RSA below 2048 bits.  Two layers
+// reject this today:
+//   1) src/crypto/approved_services.rs::enforce, wired into C_GenerateKeyPair
+//      via the ABI dispatcher (the path under test).
+//   2) src/crypto/keygen.rs hard-codes a {2048, 3072, 4096} match.
+// approved_services::enforce runs first, so it is the path that returns the
+// error here.  Both layers are kept as defense in depth.
+// =============================================================================
+
+#[test]
+fn fips_mode_blocks_rsa_1024_keygen() {
+    let session = setup_session();
+
+    let modulus_bits: CK_ULONG = 1024;
+    let pub_exp: [u8; 3] = [0x01, 0x00, 0x01];
+    let true_val: CK_BBOOL = CK_TRUE;
+
+    let mut pub_template = [
+        CK_ATTRIBUTE {
+            attr_type: CKA_MODULUS_BITS,
+            p_value: &modulus_bits as *const _ as *mut _,
+            value_len: std::mem::size_of::<CK_ULONG>() as CK_ULONG,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_PUBLIC_EXPONENT,
+            p_value: pub_exp.as_ptr() as *mut _,
+            value_len: 3,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_VERIFY,
+            p_value: &true_val as *const _ as *mut _,
+            value_len: 1,
+        },
+    ];
+    let mut priv_template = [CK_ATTRIBUTE {
+        attr_type: CKA_SIGN,
+        p_value: &true_val as *const _ as *mut _,
+        value_len: 1,
+    }];
+
+    let mut mechanism = CK_MECHANISM {
+        mechanism: CKM_RSA_PKCS_KEY_PAIR_GEN,
+        p_parameter: ptr::null_mut(),
+        parameter_len: 0,
+    };
+
+    let mut pub_key: CK_OBJECT_HANDLE = 0;
+    let mut priv_key: CK_OBJECT_HANDLE = 0;
+    let rv = C_GenerateKeyPair(
+        session,
+        &mut mechanism,
+        pub_template.as_mut_ptr(),
+        pub_template.len() as CK_ULONG,
+        priv_template.as_mut_ptr(),
+        priv_template.len() as CK_ULONG,
+        &mut pub_key,
+        &mut priv_key,
+    );
+    assert_ne!(
+        rv, CKR_OK,
+        "RSA-1024 keygen must be rejected in FIPS mode, got CKR_OK"
+    );
+    // approved_services::enforce returns HsmError::KeySizeRange ->
+    // CKR_KEY_SIZE_RANGE before keygen.rs is reached.
+    assert_eq!(
+        rv, CKR_KEY_SIZE_RANGE,
+        "RSA-1024 keygen should fail with CKR_KEY_SIZE_RANGE via approved_services, got 0x{:08X}",
+        rv
+    );
+    assert_eq!(pub_key, 0, "no public key handle should be written on failure");
+    assert_eq!(
+        priv_key, 0,
+        "no private key handle should be written on failure"
+    );
+}
+
+// =============================================================================
 // Test: C_GetMechanismList in FIPS mode excludes non-approved mechanisms
 // =============================================================================
 

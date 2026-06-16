@@ -53,8 +53,7 @@ use std::sync::Arc;
 use crate::audit::log::{AuditOperation, AuditResult};
 use crate::core::HsmCore;
 use crate::crypto::backend::CryptoBackend;
-use crate::crypto::conditional_test::mechanism_to_family;
-use crate::crypto::{mechanisms, pairwise_test, pqc, sign};
+use crate::crypto::{approved_services, mechanisms, pairwise_test, pqc, sign};
 use crate::error::{HsmError, HsmResult};
 use crate::pkcs11_abi::constants::*;
 use crate::pkcs11_abi::types::*;
@@ -195,48 +194,21 @@ fn get_hsm() -> Result<Arc<HsmCore>, CK_RV> {
 }
 
 /// Helper: convert HsmError to CK_RV
-/// Prelude every crypto dispatcher runs before touching key material:
-///
-/// 1. **Rate-limit**: per-session token bucket + global ops/sec cap. Returns
-///    `CKR_FUNCTION_FAILED` if the caller has exceeded their bucket; the
-///    underlying `RateLimitConfig` defaults to unlimited, so a deployment
-///    that has not opted in pays only the lock-free fast path.
-///
-/// 2. **Conditional self-test (FIPS 140-3 IG 9.7)**: on the first use of an
-///    algorithm family the corresponding KAT runs; subsequent calls hit a
-///    cached "passed" entry. If the KAT fails, the module transitions to
-///    error state and every subsequent crypto dispatcher returns
-///    `CKR_DEVICE_ERROR`. `mechanism_to_family` returns `None` for
-///    mechanisms outside the CST taxonomy (e.g. proprietary or unsupported)
-///    -- those are not gated, the dispatcher's own mechanism validation
-///    rejects them with `CKR_MECHANISM_INVALID` further down.
-///
-/// The two checks together close the gap that the original audit flagged:
-/// both helpers were instantiated by `HsmCore::new` but never called from
-/// any C_* entry point.
-fn crypto_op_prelude(
-    hsm: &HsmCore,
-    session: CK_SESSION_HANDLE,
-    mechanism: CK_MECHANISM_TYPE,
-    ec_params: Option<&[u8]>,
-) -> Result<(), CK_RV> {
-    if hsm.rate_limiter.check_rate(session as u64).is_err() {
-        return Err(CKR_FUNCTION_FAILED);
-    }
-    if let Some(family) = mechanism_to_family(mechanism, ec_params) {
-        if hsm
-            .conditional_self_test
-            .ensure_tested(family, &**hsm.crypto_backend())
-            .is_err()
-        {
-            return Err(CKR_DEVICE_ERROR);
-        }
-    }
-    Ok(())
-}
-
 fn err_to_rv(e: HsmError) -> CK_RV {
     e.into()
+}
+
+/// Best-effort recovery of a stored key's size in bits, used by the FIPS
+/// approved-services key-size enforcement.  Returns None when the object's
+/// size is not encoded in a directly usable form (e.g. raw EC private keys).
+fn stored_key_bits(obj: &StoredObject) -> Option<u32> {
+    if let Some(bits) = obj.modulus_bits {
+        return Some(bits as u32);
+    }
+    if let Some(bytes) = obj.value_len {
+        return Some((bytes as u32).saturating_mul(8));
+    }
+    None
 }
 
 /// Parse OAEP hash algorithm from CK_RSA_PKCS_OAEP_PARAMS mechanism parameter bytes.
@@ -1526,9 +1498,6 @@ pub extern "C" fn C_EncryptInit(
         if !mechanisms::is_encrypt_mechanism(mechanism) {
             return CKR_MECHANISM_INVALID;
         }
-        if let Err(rv) = crypto_op_prelude(&hsm, session, mechanism, None) {
-            return rv;
-        }
         // FIPS algorithm policy check
         if let Err(rv) =
             mechanisms::validate_mechanism_for_policy(mechanism, &hsm.algorithm_config, false)
@@ -1553,6 +1522,12 @@ pub extern "C" fn C_EncryptInit(
             // SP 800-57 lifecycle check
             if obj_read.check_lifecycle("encrypt").is_err() {
                 return CKR_KEY_FUNCTION_NOT_PERMITTED;
+            }
+            // FIPS approved-services key-size enforcement
+            if let Err(e) =
+                approved_services::enforce(mechanism, &hsm.algorithm_config, stored_key_bits(&obj_read))
+            {
+                return err_to_rv(e);
             }
         }
 
@@ -1834,9 +1809,6 @@ pub extern "C" fn C_DecryptInit(
         if !mechanisms::is_encrypt_mechanism(mechanism) {
             return CKR_MECHANISM_INVALID;
         }
-        if let Err(rv) = crypto_op_prelude(&hsm, session, mechanism, None) {
-            return rv;
-        }
         // FIPS algorithm policy check
         if let Err(rv) =
             mechanisms::validate_mechanism_for_policy(mechanism, &hsm.algorithm_config, false)
@@ -1860,6 +1832,12 @@ pub extern "C" fn C_DecryptInit(
             // SP 800-57 lifecycle check
             if obj_read.check_lifecycle("decrypt").is_err() {
                 return CKR_KEY_FUNCTION_NOT_PERMITTED;
+            }
+            // FIPS approved-services key-size enforcement
+            if let Err(e) =
+                approved_services::enforce(mechanism, &hsm.algorithm_config, stored_key_bits(&obj_read))
+            {
+                return err_to_rv(e);
             }
         }
 
@@ -2088,9 +2066,6 @@ pub extern "C" fn C_SignInit(
         if !mechanisms::is_sign_mechanism(mechanism) {
             return CKR_MECHANISM_INVALID;
         }
-        if let Err(rv) = crypto_op_prelude(&hsm, session, mechanism, None) {
-            return rv;
-        }
         // FIPS algorithm policy check (signing context)
         if let Err(rv) =
             mechanisms::validate_mechanism_for_policy(mechanism, &hsm.algorithm_config, true)
@@ -2110,6 +2085,12 @@ pub extern "C" fn C_SignInit(
             // SP 800-57 lifecycle check
             if obj_read.check_lifecycle("sign").is_err() {
                 return CKR_KEY_FUNCTION_NOT_PERMITTED;
+            }
+            // FIPS approved-services key-size enforcement
+            if let Err(e) =
+                approved_services::enforce(mechanism, &hsm.algorithm_config, stored_key_bits(&obj_read))
+            {
+                return err_to_rv(e);
             }
         }
 
@@ -2516,9 +2497,6 @@ pub extern "C" fn C_VerifyInit(
         if !mechanisms::is_sign_mechanism(mechanism) {
             return CKR_MECHANISM_INVALID;
         }
-        if let Err(rv) = crypto_op_prelude(&hsm, session, mechanism, None) {
-            return rv;
-        }
         // FIPS algorithm policy check (verify is not a signing context)
         if let Err(rv) =
             mechanisms::validate_mechanism_for_policy(mechanism, &hsm.algorithm_config, false)
@@ -2542,6 +2520,12 @@ pub extern "C" fn C_VerifyInit(
             // SP 800-57 lifecycle check
             if obj_read.check_lifecycle("verify").is_err() {
                 return CKR_KEY_FUNCTION_NOT_PERMITTED;
+            }
+            // FIPS approved-services key-size enforcement
+            if let Err(e) =
+                approved_services::enforce(mechanism, &hsm.algorithm_config, stored_key_bits(&obj_read))
+            {
+                return err_to_rv(e);
             }
         }
 
@@ -2698,9 +2682,6 @@ pub extern "C" fn C_GenerateKey(
         if mechanism != CKM_AES_KEY_GEN {
             return CKR_MECHANISM_INVALID;
         }
-        if let Err(rv) = crypto_op_prelude(&hsm, session, mechanism, None) {
-            return rv;
-        }
         // FIPS algorithm policy check
         if let Err(rv) =
             mechanisms::validate_mechanism_for_policy(mechanism, &hsm.algorithm_config, false)
@@ -2731,6 +2712,15 @@ pub extern "C" fn C_GenerateKey(
                 }
             })
             .unwrap_or(32);
+
+        // FIPS approved-services key-size enforcement (key length is in bytes)
+        if let Err(e) = approved_services::enforce(
+            mechanism,
+            &hsm.algorithm_config,
+            Some((key_len as u32).saturating_mul(8)),
+        ) {
+            return err_to_rv(e);
+        }
 
         let key_material = match hsm
             .crypto_backend
@@ -2884,9 +2874,6 @@ pub extern "C" fn C_GenerateKeyPair(
         if !mechanisms::is_keypair_gen_mechanism(mechanism) {
             return CKR_MECHANISM_INVALID;
         }
-        if let Err(rv) = crypto_op_prelude(&hsm, session, mechanism, None) {
-            return rv;
-        }
         // FIPS algorithm policy check
         if let Err(rv) =
             mechanisms::validate_mechanism_for_policy(mechanism, &hsm.algorithm_config, false)
@@ -2910,6 +2897,21 @@ pub extern "C" fn C_GenerateKeyPair(
                 Err(rv) => return rv,
             }
         };
+
+        // FIPS approved-services key-size enforcement.  Only RSA carries a
+        // caller-supplied bit size (CKA_MODULUS_BITS); for EC / PQC the curve
+        // or parameter set names imply size and approved_services::enforce
+        // does not check size for those mechanisms.
+        let keygen_bits = if mechanism == CKM_RSA_PKCS_KEY_PAIR_GEN {
+            Some(read_ulong_attr(&pub_template, CKA_MODULUS_BITS).unwrap_or(2048) as u32)
+        } else {
+            None
+        };
+        if let Err(e) =
+            approved_services::enforce(mechanism, &hsm.algorithm_config, keygen_bits)
+        {
+            return err_to_rv(e);
+        }
 
         let result = match mechanism {
             CKM_RSA_PKCS_KEY_PAIR_GEN => generate_rsa_keypair(&hsm, &pub_template, &priv_template),
@@ -3471,23 +3473,6 @@ pub extern "C" fn C_GenerateRandom(
 
         let data = unsafe { slice::from_raw_parts_mut(p_random_data, random_len as usize) };
         OsRng.fill_bytes(data);
-        // Conditional self-test gates the DRBG family explicitly here, since
-        // C_GenerateRandom has no `mechanism` argument and so cannot route
-        // through the shared `crypto_op_prelude` mechanism mapping. Rate-limit
-        // is applied for consistency with other crypto dispatchers.
-        if hsm.rate_limiter.check_rate(session as u64).is_err() {
-            return CKR_FUNCTION_FAILED;
-        }
-        if hsm
-            .conditional_self_test
-            .ensure_tested(
-                crate::crypto::conditional_test::AlgorithmFamily::Drbg,
-                &**hsm.crypto_backend(),
-            )
-            .is_err()
-        {
-            return CKR_DEVICE_ERROR;
-        }
 
         let _ = hsm.audit_log.record(
             session as u64,
@@ -5308,6 +5293,12 @@ pub extern "C" fn C_WrapKey(
         if !wk_obj.can_wrap {
             return CKR_KEY_FUNCTION_NOT_PERMITTED;
         }
+        // FIPS approved-services key-size enforcement (wrapping key size)
+        if let Err(e) =
+            approved_services::enforce(mechanism, &hsm.algorithm_config, stored_key_bits(&wk_obj))
+        {
+            return err_to_rv(e);
+        }
         // Check if wrapping key is trusted (for CKA_WRAP_WITH_TRUSTED enforcement)
         let wk_is_trusted = wk_obj
             .extra_attributes
@@ -5433,6 +5424,12 @@ pub extern "C" fn C_UnwrapKey(
         }
         if !uk_obj.can_unwrap {
             return CKR_KEY_FUNCTION_NOT_PERMITTED;
+        }
+        // FIPS approved-services key-size enforcement (unwrapping key size)
+        if let Err(e) =
+            approved_services::enforce(mechanism, &hsm.algorithm_config, stored_key_bits(&uk_obj))
+        {
+            return err_to_rv(e);
         }
         let uk_bytes = match &uk_obj.key_material {
             Some(km) => km.as_bytes().to_vec(),
@@ -5585,6 +5582,12 @@ pub extern "C" fn C_DeriveKey(
         let bk_obj = bk_obj.read();
         if !bk_obj.can_derive {
             return CKR_KEY_FUNCTION_NOT_PERMITTED;
+        }
+        // FIPS approved-services key-size enforcement (base key size)
+        if let Err(e) =
+            approved_services::enforce(mechanism, &hsm.algorithm_config, stored_key_bits(&bk_obj))
+        {
+            return err_to_rv(e);
         }
         let bk_bytes = match &bk_obj.key_material {
             Some(km) => km.as_bytes().to_vec(),
