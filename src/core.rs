@@ -263,4 +263,15 @@ impl HsmCore {
     pub fn metrics(&self) -> &MetricsCollector {
         &self.metrics
     }
+
+    /// Whether the SP 800-90B entropy source health monitor has tripped.
+    ///
+    /// Returns `true` if either continuous health test (repetition count or
+    /// adaptive proportion) has failed, or if the startup test failed. Once
+    /// set, this stays set for the process lifetime — callers that observe a
+    /// `true` here MUST refuse to perform crypto operations and return
+    /// `CKR_DEVICE_ERROR` / `CKR_GENERAL_ERROR` to the PKCS#11 client.
+    pub fn entropy_health_error_state(&self) -> bool {
+        crate::crypto::entropy_health::global_is_error_state()
+    }
 }
