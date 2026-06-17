@@ -3,22 +3,26 @@
 //! HMAC_DRBG implementation per NIST SP 800-90A Rev.1.
 //!
 //! Uses HMAC-SHA256 as the underlying function.
-//! Entropy is sourced from the OS via `OsRng` — this is the ONLY
-//! place in the codebase that should use `OsRng` directly (besides
-//! self-test and `C_SeedRandom`).
+//! Entropy is sourced from the OS via [`HealthMonitoredRng`], which wraps
+//! `OsRng` and routes every consumed byte through the SP 800-90B continuous
+//! health tests (repetition count + adaptive proportion) defined in
+//! `crypto/entropy_health.rs`. The DRBG seed/reseed path is one of only a
+//! small number of legitimate raw-entropy consumers in the codebase, and is
+//! the primary integration point for the SP 800-90B monitor.
 //!
 //! Key properties:
 //! - Reseed interval: 2^48 (per SP 800-90A Table 2)
 //! - Continuous health test: consecutive output comparison (SP 800-90B §4.9)
+//! - SP 800-90B continuous health tests on the raw entropy source
 //! - Prediction resistance: reseeds from OS entropy on each generate call (conservative)
 //! - K and V are zeroized on drop
 
 use hmac::{Hmac, Mac};
-use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::Sha256;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
+use crate::crypto::entropy_health::HealthMonitoredRng;
 use crate::error::{HsmError, HsmResult};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -73,9 +77,11 @@ impl HmacDrbg {
             has_output: false,
         };
 
-        // Gather entropy (32 bytes) + nonce (16 bytes)
+        // Gather entropy (32 bytes) + nonce (16 bytes) through the
+        // SP 800-90B health-monitored RNG so a stuck/biased entropy source
+        // trips the module-level error state before reaching the DRBG.
         let mut seed = [0u8; 48];
-        OsRng.fill_bytes(&mut seed);
+        HealthMonitoredRng::new().fill_bytes(&mut seed);
         drbg.update(Some(&seed));
         seed.zeroize();
 
@@ -157,8 +163,14 @@ impl HmacDrbg {
     /// 2. Update(seed_material)
     /// 3. reseed_counter = 1
     pub fn reseed(&mut self) -> HsmResult<()> {
+        // Every reseed feeds 32 bytes of fresh OS entropy through the
+        // SP 800-90B health monitor via HealthMonitoredRng. On health-test
+        // failure the wrapper aborts the process (FIPS 140-3 §7.3); the
+        // `try_fill_bytes` path could be used here to surface a recoverable
+        // error, but the existing DRBG contract treats reseed failures as
+        // catastrophic anyway.
         let mut entropy = [0u8; 32];
-        OsRng.fill_bytes(&mut entropy);
+        HealthMonitoredRng::new().fill_bytes(&mut entropy);
         self.update(Some(&entropy));
         entropy.zeroize();
         self.reseed_counter = 1;
