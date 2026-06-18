@@ -44,16 +44,37 @@ struct HandleScrambler {
 
 impl HandleScrambler {
     fn new() -> Self {
+        // SAFETY-NOTE: this is process-init Feistel-key generation that runs
+        // before any `HsmCore` (and therefore any DRBG) exists — both handle
+        // allocators are constructed *inside* `HsmCore::try_new` / `ObjectStore::new`
+        // and feed into the construction itself, so routing through the
+        // SP 800-90A DRBG here would be a chicken-and-egg.
+        //
+        // The Feistel keys are not a FIPS-approved-services output: they
+        // are an internal bijective permutation parameter whose only goal
+        // is to make session/object handle values unpredictable to PKCS#11
+        // callers. OS entropy (`getrandom` / `BCryptGenRandom`) is acceptable
+        // here for the same reason it is acceptable as DRBG seed material.
+        //
+        // Do **not** copy this pattern into hot-path or key-material code —
+        // those must use `crate::crypto::drbg::{HmacDrbg, DrbgRng}` so the
+        // continuous-health-test gating and prediction-resistance reseed
+        // apply. A `tracing::debug!` is emitted so an operator auditing the
+        // log can see exactly how many times per process this fallback
+        // fires (expected: once per allocator, twice per HsmCore).
         use rand::RngCore;
         let mut rng = rand::rngs::OsRng;
-        Self {
-            round_keys: [
-                rng.next_u64(),
-                rng.next_u64(),
-                rng.next_u64(),
-                rng.next_u64(),
-            ],
-        }
+        let round_keys = [
+            rng.next_u64(),
+            rng.next_u64(),
+            rng.next_u64(),
+            rng.next_u64(),
+        ];
+        tracing::debug!(
+            "HandleScrambler keys sourced from OsRng \
+             (process-init Feistel-key generation, no DRBG yet available)"
+        );
+        Self { round_keys }
     }
 
     /// Forward permutation: counter → handle.
