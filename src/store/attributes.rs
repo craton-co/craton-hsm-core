@@ -2,8 +2,6 @@
 // Copyright 2026 Craton Software Company
 use dashmap::DashMap;
 use parking_lot::RwLock;
-use rand::rngs::OsRng;
-use rand::RngCore;
 use std::sync::Arc;
 use zeroize::Zeroize;
 
@@ -81,9 +79,32 @@ impl ObjectStore {
 
     /// Generate an opaque, random store key for a new object.
     /// Prevents sequential handle enumeration in the persistent store.
+    ///
+    /// Routes through the SP 800-90A HMAC_DRBG (per-call instantiation, matching
+    /// the `crypto::keygen` pattern) so the bytes are subject to the approved
+    /// DRBG's continuous health-test gating and prediction-resistance reseed.
+    /// Falls back to `OsRng` only on DRBG instantiation failure (which would
+    /// require OS entropy to be unavailable — already a catastrophic state).
     fn generate_store_key(&self, handle: CK_OBJECT_HANDLE) -> String {
         let mut random_bytes = [0u8; 16];
-        OsRng.fill_bytes(&mut random_bytes);
+        match crate::crypto::drbg::HmacDrbg::new()
+            .and_then(|mut drbg| drbg.generate(&mut random_bytes))
+        {
+            Ok(()) => {}
+            Err(e) => {
+                // DRBG unavailable — fall back to OsRng so we never emit a
+                // sequential / predictable store key. This branch is logged
+                // so operators can spot a degraded entropy environment.
+                use rand::rngs::OsRng;
+                use rand::RngCore;
+                tracing::warn!(
+                    "store-key DRBG instantiation failed ({:?}); \
+                     falling back to OsRng for opaque store-key generation",
+                    e
+                );
+                OsRng.fill_bytes(&mut random_bytes);
+            }
+        }
         let key = format!("obj_{}", hex::encode(random_bytes));
         self.handle_to_store_key.lock().insert(handle, key.clone());
         key
