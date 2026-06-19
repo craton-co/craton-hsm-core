@@ -146,7 +146,11 @@ impl From<HsmError> for CK_RV {
             HsmError::PinInvalid => CKR_PIN_INVALID,
             HsmError::PinLenRange => CKR_PIN_LEN_RANGE,
             HsmError::PinLocked => CKR_PIN_LOCKED,
-            HsmError::PinRateLimited => CKR_FUNCTION_FAILED,
+            // CKR_PIN_LOCKED is used per spec "when the user's PIN is locked out
+            // due to too many failed attempts" -- close enough semantically for a
+            // rate-limit lockout, and gives PKCS#11 clients a clear signal to back
+            // off rather than treating it as an arbitrary failure.
+            HsmError::PinRateLimited => CKR_PIN_LOCKED,
             HsmError::ObjectHandleInvalid => CKR_OBJECT_HANDLE_INVALID,
             HsmError::AttributeTypeInvalid => CKR_ATTRIBUTE_TYPE_INVALID,
             HsmError::AttributeValueInvalid => CKR_ATTRIBUTE_VALUE_INVALID,
