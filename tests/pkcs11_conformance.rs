@@ -1404,9 +1404,12 @@ fn test_login_lockout() {
 
     // Try wrong PIN repeatedly until lockout. Each failed attempt arms an
     // exponential backoff (100 ms × 2^(failures-1), capped at 5 s); subsequent
-    // attempts within the backoff window are rejected with CKR_FUNCTION_FAILED
+    // attempts within the backoff window are rejected with CKR_PIN_LOCKED
     // (PinRateLimited) without incrementing the failure counter. To actually
-    // reach the lockout threshold we must wait out each backoff window.
+    // reach the lockout threshold we must wait out each backoff window. Note
+    // that both rate-limit rejection and true lockout surface as CKR_PIN_LOCKED
+    // to the PKCS#11 client (both signal "back off and try later"), so we
+    // disambiguate by waiting the worst-case backoff and re-checking.
     let wrong_pin = b"wrongpn1";
     let mut locked = false;
     let mut failures: u32 = 0;
@@ -1418,13 +1421,28 @@ fn test_login_lockout() {
             wrong_pin.len() as CK_ULONG,
         );
         if rv == CKR_PIN_LOCKED {
-            locked = true;
-            break;
-        }
-        if rv == CKR_FUNCTION_FAILED {
-            // Rate-limited; wait the worst-case backoff and retry without
-            // counting this attempt.
+            // Could be rate-limited or truly locked. Wait the worst-case
+            // backoff and retry: if it still reports CKR_PIN_LOCKED, the
+            // account is genuinely locked.
             std::thread::sleep(std::time::Duration::from_millis(5100));
+            let rv2 = C_Login(
+                session,
+                CKU_USER,
+                wrong_pin.as_ptr() as *mut _,
+                wrong_pin.len() as CK_ULONG,
+            );
+            if rv2 == CKR_PIN_LOCKED {
+                locked = true;
+                break;
+            }
+            // Was rate-limited; the retry above either consumed a failure
+            // or was rejected with CKR_PIN_INCORRECT.
+            if rv2 == CKR_PIN_INCORRECT {
+                failures += 1;
+            }
+            let shift = failures.saturating_sub(1).min(6);
+            let delay_ms = (100u64 << shift).min(5000) + 50;
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
             continue;
         }
         assert_eq!(rv, CKR_PIN_INCORRECT, "Should report incorrect PIN");
@@ -1437,19 +1455,18 @@ fn test_login_lockout() {
     }
     assert!(locked, "Account should be locked after max failed attempts");
 
-    // Even correct PIN should be rejected when locked. The rate-limit check
-    // runs before the lockout check, so an immediate retry may surface as
-    // CKR_FUNCTION_FAILED (rate-limited) rather than CKR_PIN_LOCKED — both
-    // are valid rejections of a correct PIN on a locked account.
+    // Even correct PIN should be rejected when locked. Both rate-limit
+    // rejection and true lockout map to CKR_PIN_LOCKED, which is the only
+    // valid response here.
     let rv = C_Login(
         session,
         CKU_USER,
         user_pin.as_ptr() as *mut _,
         user_pin.len() as CK_ULONG,
     );
-    assert!(
-        rv == CKR_PIN_LOCKED || rv == CKR_FUNCTION_FAILED,
-        "Correct PIN should be rejected when account is locked, got 0x{:08X}",
+    assert_eq!(
+        rv, CKR_PIN_LOCKED,
+        "Correct PIN should be rejected with CKR_PIN_LOCKED when account is locked, got 0x{:08X}",
         rv
     );
 }

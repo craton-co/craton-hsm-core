@@ -301,18 +301,16 @@ impl StoredObject {
 
         match effective_state {
             KeyLifecycleState::Active => Ok(()),
-            KeyLifecycleState::PreActivation => {
-                Err(HsmError::GeneralError) // CKR_KEY_FUNCTION_NOT_PERMITTED mapped to GeneralError
-            }
+            KeyLifecycleState::PreActivation => Err(HsmError::KeyFunctionNotPermitted),
             KeyLifecycleState::Deactivated => {
                 // Allow verify, decrypt, unwrap (processing existing data)
                 // Block sign, encrypt, wrap (creating new protected data)
                 match operation {
                     "verify" | "decrypt" | "unwrap" => Ok(()),
-                    _ => Err(HsmError::GeneralError),
+                    _ => Err(HsmError::KeyFunctionNotPermitted),
                 }
             }
-            KeyLifecycleState::Compromised => Err(HsmError::GeneralError),
+            KeyLifecycleState::Compromised => Err(HsmError::KeyFunctionNotPermitted),
             KeyLifecycleState::Destroyed => Err(HsmError::ObjectHandleInvalid),
         }
     }
