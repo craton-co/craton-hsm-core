@@ -72,6 +72,13 @@ pub struct DaemonConfig {
     /// Per-request timeout in seconds. Default: 30.
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
+    /// CRL refresh interval in seconds. When `tls_client_crl` is set, a
+    /// background task re-reads the CRL file at this interval and atomically
+    /// swaps the TLS `ServerConfig` so revoked clients are rejected without
+    /// a daemon restart. Default: 300 (5 minutes). Set to 0 to disable
+    /// automatic CRL refresh (operators must SIGHUP after rotating the CRL).
+    #[serde(default = "default_crl_refresh_secs")]
+    pub crl_refresh_secs: u64,
 }
 
 fn default_bind() -> String {
@@ -102,6 +109,10 @@ fn default_request_timeout_secs() -> u64 {
     30
 }
 
+fn default_crl_refresh_secs() -> u64 {
+    300
+}
+
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
@@ -118,6 +129,7 @@ impl Default for DaemonConfig {
             login_cooldown_secs: default_login_cooldown_secs(),
             max_connections: default_max_connections(),
             request_timeout_secs: default_request_timeout_secs(),
+            crl_refresh_secs: default_crl_refresh_secs(),
         }
     }
 }

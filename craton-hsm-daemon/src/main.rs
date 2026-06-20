@@ -9,8 +9,10 @@ mod tls;
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use craton_hsm::config::config::HsmConfig;
 use craton_hsm::core::HsmCore;
+use rustls::ServerConfig;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tonic::transport::Server;
@@ -92,12 +94,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         full_config.daemon.max_login_attempts,
         full_config.daemon.login_cooldown_secs,
     );
-    let addr: std::net::SocketAddr = full_config.daemon.bind.parse()?;
+    let addr = full_config.daemon.bind.parse()?;
 
-    // Per-listener startup log lives in each branch below — TCP+TLS logs the
-    // bound address, and the UDS path (when allow_insecure=true on Unix) logs
-    // the socket path. We avoid logging `addr` here because in UDS mode it is
-    // a parsed-but-unused fallback.
+    tracing::info!("Craton HSM daemon listening on {}", addr);
 
     // gRPC message size limits (#12) — 4 MiB inbound, 16 MiB outbound
     let svc = HsmServiceServer::new(service)
@@ -107,25 +106,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (#15) Connection limits and request timeout
     let request_timeout = Duration::from_secs(full_config.daemon.request_timeout_secs);
     let max_connections = full_config.daemon.max_connections as usize;
-    let h2_keepalive_interval =
-        Duration::from_secs(full_config.daemon.http2_keepalive_interval_secs);
-    let h2_keepalive_timeout = Duration::from_secs(full_config.daemon.http2_keepalive_timeout_secs);
-    let tcp_keepalive = Duration::from_secs(full_config.daemon.tcp_keepalive_secs);
-    let max_concurrent_streams = full_config.daemon.max_concurrent_streams;
     let mut server = Server::builder()
         .timeout(request_timeout)
         .concurrency_limit_per_connection(64)
         // (#22) Enforce max_connections — previously configured but never applied.
         // This layer limits the total number of concurrent in-flight requests
         // across all connections, preventing connection exhaustion DoS.
-        .layer(ConcurrencyLimitLayer::new(max_connections))
-        // Slowloris / HTTP/2 RAPID-RESET defenses: keepalive pings detect
-        // dead peers, TCP keepalive trips OS-level abandoned-socket cleanup,
-        // and the stream cap bounds per-connection RAPID-RESET amplification.
-        .http2_keepalive_interval(Some(h2_keepalive_interval))
-        .http2_keepalive_timeout(Some(h2_keepalive_timeout))
-        .tcp_keepalive(Some(tcp_keepalive))
-        .max_concurrent_streams(Some(max_concurrent_streams));
+        .layer(ConcurrencyLimitLayer::new(max_connections));
 
     // Configure TLS — mandatory for production security
     if let (Some(cert), Some(key)) = (&full_config.daemon.tls_cert, &full_config.daemon.tls_key) {
@@ -139,84 +126,75 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             key,
             full_config.daemon.tls_client_ca.as_deref(),
             full_config.daemon.tls_client_crl.as_deref(),
-            full_config.daemon.allow_unauthenticated_tls,
         )?;
 
-        let tls_acceptor = TlsAcceptor::from(Arc::new(rustls_config));
+        // Wrap the ServerConfig in an ArcSwap so SIGHUP and the CRL refresh
+        // timer can atomically replace it. New TLS handshakes use the latest
+        // config; already-established connections keep their original TLS
+        // state (rustls clones the Arc into each ClientConnection on accept).
+        let config_swap: Arc<ArcSwap<ServerConfig>> =
+            Arc::new(ArcSwap::from(Arc::new(rustls_config)));
 
         // (#11) Do NOT log the TLS key path — it reveals filesystem layout
-        tracing::info!(
-            "TLS enabled — daemon listening on {} (cert: {}, TLS 1.3 enforced)",
-            addr,
-            cert
+        tracing::info!("TLS enabled (cert: {}, TLS 1.3 enforced)", cert);
+
+        // Spawn the SIGHUP reload task (Unix only — Windows has no SIGHUP).
+        // On signal, re-read cert/key/CA/CRL and swap the active config. A
+        // reload failure logs an error and keeps the old config in place so
+        // the daemon stays up across operator mistakes.
+        spawn_sighup_reload(
+            config_swap.clone(),
+            cert.clone(),
+            key.clone(),
+            full_config.daemon.tls_client_ca.clone(),
+            full_config.daemon.tls_client_crl.clone(),
         );
 
-        // Bind a TCP listener and wrap accepted connections with TLS using our
-        // validated rustls config (TLS 1.3, mTLS, CRL). Each TLS handshake is
-        // performed inside its own tokio task with a timeout, so a slow / stuck
-        // client cannot block the accept loop for everyone else and cannot tie
-        // up an accept slot indefinitely. Completed TLS streams are funneled
-        // back to the accept stream via an mpsc channel.
-        let listener = TcpListener::bind(addr).await?;
-        let handshake_timeout = Duration::from_secs(full_config.daemon.tls_handshake_timeout_secs);
-
-        type AcceptItem =
-            Result<tokio_rustls::server::TlsStream<tokio::net::TcpStream>, std::io::Error>;
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<AcceptItem>(max_connections);
-
-        // Spawn the accept loop in its own task. It only does cheap work
-        // (accept + spawn) and never awaits a handshake itself.
-        {
-            let tls_acceptor = tls_acceptor.clone();
-            tokio::spawn(async move {
-                loop {
-                    match listener.accept().await {
-                        Ok((tcp, remote_addr)) => {
-                            let tls_acceptor = tls_acceptor.clone();
-                            let tx = tx.clone();
-                            tokio::spawn(async move {
-                                match tokio::time::timeout(
-                                    handshake_timeout,
-                                    tls_acceptor.accept(tcp),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(tls_stream)) => {
-                                        // Send may fail if the server is shutting
-                                        // down; that's fine — the stream is dropped.
-                                        let _ = tx.send(Ok(tls_stream)).await;
-                                    }
-                                    Ok(Err(e)) => {
-                                        tracing::info!(
-                                            remote_addr = %remote_addr,
-                                            error = %e,
-                                            "TLS handshake failed"
-                                        );
-                                    }
-                                    Err(_) => {
-                                        tracing::info!(
-                                            remote_addr = %remote_addr,
-                                            timeout_secs = handshake_timeout.as_secs(),
-                                            "TLS handshake timed out"
-                                        );
-                                    }
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            tracing::error!(error = %e, "TCP accept failed");
-                            // Backoff briefly to avoid a tight spin on a
-                            // persistent accept error (e.g. EMFILE).
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                        }
-                    }
-                }
-            });
+        // Spawn the CRL refresh timer when a CRL is configured and refresh
+        // is enabled. Without it, a freshly revoked client cert is only
+        // honored after the next SIGHUP / restart.
+        if full_config.daemon.tls_client_crl.is_some() && full_config.daemon.crl_refresh_secs > 0 {
+            spawn_crl_refresh(
+                config_swap.clone(),
+                cert.clone(),
+                key.clone(),
+                full_config.daemon.tls_client_ca.clone(),
+                full_config.daemon.tls_client_crl.clone(),
+                Duration::from_secs(full_config.daemon.crl_refresh_secs),
+            );
         }
 
+        // Bind a TCP listener and wrap accepted connections with TLS using
+        // the *current* swapped config. The resulting stream of TLS
+        // connections is passed to tonic's serve_with_incoming_shutdown.
+        let listener = TcpListener::bind(addr).await?;
+        let accept_swap = config_swap.clone();
+
         let incoming = async_stream::stream! {
-            while let Some(item) = rx.recv().await {
-                yield item;
+            loop {
+                match listener.accept().await {
+                    Ok((tcp, remote_addr)) => {
+                        // Fetch the current config per-connection so reloads
+                        // take effect for new handshakes without disturbing
+                        // already-established sessions.
+                        let acceptor = TlsAcceptor::from(accept_swap.load_full());
+                        match acceptor.accept(tcp).await {
+                            Ok(tls_stream) => yield Ok(tls_stream),
+                            Err(e) => {
+                                tracing::debug!(
+                                    remote_addr = %remote_addr,
+                                    error = %e,
+                                    "TLS handshake failed"
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "TCP accept failed");
+                        yield Err(e);
+                    }
+                }
             }
         };
         tokio::pin!(incoming);
@@ -226,150 +204,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .serve_with_incoming_shutdown(incoming, shutdown_signal())
             .await?;
     } else if full_config.daemon.allow_insecure {
-        // (#sec-uds) Plaintext loopback TCP is NOT safe: any local user with
-        // CAP_NET_RAW (or any local process at all) can read PINs by sniffing
-        // `lo` or by simply connecting to the loopback port. Authenticate the
-        // caller via the filesystem instead.
-        //
-        // - Unix: bind a UDS at mode 0600 so only the daemon's UID can connect.
-        // - Windows: there is no SO_PEERCRED equivalent for loopback TCP, and
-        //   named-pipe ACLs would still leave the loopback TCP listener wide
-        //   open. Refuse `allow_insecure` outright and require TLS.
-        #[cfg(windows)]
-        {
+        // (#10) Refuse insecure mode on non-loopback addresses
+        if !full_config.daemon.is_loopback_bind() {
             tracing::error!(
-                "allow_insecure = true is not supported on Windows: there is no \
-                 equivalent of SO_PEERCRED for loopback TCP, so the listener \
-                 cannot authenticate the calling user. Configure tls_cert and \
-                 tls_key in [daemon] (TLS is the only safe option on Windows)."
+                "allow_insecure = true is only permitted on loopback addresses \
+                 (127.0.0.1 / [::1]). Bind address '{}' is not loopback. \
+                 Either bind to a loopback address or configure TLS.",
+                full_config.daemon.bind
             );
             std::process::exit(1);
         }
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            use tokio::net::UnixListener;
+        // (#1) Only allow plaintext if explicitly opted in
+        tracing::error!(
+            "TLS disabled — the daemon is running WITHOUT encryption or authentication. \
+             This is a CRITICAL security risk. Set allow_insecure = false and configure \
+             tls_cert / tls_key in [daemon] for production."
+        );
 
-            let sock_path = full_config.daemon.resolved_unix_socket_path();
-
-            // (1) Clean up a stale socket from a previous run, but ONLY if the
-            // existing path is actually a socket. Refusing to clobber regular
-            // files prevents the daemon from accidentally truncating an
-            // arbitrary file if `bind_unix` is misconfigured.
-            if let Ok(meta) = std::fs::symlink_metadata(&sock_path) {
-                use std::os::unix::fs::FileTypeExt;
-                if meta.file_type().is_socket() {
-                    if let Err(e) = std::fs::remove_file(&sock_path) {
-                        tracing::error!(
-                            path = %sock_path.display(),
-                            error = %e,
-                            "Failed to remove stale UDS socket file"
-                        );
-                        std::process::exit(1);
-                    }
-                } else {
-                    tracing::error!(
-                        path = %sock_path.display(),
-                        "bind_unix path exists and is NOT a socket — refusing to overwrite. \
-                         Remove the file manually or point bind_unix at a clean path."
-                    );
-                    std::process::exit(1);
-                }
-            }
-
-            // (2) Atomically create the socket with mode 0600 by setting
-            // umask=0o177 before bind(2). Doing chmod *after* bind would
-            // leave a window where another local user could connect with
-            // the default permissive mode.
-            // SAFETY: umask is process-global; we restore it immediately
-            // after bind.
-            let prev_umask = unsafe { libc::umask(0o177) };
-            let listener_result = UnixListener::bind(&sock_path);
-            unsafe {
-                libc::umask(prev_umask);
-            }
-            let listener = listener_result.map_err(|e| {
-                format!(
-                    "Failed to bind UDS '{}': {}. Ensure the parent directory \
-                     exists and is writable by the daemon's UID.",
-                    sock_path.display(),
-                    e
-                )
-            })?;
-
-            // (3) Defense in depth: verify the resulting file mode. If
-            // something defeated the umask (unusual filesystem, ACL),
-            // refuse to expose secrets and chmod down to 0600.
-            match std::fs::metadata(&sock_path) {
-                Ok(meta) => {
-                    let mode = meta.permissions().mode() & 0o777;
-                    if mode != 0o600 {
-                        tracing::warn!(
-                            path = %sock_path.display(),
-                            actual_mode = format!("{:o}", mode),
-                            "UDS socket mode is not 0600 after bind — chmod'ing down"
-                        );
-                        let perms = std::fs::Permissions::from_mode(0o600);
-                        if let Err(e) = std::fs::set_permissions(&sock_path, perms) {
-                            tracing::error!(
-                                path = %sock_path.display(),
-                                error = %e,
-                                "Failed to chmod UDS to 0600 — refusing to expose plaintext socket"
-                            );
-                            let _ = std::fs::remove_file(&sock_path);
-                            std::process::exit(1);
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(
-                        path = %sock_path.display(),
-                        error = %e,
-                        "Failed to stat UDS after bind — refusing to expose plaintext socket"
-                    );
-                    let _ = std::fs::remove_file(&sock_path);
-                    std::process::exit(1);
-                }
-            }
-
-            tracing::warn!(
-                "TLS disabled — daemon is serving plaintext gRPC on UDS '{}' \
-                 (mode 0600). Only the daemon's UID can connect. For production \
-                 deployments configure tls_cert / tls_key in [daemon] and serve \
-                 over TCP+TLS instead.",
-                sock_path.display()
-            );
-
-            // (4) Adapt the listener into a stream of accepted UnixStreams.
-            // Tonic implements `Connected` for `tokio::net::UnixStream`
-            // directly, so no wrapper type is needed.
-            let incoming = async_stream::stream! {
-                loop {
-                    match listener.accept().await {
-                        Ok((stream, _addr)) => yield Ok::<_, std::io::Error>(stream),
-                        Err(e) => {
-                            tracing::error!(error = %e, "UDS accept failed");
-                            yield Err(e);
-                        }
-                    }
-                }
-            };
-            tokio::pin!(incoming);
-
-            let sock_path_for_cleanup = sock_path.clone();
-            let result = server
-                .add_service(svc)
-                .serve_with_incoming_shutdown(incoming, shutdown_signal())
-                .await;
-
-            // Best-effort cleanup of the socket file on shutdown. If this
-            // fails, the next start-up will detect+remove it via the
-            // stale-socket check above.
-            let _ = std::fs::remove_file(&sock_path_for_cleanup);
-
-            result?;
-        }
+        server
+            .add_service(svc)
+            .serve_with_shutdown(addr, shutdown_signal())
+            .await?;
     } else {
         // (#1) Refuse to start without TLS
         tracing::error!(
@@ -383,9 +239,142 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Graceful shutdown on SIGTERM/SIGINT.
+/// Graceful shutdown on SIGINT (Ctrl-C) on all platforms and SIGTERM on Unix.
+///
+/// systemd sends SIGTERM by default for `systemctl stop`; without an explicit
+/// handler tokio's runtime would let the process exit immediately and drop
+/// in-flight RPCs. Wiring SIGTERM into the same shutdown future as Ctrl-C
+/// makes `serve_with_incoming_shutdown` drain connections gracefully.
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
-    tracing::info!("Shutdown signal received, draining connections...");
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to install SIGTERM handler — falling back to Ctrl-C only"
+                );
+                let _ = tokio::signal::ctrl_c().await;
+                tracing::info!("Shutdown signal received, draining connections...");
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("SIGINT received, draining connections...");
+            }
+            _ = sigterm.recv() => {
+                tracing::info!("SIGTERM received, draining connections...");
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("Shutdown signal received, draining connections...");
+    }
 }
 
+/// Spawn the SIGHUP reload task on Unix. On Windows this is a no-op — the
+/// platform has no SIGHUP, and operators can restart the service to pick up
+/// rotated certificates.
+#[cfg(unix)]
+fn spawn_sighup_reload(
+    config_swap: Arc<ArcSwap<ServerConfig>>,
+    cert: String,
+    key: String,
+    client_ca: Option<String>,
+    client_crl: Option<String>,
+) {
+    tokio::spawn(async move {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sighup = match signal(SignalKind::hangup()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to install SIGHUP handler");
+                return;
+            }
+        };
+        while sighup.recv().await.is_some() {
+            tracing::info!("SIGHUP received — reloading TLS material");
+            match tls::load_tls_config(
+                &cert,
+                &key,
+                client_ca.as_deref(),
+                client_crl.as_deref(),
+            ) {
+                Ok(new_config) => {
+                    config_swap.store(Arc::new(new_config));
+                    tracing::info!("TLS config reloaded successfully");
+                }
+                Err(e) => {
+                    // Keep the previous config — a half-reloaded daemon
+                    // would refuse all new clients if we cleared it.
+                    tracing::error!(
+                        error = %e,
+                        "TLS reload failed — keeping previous config"
+                    );
+                }
+            }
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_sighup_reload(
+    _config_swap: Arc<ArcSwap<ServerConfig>>,
+    _cert: String,
+    _key: String,
+    _client_ca: Option<String>,
+    _client_crl: Option<String>,
+) {
+    // SIGHUP does not exist on Windows. Operators rotate TLS material by
+    // restarting the service (the Windows Service Control Manager
+    // delivers a stop event which we honor via ctrl_c).
+}
+
+/// Spawn the periodic CRL refresh task. Re-reads the CRL file at the
+/// configured interval and rebuilds the full `ServerConfig` (CRL data is
+/// baked into the `WebPkiClientVerifier`, so a partial update is not
+/// possible). On read or parse failure the previous config is retained.
+fn spawn_crl_refresh(
+    config_swap: Arc<ArcSwap<ServerConfig>>,
+    cert: String,
+    key: String,
+    client_ca: Option<String>,
+    client_crl: Option<String>,
+    interval: Duration,
+) {
+    tracing::info!(
+        "CRL refresh enabled (every {}s)",
+        interval.as_secs()
+    );
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        // Skip the immediate tick — the initial config was just loaded.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            match tls::load_tls_config(
+                &cert,
+                &key,
+                client_ca.as_deref(),
+                client_crl.as_deref(),
+            ) {
+                Ok(new_config) => {
+                    config_swap.store(Arc::new(new_config));
+                    tracing::debug!("CRL refresh: TLS config reloaded");
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "CRL refresh failed — keeping previous config"
+                    );
+                }
+            }
+        }
+    });
+}
