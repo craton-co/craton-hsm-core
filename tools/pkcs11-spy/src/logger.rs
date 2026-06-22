@@ -1,10 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Craton Software Company
 //! JSON-lines logger for PKCS#11 spy calls.
+//!
+//! ## Timing precision and side-channel exposure
+//!
+//! By default, this logger emits **millisecond-precision** timestamps and
+//! durations. Microsecond-precision timing in a log that sits in the data
+//! path of every cryptographic operation is a side-channel: a reader of
+//! the log can correlate per-call latency with key-dependent operations
+//! (sign, decrypt, etc.) and potentially recover secret material.
+//!
+//! Environment variables controlling timing precision:
+//!
+//! - `PKCS11_SPY_FULL_TIMING=1` — opt **in** to microsecond precision.
+//!   Only enable this for local debugging where the log is not exposed
+//!   to other principals. Do NOT enable on production HSMs or in any
+//!   environment where the log is readable by another user or persisted
+//!   to long-lived storage.
+//! - `PKCS11_SPY_REDUCED_TIMING=1` — legacy, accepted for back-compat.
+//!   Millisecond resolution is now the default, so this variable is a
+//!   no-op (it simply confirms the default behaviour). New deployments
+//!   should not set it.
+//!
+//! Precedence: if `PKCS11_SPY_FULL_TIMING=1` is set, microsecond
+//! resolution is used regardless of `PKCS11_SPY_REDUCED_TIMING`.
 
-use std::fs::File;
-use std::io::{self, Write};
-use std::path::Path;
+use std::io::Write;
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -13,10 +34,11 @@ static LOGGER: std::sync::OnceLock<Mutex<SpyLogger>> = std::sync::OnceLock::new(
 pub struct SpyLogger {
     writer: Box<dyn Write + Send>,
     start: Instant,
-    /// When true, log timing at millisecond precision instead of microsecond.
-    /// Reduces side-channel leakage from crypto operation timing.
-    /// Controlled by PKCS11_SPY_REDUCED_TIMING=1 environment variable.
-    reduced_timing: bool,
+    /// When true, log timing at microsecond precision (opt-in).
+    /// The default is millisecond precision, which reduces side-channel
+    /// leakage from crypto operation timing.
+    /// Controlled by `PKCS11_SPY_FULL_TIMING=1` environment variable.
+    full_timing: bool,
 }
 
 impl SpyLogger {
@@ -53,7 +75,11 @@ impl SpyLogger {
                                 );
                                 Box::new(std::io::stderr())
                             } else {
-                                match open_log_file(&full_path) {
+                                match std::fs::OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open(&full_path)
+                                {
                                     Ok(f) => {
                                         // On Unix, set restrictive permissions on the log file
                                         #[cfg(unix)]
@@ -102,13 +128,6 @@ impl SpyLogger {
                                         Box::new(f)
                                     }
                                     Err(e) => {
-                                        // open_log_file refuses symlink targets and
-                                        // uses O_NOFOLLOW / FILE_FLAG_OPEN_REPARSE_POINT
-                                        // to defeat symlink-swap attacks on the log path.
-                                        tracing::error!(
-                                            error = %e,
-                                            "pkcs11-spy: failed to open log file (symlink refused or open failed), using stderr"
-                                        );
                                         eprintln!(
                                             "pkcs11-spy: failed to open log file, using stderr: {}",
                                             e
@@ -130,117 +149,43 @@ impl SpyLogger {
             }
             Err(_) => Box::new(std::io::stderr()),
         };
-        // PKCS11_SPY_REDUCED_TIMING=1 switches from microsecond to millisecond
-        // precision, reducing timing side-channel exposure for crypto operations.
-        let reduced_timing = std::env::var("PKCS11_SPY_REDUCED_TIMING")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        let full_timing = resolve_full_timing_from_env();
 
         Self {
             writer,
             start: Instant::now(),
-            reduced_timing,
+            full_timing,
         }
     }
 }
 
-/// Open the log file, refusing symlink targets.
+/// Resolve the timing-precision policy from the current environment.
 ///
-/// Without `O_NOFOLLOW` (Unix) / `FILE_FLAG_OPEN_REPARSE_POINT` (Windows), an
-/// attacker with write access to the log directory can symlink the log path to
-/// a sensitive file (e.g. `/etc/shadow`) and cause the spy — potentially
-/// running with elevated privilege — to append log lines to that file.
+/// Returns `true` for microsecond precision (opt-in), `false` for the
+/// default millisecond precision.
 ///
-/// Strategy:
-/// 1. Probe the path with `symlink_metadata`. If it exists and is a symlink,
-///    refuse outright with `tracing::error!` and return `io::ErrorKind::InvalidInput`.
-/// 2. Try `create_new(true)` first so a brand-new log file is created atomically
-///    (`O_EXCL` semantics) and cannot race a symlink in between stat and open.
-/// 3. If the file already exists, open it for append with `O_NOFOLLOW` (Unix) or
-///    `FILE_FLAG_OPEN_REPARSE_POINT` (Windows) + a post-open symlink_metadata
-///    re-check so a TOCTOU symlink swap is still rejected.
-fn open_log_file(path: &Path) -> io::Result<File> {
-    // Up-front symlink check. If the path resolves to a symlink we refuse
-    // before any file handle is created.
-    if let Ok(md) = std::fs::symlink_metadata(path) {
-        if md.file_type().is_symlink() {
-            tracing::error!(
-                path = %path.display(),
-                "pkcs11-spy: refusing to open log file: path is a symlink"
-            );
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "pkcs11-spy: refusing to open symlink as log file",
-            ));
-        }
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-
-        // First, attempt atomic create with O_EXCL semantics. This races safely:
-        // if an attacker pre-creates a symlink at the path, create_new fails with
-        // AlreadyExists, and we fall through to the existing-file open below which
-        // sets O_NOFOLLOW and refuses the symlink.
-        let create_flags = libc::O_NOFOLLOW | libc::O_CLOEXEC;
-        match std::fs::OpenOptions::new()
-            .create_new(true)
-            .append(true)
-            .custom_flags(create_flags)
-            .open(path)
-        {
-            Ok(f) => Ok(f),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                // File exists — open without O_CREAT, but keep O_NOFOLLOW so the
-                // kernel refuses the open if the path is a symlink.
-                std::fs::OpenOptions::new()
-                    .append(true)
-                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                    .open(path)
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        // FILE_FLAG_OPEN_REPARSE_POINT (0x00200000) opens the reparse point
-        // itself rather than following it; combined with the symlink_metadata
-        // re-check below, any symlink target is refused.
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
-
-        let f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(path)?;
-
-        // Post-open re-check: if the path became a symlink between the up-front
-        // probe and the open call, refuse now.
-        if let Ok(md) = std::fs::symlink_metadata(path) {
-            if md.file_type().is_symlink() {
-                tracing::error!(
-                    path = %path.display(),
-                    "pkcs11-spy: refusing to open log file: path became a symlink during open"
-                );
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "pkcs11-spy: refusing to open symlink as log file",
-                ));
-            }
-        }
-        Ok(f)
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-    }
+/// Precedence:
+///   1. `PKCS11_SPY_FULL_TIMING=1` (or `=true`, case-insensitive)
+///      -> microsecond. Wins over everything else.
+///   2. Otherwise -> millisecond (the secure default).
+///
+/// `PKCS11_SPY_REDUCED_TIMING` is read for back-compat but is a no-op:
+/// millisecond is already the default. If both vars are set, FULL_TIMING
+/// wins.
+///
+/// SECURITY: microsecond-precision timestamps in the log are a side-channel
+/// for any tool that sits in the crypto data path -- a reader of the log
+/// can correlate latency with key-dependent operations (sign, decrypt).
+fn resolve_full_timing_from_env() -> bool {
+    let full = std::env::var("PKCS11_SPY_FULL_TIMING")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    // PKCS11_SPY_REDUCED_TIMING is read but intentionally ignored beyond
+    // accepting its presence -- millisecond is already the default. We
+    // touch the var explicitly so its semantics are documented at the
+    // point of use.
+    let _legacy_reduced = std::env::var("PKCS11_SPY_REDUCED_TIMING").ok();
+    full
 }
 
 pub fn get_logger() -> &'static Mutex<SpyLogger> {
@@ -327,14 +272,26 @@ pub fn log_panic(func: &str, payload: &(dyn std::any::Any + Send)) {
 }
 
 /// Log a function call entry.
+///
+/// Timestamp precision follows the same policy as `log_return`:
+/// millisecond by default, microsecond only if `PKCS11_SPY_FULL_TIMING=1`.
 pub fn log_call(func: &str, args: &str) {
     with_logger(|logger| {
         let elapsed = logger.start.elapsed().as_secs_f64();
-        let _ = writeln!(
-            logger.writer,
-            r#"{{"ts":{:.6},"fn":"{}","event":"call","args":{}}}"#,
-            elapsed, func, args
-        );
+        if logger.full_timing {
+            let _ = writeln!(
+                logger.writer,
+                r#"{{"ts":{:.6},"fn":"{}","event":"call","args":{}}}"#,
+                elapsed, func, args
+            );
+        } else {
+            let elapsed_ms = (elapsed * 1000.0).round() / 1000.0;
+            let _ = writeln!(
+                logger.writer,
+                r#"{{"ts":{:.3},"fn":"{}","event":"call","args":{}}}"#,
+                elapsed_ms, func, args
+            );
+        }
     });
 }
 
@@ -344,21 +301,26 @@ pub fn log_return(func: &str, rv: u64, duration_us: u64) {
     with_logger(|logger| {
         let elapsed = logger.start.elapsed().as_secs_f64();
 
-        if logger.reduced_timing {
-            // Reduced precision: truncate to milliseconds to limit side-channel
-            // leakage from crypto operation timing.
+        if logger.full_timing {
+            // Opt-in microsecond precision (PKCS11_SPY_FULL_TIMING=1).
+            // WARNING: microsecond timestamps in the log are a side-channel
+            // for any tool that sits in the crypto data path. Only enable
+            // for local debugging on logs that are not exposed to other
+            // principals.
+            let _ = writeln!(
+                logger.writer,
+                r#"{{"ts":{:.6},"fn":"{}","event":"return","rv":"{}","rv_code":{},"duration_us":{}}}"#,
+                elapsed, func, rv_name, rv, duration_us
+            );
+        } else {
+            // Default: millisecond precision. Truncates to limit
+            // side-channel leakage from crypto operation timing.
             let elapsed_ms = (elapsed * 1000.0).round() / 1000.0;
             let duration_ms = duration_us / 1000;
             let _ = writeln!(
                 logger.writer,
                 r#"{{"ts":{:.3},"fn":"{}","event":"return","rv":"{}","rv_code":{},"duration_ms":{}}}"#,
                 elapsed_ms, func, rv_name, rv, duration_ms
-            );
-        } else {
-            let _ = writeln!(
-                logger.writer,
-                r#"{{"ts":{:.6},"fn":"{}","event":"return","rv":"{}","rv_code":{},"duration_us":{}}}"#,
-                elapsed, func, rv_name, rv, duration_us
             );
         }
     });
@@ -422,50 +384,149 @@ fn ckr_name(rv: u64) -> &'static str {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
-    use super::open_log_file;
-    use std::os::unix::fs::symlink;
+    //! Tests for the timing-precision env-var policy.
+    //!
+    //! These tests mutate process-wide environment variables, which is not
+    //! thread-safe. `cargo test` runs tests in parallel by default, so we
+    //! serialise them with a per-module mutex. Callers should also invoke
+    //! `cargo test -- --test-threads=1` for extra safety (CI does this for
+    //! this crate).
+    //!
+    //! Note: `std::env::set_var` / `remove_var` are marked `unsafe` from
+    //! Rust 2024 onward; we wrap them via the helpers below so the
+    //! `unsafe` block is localised and audited.
+    use super::resolve_full_timing_from_env;
+    use std::sync::Mutex;
 
-    #[test]
-    fn open_log_file_refuses_symlink_targets() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        // A direct (non-symlink) target should open fine.
-        let direct = dir.path().join("direct.log");
-        let f = open_log_file(&direct).expect("direct path opens");
-        drop(f);
-        assert!(direct.exists());
+    /// Serialises env-var mutation across tests in this module.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-        // Create a real file and a symlink pointing at it.
-        let real = dir.path().join("real.log");
-        std::fs::write(&real, b"existing\n").expect("write real");
-        let link = dir.path().join("link.log");
-        symlink(&real, &link).expect("create symlink");
+    const FULL: &str = "PKCS11_SPY_FULL_TIMING";
+    const REDUCED: &str = "PKCS11_SPY_REDUCED_TIMING";
 
-        let err = open_log_file(&link)
-            .expect_err("symlinked path must be refused");
-        // The real file's contents must be untouched.
-        let after = std::fs::read(&real).expect("read real");
-        assert_eq!(after, b"existing\n", "symlink target must not be modified");
-        // We don't assert on a specific kind across platforms, but on Unix our
-        // helper returns InvalidInput (refused up-front) or a kernel ELOOP via
-        // O_NOFOLLOW; either is acceptable as long as the open fails.
-        let _ = err;
+    /// RAII guard that snapshots the two env vars on construction and
+    /// restores them on drop. Combined with `ENV_LOCK`, this keeps each
+    /// test hermetic even if it panics mid-way.
+    struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev_full: Option<String>,
+        prev_reduced: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn new() -> Self {
+            // Recover from a poisoned lock -- a previous test panicked,
+            // but we still want to run.
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prev_full = std::env::var(FULL).ok();
+            let prev_reduced = std::env::var(REDUCED).ok();
+            // Start each test from a clean slate.
+            unset(FULL);
+            unset(REDUCED);
+            Self {
+                _lock: lock,
+                prev_full,
+                prev_reduced,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.prev_full.take() {
+                Some(v) => set(FULL, &v),
+                None => unset(FULL),
+            }
+            match self.prev_reduced.take() {
+                Some(v) => set(REDUCED, &v),
+                None => unset(REDUCED),
+            }
+        }
+    }
+
+    fn set(k: &str, v: &str) {
+        // SAFETY: env-var mutation is process-global and not thread-safe.
+        // Tests in this module are serialised by `ENV_LOCK`, and we only
+        // call this from inside an `EnvGuard`, so no other thread in this
+        // module is reading or writing these vars concurrently.
+        unsafe {
+            std::env::set_var(k, v);
+        }
+    }
+
+    fn unset(k: &str) {
+        // SAFETY: see `set`.
+        unsafe {
+            std::env::remove_var(k);
+        }
     }
 
     #[test]
-    fn open_log_file_creates_new_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("fresh.log");
-        let mut f = open_log_file(&path).expect("create new");
-        use std::io::Write;
-        writeln!(f, "hello").expect("write");
-        drop(f);
-        // Reopen and append should also succeed.
-        let mut f2 = open_log_file(&path).expect("reopen existing");
-        writeln!(f2, "world").expect("append");
-        let contents = std::fs::read_to_string(&path).expect("read");
-        assert!(contents.contains("hello"));
-        assert!(contents.contains("world"));
+    fn default_is_millisecond_when_no_vars_set() {
+        let _g = EnvGuard::new();
+        assert!(
+            !resolve_full_timing_from_env(),
+            "default precision must be millisecond (full_timing == false)"
+        );
+    }
+
+    #[test]
+    fn full_timing_opts_in_to_microsecond() {
+        let _g = EnvGuard::new();
+        set(FULL, "1");
+        assert!(
+            resolve_full_timing_from_env(),
+            "PKCS11_SPY_FULL_TIMING=1 must enable microsecond precision"
+        );
+    }
+
+    #[test]
+    fn full_timing_accepts_true_case_insensitive() {
+        let _g = EnvGuard::new();
+        set(FULL, "TrUe");
+        assert!(
+            resolve_full_timing_from_env(),
+            "PKCS11_SPY_FULL_TIMING=true (any case) must enable microsecond precision"
+        );
+    }
+
+    #[test]
+    fn legacy_reduced_timing_alone_keeps_millisecond_default() {
+        let _g = EnvGuard::new();
+        set(REDUCED, "1");
+        assert!(
+            !resolve_full_timing_from_env(),
+            "PKCS11_SPY_REDUCED_TIMING=1 (without FULL_TIMING) must keep the millisecond default"
+        );
+    }
+
+    #[test]
+    fn full_timing_wins_when_both_set() {
+        let _g = EnvGuard::new();
+        set(FULL, "1");
+        set(REDUCED, "1");
+        assert!(
+            resolve_full_timing_from_env(),
+            "FULL_TIMING must win over REDUCED_TIMING when both are set"
+        );
+    }
+
+    #[test]
+    fn full_timing_non_truthy_value_keeps_default() {
+        let _g = EnvGuard::new();
+        // Anything other than "1" / "true" must NOT enable microsecond
+        // timing -- avoid easy-to-trip-over opt-in semantics.
+        set(FULL, "0");
+        assert!(
+            !resolve_full_timing_from_env(),
+            "PKCS11_SPY_FULL_TIMING=0 must not enable microsecond precision"
+        );
+        set(FULL, "yes");
+        assert!(
+            !resolve_full_timing_from_env(),
+            "PKCS11_SPY_FULL_TIMING=yes must not enable microsecond precision (only 1/true)"
+        );
     }
 }

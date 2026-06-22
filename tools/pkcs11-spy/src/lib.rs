@@ -6,6 +6,16 @@
 //!   Set `PKCS11_SPY_TARGET` to the path of the real PKCS#11 library.
 //!   Set `PKCS11_SPY_LOG` to the desired log file path (default: stderr).
 //!   Load this library as the PKCS#11 provider in your application.
+//!
+//! Timing precision (see [`logger`] for details):
+//!   - Default: **millisecond** precision. This reduces the side-channel
+//!     surface of the log; microsecond-precision timing in a log that
+//!     sits in the crypto data path can leak key-dependent information.
+//!   - `PKCS11_SPY_FULL_TIMING=1` opts in to microsecond precision. Use
+//!     only for local debugging on logs that are not exposed to other
+//!     principals.
+//!   - `PKCS11_SPY_REDUCED_TIMING=1` is accepted for back-compat but is
+//!     now a no-op (millisecond is already the default).
 
 #![allow(non_snake_case)]
 #![allow(non_camel_case_types)]
