@@ -167,11 +167,17 @@ impl DaemonConfig {
         std::path::PathBuf::from(format!("/tmp/craton-hsm-{}.sock", uid))
     }
 
-    // NOTE: `is_loopback_bind` previously guarded the deprecated insecure
-    // loopback-TCP path. With `allow_insecure = true` now binding a UDS
-    // (Unix) or being refused outright (Windows), there is no remaining
-    // caller, so the helper was removed. If a future feature needs to
-    // detect loopback bind addresses, restore from git history.
+    /// Returns true if the bind address parses as a loopback IP address.
+    /// Only trusts parsed IP addresses — never hostnames. "localhost" can
+    /// resolve to a non-loopback address on systems with a poisoned /etc/hosts
+    /// or misconfigured DNS; requiring an explicit IP eliminates that risk.
+    pub fn is_loopback_bind(&self) -> bool {
+        use std::net::SocketAddr;
+        self.bind
+            .parse::<SocketAddr>()
+            .map(|addr| addr.ip().is_loopback())
+            .unwrap_or(false)
+    }
 }
 
 /// Full config file structure (extends craton_hsm.toml with [daemon] section).

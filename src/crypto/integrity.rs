@@ -347,6 +347,8 @@ fn get_module_path_windows() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     #[cfg_attr(miri, ignore)]
     fn test_compute_hash_deterministic() {
@@ -371,22 +373,18 @@ mod tests {
         // cause check_integrity() to fail — this is the security invariant
         // that the previous "Ok(())" behavior silently violated.
         //
-        // SAFETY: env-var mutation is process-global; this test does its own
-        // cleanup. We only enter this branch when the embedded key really is
-        // the all-zeros placeholder (i.e. the default `cargo test` build).
+        // Serialize with all other env-var-mutating tests to avoid races under
+        // --test-threads=N.
         if !is_placeholder_key() {
-            // Build embedded a real key — the bypass is ignored anyway.
             return;
         }
-        // Ensure no bypass leaks in from the environment.
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var(DEV_BYPASS_ENV).ok();
-        // SAFETY: single-threaded test, restored below.
         unsafe { std::env::remove_var(DEV_BYPASS_ENV) };
 
         let result = check_integrity();
 
         // Restore previous value before asserting so a failure doesn't leak state.
-        // SAFETY: single-threaded test.
         unsafe {
             match prev {
                 Some(v) => std::env::set_var(DEV_BYPASS_ENV, v),
@@ -407,16 +405,14 @@ mod tests {
         // check returns Ok(()) (and logs a loud warning).  This is the only
         // sanctioned way to run `cargo test` against an unsigned build.
         if !is_placeholder_key() {
-            // Real key embedded; the dev bypass is intentionally ignored.
             return;
         }
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var(DEV_BYPASS_ENV).ok();
-        // SAFETY: single-threaded test.
         unsafe { std::env::set_var(DEV_BYPASS_ENV, DEV_BYPASS_VALUE) };
 
         let result = check_integrity();
 
-        // SAFETY: single-threaded test, restoring prior value.
         unsafe {
             match prev {
                 Some(v) => std::env::set_var(DEV_BYPASS_ENV, v),

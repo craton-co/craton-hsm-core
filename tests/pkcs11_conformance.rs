@@ -1175,7 +1175,10 @@ fn test_config_absolute_path_accepted() {
             .unwrap_or(0)
     );
     let candidate = tmp.join(&unique);
-    assert!(candidate.is_absolute(), "tempdir must yield an absolute path");
+    assert!(
+        candidate.is_absolute(),
+        "tempdir must yield an absolute path"
+    );
     config.token.storage_path = candidate;
     // Audit log_path still uses the relative default, so the only
     // path-shaped change is storage_path.

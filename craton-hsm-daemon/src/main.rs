@@ -300,12 +300,7 @@ fn spawn_sighup_reload(
         };
         while sighup.recv().await.is_some() {
             tracing::info!("SIGHUP received — reloading TLS material");
-            match tls::load_tls_config(
-                &cert,
-                &key,
-                client_ca.as_deref(),
-                client_crl.as_deref(),
-            ) {
+            match tls::load_tls_config(&cert, &key, client_ca.as_deref(), client_crl.as_deref()) {
                 Ok(new_config) => {
                     config_swap.store(Arc::new(new_config));
                     tracing::info!("TLS config reloaded successfully");
@@ -348,22 +343,14 @@ fn spawn_crl_refresh(
     client_crl: Option<String>,
     interval: Duration,
 ) {
-    tracing::info!(
-        "CRL refresh enabled (every {}s)",
-        interval.as_secs()
-    );
+    tracing::info!("CRL refresh enabled (every {}s)", interval.as_secs());
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         // Skip the immediate tick — the initial config was just loaded.
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            match tls::load_tls_config(
-                &cert,
-                &key,
-                client_ca.as_deref(),
-                client_crl.as_deref(),
-            ) {
+            match tls::load_tls_config(&cert, &key, client_ca.as_deref(), client_crl.as_deref()) {
                 Ok(new_config) => {
                     config_swap.store(Arc::new(new_config));
                     tracing::debug!("CRL refresh: TLS config reloaded");

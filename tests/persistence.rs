@@ -22,7 +22,10 @@ fn make_db_path(dir: &std::path::Path) -> String {
 fn test_token_objects_survive_restart() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = make_db_path(dir.path());
-    let (enc_key, _) = derive_key_from_pin(b"test-pin", None, None);
+    // Pin iterations to 1: these tests verify persistence round-trips, not the
+    // KDF work factor. `None` would use the 1,000,000-iteration default on
+    // every test run (debug AND release) for no benefit.
+    let (enc_key, _) = derive_key_from_pin(b"test-pin", None, Some(1));
 
     // Phase 1: Create objects and persist them
     let handle = {
@@ -72,7 +75,10 @@ fn test_token_objects_survive_restart() {
 fn test_session_objects_not_persisted() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = make_db_path(dir.path());
-    let (enc_key, _) = derive_key_from_pin(b"test-pin", None, None);
+    // Pin iterations to 1: these tests verify persistence round-trips, not the
+    // KDF work factor. `None` would use the 1,000,000-iteration default on
+    // every test run (debug AND release) for no benefit.
+    let (enc_key, _) = derive_key_from_pin(b"test-pin", None, Some(1));
 
     // Phase 1: Create a session object (CKA_TOKEN = false)
     {
@@ -104,7 +110,10 @@ fn test_session_objects_not_persisted() {
 fn test_clear_removes_persisted_objects() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = make_db_path(dir.path());
-    let (enc_key, _) = derive_key_from_pin(b"test-pin", None, None);
+    // Pin iterations to 1: these tests verify persistence round-trips, not the
+    // KDF work factor. `None` would use the 1,000,000-iteration default on
+    // every test run (debug AND release) for no benefit.
+    let (enc_key, _) = derive_key_from_pin(b"test-pin", None, Some(1));
 
     // Phase 1: Create token objects then clear (simulates C_InitToken)
     {
@@ -141,7 +150,10 @@ fn test_clear_removes_persisted_objects() {
 fn test_destroy_removes_from_persistent_store() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = make_db_path(dir.path());
-    let (enc_key, _) = derive_key_from_pin(b"test-pin", None, None);
+    // Pin iterations to 1: these tests verify persistence round-trips, not the
+    // KDF work factor. `None` would use the 1,000,000-iteration default on
+    // every test run (debug AND release) for no benefit.
+    let (enc_key, _) = derive_key_from_pin(b"test-pin", None, Some(1));
 
     // Phase 1: Create then destroy a token object
     {
@@ -190,8 +202,8 @@ fn test_file_lock_prevents_dual_open() {
 fn test_wrong_pin_cannot_load_objects() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = make_db_path(dir.path());
-    let (enc_key1, _) = derive_key_from_pin(b"correct-pin", None, None);
-    let (enc_key2, _) = derive_key_from_pin(b"wrong-pin", None, None);
+    let (enc_key1, _) = derive_key_from_pin(b"correct-pin", None, Some(1));
+    let (enc_key2, _) = derive_key_from_pin(b"wrong-pin", None, Some(1));
 
     // Phase 1: Create with correct PIN
     {
@@ -228,7 +240,10 @@ fn test_wrong_pin_cannot_load_objects() {
 fn test_insert_object_persists() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = make_db_path(dir.path());
-    let (enc_key, _) = derive_key_from_pin(b"test-pin", None, None);
+    // Pin iterations to 1: these tests verify persistence round-trips, not the
+    // KDF work factor. `None` would use the 1,000,000-iteration default on
+    // every test run (debug AND release) for no benefit.
+    let (enc_key, _) = derive_key_from_pin(b"test-pin", None, Some(1));
 
     let handle;
     // Phase 1: Insert a pre-built object (keygen path)
@@ -299,7 +314,10 @@ fn test_clear_and_rotate_invalidates_old_key() {
     // pre-init key.
     let dir = tempfile::tempdir().unwrap();
     let db_path = make_db_path(dir.path());
-    let (enc_key, _) = derive_key_from_pin(b"test-pin", None, None);
+    // Pin iterations to 1: these tests verify persistence round-trips, not the
+    // KDF work factor. `None` would use the 1,000,000-iteration default on
+    // every test run (debug AND release) for no benefit.
+    let (enc_key, _) = derive_key_from_pin(b"test-pin", None, Some(1));
 
     // Phase 1: Create + wipe + rotate, all under the original key.
     {
@@ -365,7 +383,10 @@ fn test_clear_and_rotate_with_no_key_is_noop_on_key() {
 fn test_multiple_objects_persist() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = make_db_path(dir.path());
-    let (enc_key, _) = derive_key_from_pin(b"test-pin", None, None);
+    // Pin iterations to 1: these tests verify persistence round-trips, not the
+    // KDF work factor. `None` would use the 1,000,000-iteration default on
+    // every test run (debug AND release) for no benefit.
+    let (enc_key, _) = derive_key_from_pin(b"test-pin", None, Some(1));
 
     // Phase 1: Create multiple token objects
     {

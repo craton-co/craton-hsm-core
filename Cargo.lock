@@ -127,6 +127,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "arc-swap"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a3a1fd6f75306b68087b831f025c712524bcb19aad54e557b1129cfa0a2b207"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "async-stream"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -617,12 +626,15 @@ dependencies = [
 name = "craton-hsm-daemon"
 version = "0.3.1"
 dependencies = [
+ "arc-swap",
  "async-stream",
  "craton-hsm",
+ "libc",
  "prost",
  "rustls",
  "rustls-pemfile",
  "serde",
+ "sha2 0.10.9",
  "tokio",
  "tokio-rustls",
  "toml",
@@ -1879,7 +1891,13 @@ dependencies = [
 name = "pkcs11-spy"
 version = "0.3.0"
 dependencies = [
+ "hex",
+ "libc",
  "libloading 0.9.0",
+ "sha2 0.10.9",
+ "tempfile",
+ "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2636,7 +2654,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

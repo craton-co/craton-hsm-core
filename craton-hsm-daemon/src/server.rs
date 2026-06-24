@@ -755,7 +755,11 @@ impl HsmService for HsmServiceImpl {
                     None,
                     &client_id,
                 )?;
-                tracing::warn!(slot_id, client_id = client_id.as_str(), "Token initialized via gRPC");
+                tracing::warn!(
+                    slot_id,
+                    client_id = client_id.as_str(),
+                    "Token initialized via gRPC"
+                );
                 Ok(Response::new(InitTokenResponse {}))
             }
             Err(e) => {
@@ -1201,7 +1205,7 @@ impl HsmService for HsmServiceImpl {
         // (#8) Check if object is private; if so, require login.
         // Per PKCS#11, private object attributes are only visible to logged-in sessions.
         let is_private =
-            craton_hsm::store::attributes::read_attribute(&obj, CKA_PRIVATE as CK_ULONG)
+            craton_hsm::store::attributes::read_attribute(&obj, CKA_PRIVATE as CK_ULONG, true)
                 .ok()
                 .flatten()
                 .map(|v| !v.is_empty() && v[0] != 0)
@@ -1215,7 +1219,7 @@ impl HsmService for HsmServiceImpl {
 
         for attr_type in &req.attribute_types {
             let attr_ck = to_ck_ulong(*attr_type, "attribute_type")?;
-            match craton_hsm::store::attributes::read_attribute(&obj, attr_ck) {
+            match craton_hsm::store::attributes::read_attribute(&obj, attr_ck, true) {
                 Ok(Some(value)) => {
                     attrs.push(Attribute {
                         attr_type: *attr_type,
@@ -2398,7 +2402,7 @@ fn proto_attrs_to_template(attrs: &[Attribute]) -> Result<Vec<(CK_ULONG, Vec<u8>
 /// (#5-fix) Evict expired throttle entries to bound HashMap memory growth.
 /// Removes entries whose lockout has expired and caps total entries at MAX_THROTTLE_ENTRIES
 /// by evicting the oldest expired entries first.
-fn evict_expired_throttle_entries(map: &mut HashMap<CK_ULONG, LoginThrottle>) {
+fn evict_expired_throttle_entries(map: &mut HashMap<ThrottleKey, LoginThrottle>) {
     let now = Instant::now();
     // Remove entries whose lockout has expired
     map.retain(|_, throttle| {
@@ -2409,10 +2413,10 @@ fn evict_expired_throttle_entries(map: &mut HashMap<CK_ULONG, LoginThrottle>) {
     });
     // If still over capacity (entries without lockout), evict oldest by lowest attempt count
     while map.len() > MAX_THROTTLE_ENTRIES {
-        if let Some(&key) = map
+        if let Some(key) = map
             .iter()
             .min_by_key(|(_, t)| t.failed_attempts)
-            .map(|(k, _)| k)
+            .map(|(k, _)| k.clone())
         {
             map.remove(&key);
         } else {

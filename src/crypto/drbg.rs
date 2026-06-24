@@ -343,8 +343,10 @@ mod tests {
     fn test_drbg_various_lengths() {
         let mut drbg = HmacDrbg::new().unwrap();
 
-        // Test various output sizes
-        for &len in &[1, 16, 32, 48, 64, 100, 256] {
+        // Test various output sizes; start at 4 so the all-zeros check is
+        // statistically sound (1-byte all-zeros probability is 1/256 — too
+        // high for a deterministic CI assertion).
+        for &len in &[4, 16, 32, 48, 64, 100, 256] {
             let mut buf = vec![0u8; len];
             drbg.generate(&mut buf).unwrap();
             assert_ne!(
@@ -354,6 +356,10 @@ mod tests {
                 len
             );
         }
+
+        // Verify that small (1-byte) requests succeed without panicking.
+        let mut one = vec![0u8; 1];
+        drbg.generate(&mut one).unwrap();
     }
 
     #[test]

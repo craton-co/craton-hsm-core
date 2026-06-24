@@ -10,7 +10,9 @@ repository = "https://github.com/craton-co/craton-hsm-core"
 crate-type = ["cdylib"]
 
 [dependencies]
+hex = "0.4"
 libloading = "0.9"
+sha2 = "0.10"
 tracing = "0.1"
 
 [target.'cfg(unix)'.dependencies]

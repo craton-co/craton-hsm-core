@@ -200,10 +200,7 @@ fn default_storage_path() -> PathBuf {
         // parent rather than the leaf so a fresh install that has the parent
         // (e.g. `/var/lib/craton-hsm`) provisioned but no `store` subdir yet
         // still gets the stable absolute default.
-        let parent_exists = system_default
-            .parent()
-            .map(|p| p.is_dir())
-            .unwrap_or(false);
+        let parent_exists = system_default.parent().map(|p| p.is_dir()).unwrap_or(false);
         if parent_exists {
             return system_default;
         }
@@ -914,7 +911,11 @@ mod tests {
         let leaf = dir.join("store");
         // Leaf does not exist; that's fine — first-run shape.
         let res = HsmConfig::validate_path_safety(&leaf, "storage_path");
-        assert!(res.is_ok(), "expected absolute path to be accepted: {:?}", res);
+        assert!(
+            res.is_ok(),
+            "expected absolute path to be accepted: {:?}",
+            res
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -951,10 +952,8 @@ mod tests {
     fn relative_path_is_still_accepted() {
         // Backwards compatibility: the legacy CWD-relative default must
         // continue to validate.
-        let res = HsmConfig::validate_path_safety(
-            Path::new(RELATIVE_STORAGE_FALLBACK),
-            "storage_path",
-        );
+        let res =
+            HsmConfig::validate_path_safety(Path::new(RELATIVE_STORAGE_FALLBACK), "storage_path");
         assert!(res.is_ok(), "expected relative default to pass: {:?}", res);
     }
 
@@ -962,10 +961,7 @@ mod tests {
     fn parent_dir_component_is_rejected() {
         // Raw `..` traversal is still rejected, regardless of whether the
         // path is absolute or relative.
-        let res = HsmConfig::validate_path_safety(
-            Path::new("../../etc/shadow"),
-            "storage_path",
-        );
+        let res = HsmConfig::validate_path_safety(Path::new("../../etc/shadow"), "storage_path");
         assert!(res.is_err(), "expected '..' traversal to be rejected");
         let errs = res.unwrap_err();
         assert!(

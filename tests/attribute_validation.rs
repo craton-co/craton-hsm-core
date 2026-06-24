@@ -343,11 +343,11 @@ fn test_read_label_and_id() {
     obj.id = b"\x01\x02\x03".to_vec();
 
     assert_eq!(
-        read_attribute(&obj, CKA_LABEL).unwrap(),
+        read_attribute(&obj, CKA_LABEL, true).unwrap(),
         Some(b"my-key".to_vec())
     );
     assert_eq!(
-        read_attribute(&obj, CKA_ID).unwrap(),
+        read_attribute(&obj, CKA_ID, true).unwrap(),
         Some(vec![0x01, 0x02, 0x03])
     );
 }
@@ -356,7 +356,7 @@ fn test_read_label_and_id() {
 fn test_read_unknown_attribute_returns_none() {
     let obj = StoredObject::new(1, CKO_DATA);
     // CKA with a vendor-defined type that doesn't exist
-    let result = read_attribute(&obj, 0x80000001).unwrap();
+    let result = read_attribute(&obj, 0x80000001, true).unwrap();
     assert_eq!(result, None);
 }
 

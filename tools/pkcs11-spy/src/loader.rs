@@ -100,9 +100,10 @@ fn warn_provenance_unverified_once() {
 }
 
 /// Load the target PKCS#11 library from `PKCS11_SPY_TARGET` env var.
-/// Returns the loaded library reference, or `None` if SHA-256 verification
-/// failed (when `PKCS11_SPY_EXPECTED_SHA256` was set). Panics on other
-/// configuration errors (missing env var, unresolvable path, etc.).
+/// Returns the loaded library reference, or `None` if the env var is unset,
+/// the path cannot be resolved, SHA-256 verification failed, or any other
+/// configuration error occurs (all errors are logged and treated as
+/// `CKR_FUNCTION_NOT_SUPPORTED`; this function never panics).
 ///
 /// SECURITY: The path is canonicalized to resolve symlinks and relative
 /// components, and validated to be a regular file before loading. This
@@ -121,16 +122,31 @@ fn warn_provenance_unverified_once() {
 fn load_library() -> Option<&'static Library> {
     REAL_LIB
         .get_or_init(|| {
-            let raw_path = std::env::var("PKCS11_SPY_TARGET")
-                .expect("PKCS11_SPY_TARGET environment variable must be set");
+            let raw_path = match std::env::var("PKCS11_SPY_TARGET") {
+                Ok(p) => p,
+                Err(_) => {
+                    tracing::debug!("PKCS11_SPY_TARGET not set; spy passthrough disabled");
+                    return None;
+                }
+            };
 
             // Canonicalize the path to resolve symlinks and relative components
-            let canonical = std::fs::canonicalize(&raw_path)
-                .unwrap_or_else(|e| panic!("PKCS11_SPY_TARGET path cannot be resolved: {}", e));
+            let canonical = match std::fs::canonicalize(&raw_path) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!("PKCS11_SPY_TARGET path cannot be resolved: {}", e);
+                    return None;
+                }
+            };
 
             // Ensure the target is a regular file (not a directory, device, etc.)
-            let metadata = std::fs::metadata(&canonical)
-                .unwrap_or_else(|e| panic!("Cannot read metadata for PKCS11_SPY_TARGET: {}", e));
+            let metadata = match std::fs::metadata(&canonical) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::error!("Cannot read metadata for PKCS11_SPY_TARGET: {}", e);
+                    return None;
+                }
+            };
             if !metadata.is_file() {
                 crate::logger::log_loader_error("PKCS11_SPY_TARGET must point to a regular file");
                 return None;
@@ -145,10 +161,11 @@ fn load_library() -> Option<&'static Library> {
                     // if ".so" appears in the filename
                     let name = canonical.file_name().and_then(|n| n.to_str()).unwrap_or("");
                     if !name.contains(".so") {
-                        panic!(
+                        tracing::error!(
                             "PKCS11_SPY_TARGET does not appear to be a shared library \
                              (expected .so, .dylib, or .dll extension)"
                         );
+                        return None;
                     }
                 }
             }
@@ -188,13 +205,22 @@ fn load_library() -> Option<&'static Library> {
             {
                 use std::os::unix::io::AsRawFd;
 
-                let file = std::fs::File::open(&canonical)
-                    .unwrap_or_else(|e| panic!("Failed to open PKCS11_SPY_TARGET: {}", e));
+                let file = match std::fs::File::open(&canonical) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::error!("Failed to open PKCS11_SPY_TARGET: {}", e);
+                        return None;
+                    }
+                };
 
                 // Validate via fstat on the fd — immune to path-based TOCTOU
-                let fd_metadata = file
-                    .metadata()
-                    .unwrap_or_else(|e| panic!("Failed to fstat PKCS11_SPY_TARGET fd: {}", e));
+                let fd_metadata = match file.metadata() {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::error!("Failed to fstat PKCS11_SPY_TARGET fd: {}", e);
+                        return None;
+                    }
+                };
                 if !fd_metadata.is_file() {
                     crate::logger::log_loader_error("PKCS11_SPY_TARGET fd is not a regular file");
                     return None;
@@ -202,9 +228,12 @@ fn load_library() -> Option<&'static Library> {
 
                 // Load via /proc/self/fd/<N> — dlopen will use the already-opened fd's inode
                 let fd_path = format!("/proc/self/fd/{}", file.as_raw_fd());
-                let lib = unsafe {
-                    Library::new(&fd_path)
-                        .unwrap_or_else(|e| panic!("Failed to load PKCS#11 library via fd: {}", e))
+                let lib = match unsafe { Library::new(&fd_path) } {
+                    Ok(l) => l,
+                    Err(e) => {
+                        tracing::error!("Failed to load PKCS#11 library via fd: {}", e);
+                        return None;
+                    }
                 };
 
                 // The file handle is intentionally kept open (leaked) to prevent the
@@ -224,12 +253,18 @@ fn load_library() -> Option<&'static Library> {
                     .map(|m| m.is_file())
                     .unwrap_or(false)
                 {
-                    panic!("PKCS11_SPY_TARGET was replaced between validation and loading");
+                    tracing::error!(
+                        "PKCS11_SPY_TARGET was replaced between validation and loading"
+                    );
+                    return None;
                 }
 
-                let lib = unsafe {
-                    Library::new(canonical.as_os_str())
-                        .unwrap_or_else(|e| panic!("Failed to load PKCS#11 library: {}", e))
+                let lib = match unsafe { Library::new(canonical.as_os_str()) } {
+                    Ok(l) => l,
+                    Err(e) => {
+                        tracing::error!("Failed to load PKCS#11 library: {}", e);
+                        return None;
+                    }
                 };
                 Some(lib)
             }

@@ -597,7 +597,10 @@ fn fips_mode_blocks_rsa_1024_keygen() {
         "RSA-1024 keygen should fail with CKR_KEY_SIZE_RANGE via approved_services, got 0x{:08X}",
         rv
     );
-    assert_eq!(pub_key, 0, "no public key handle should be written on failure");
+    assert_eq!(
+        pub_key, 0,
+        "no public key handle should be written on failure"
+    );
     assert_eq!(
         priv_key, 0,
         "no private key handle should be written on failure"

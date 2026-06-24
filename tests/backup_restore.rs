@@ -39,7 +39,7 @@ fn test_round_trip_backup_restore() {
     ];
 
     let backup_data =
-        backup::create_backup(&objects, "MyPassphrase-123!", "TEST-SERIAL-0001", None).unwrap();
+        backup::create_backup(&objects, "MyPassphrase-123!", "TEST-SERIAL-0001", Some(1)).unwrap();
     assert!(
         backup_data.len() > 52,
         "Backup should be larger than header"
@@ -53,7 +53,7 @@ fn test_round_trip_backup_restore() {
         "MyPassphrase-123!",
         "TEST-SERIAL-0001",
         Some(0),
-        None,
+        Some(1),
         None,
     )
     .unwrap();
@@ -67,14 +67,14 @@ fn test_round_trip_backup_restore() {
 fn test_wrong_passphrase_fails() {
     let objects = vec![make_test_object(1, "key1", 3)];
     let backup_data =
-        backup::create_backup(&objects, "Correct-Pass1-long", "TEST-SERIAL-0001", None).unwrap();
+        backup::create_backup(&objects, "Correct-Pass1-long", "TEST-SERIAL-0001", Some(1)).unwrap();
 
     let result = backup::restore_backup(
         &backup_data,
         "Wrong-Pass2-longg",
         "TEST-SERIAL-0001",
         Some(0),
-        None,
+        Some(1),
         None,
     );
     assert!(result.is_err(), "Wrong passphrase should fail");
@@ -83,13 +83,13 @@ fn test_wrong_passphrase_fails() {
 #[test]
 fn test_empty_backup_is_valid() {
     let backup_data =
-        backup::create_backup(&[], "Pass-Long-Phr4se", "TEST-SERIAL-0001", None).unwrap();
+        backup::create_backup(&[], "Pass-Long-Phr4se", "TEST-SERIAL-0001", Some(1)).unwrap();
     let restored = backup::restore_backup(
         &backup_data,
         "Pass-Long-Phr4se",
         "TEST-SERIAL-0001",
         Some(0),
-        None,
+        Some(1),
         None,
     )
     .unwrap();
@@ -103,7 +103,7 @@ fn test_truncated_backup_fails() {
         "Pass-Long-Phr4se",
         "TEST-SERIAL-0001",
         Some(0),
-        None,
+        Some(1),
         None,
     );
     assert!(result.is_err(), "Truncated backup should fail");
@@ -112,14 +112,14 @@ fn test_truncated_backup_fails() {
 #[test]
 fn test_corrupt_magic_fails() {
     let mut backup_data =
-        backup::create_backup(&[], "Pass-Long-Phr4se", "TEST-SERIAL-0001", None).unwrap();
+        backup::create_backup(&[], "Pass-Long-Phr4se", "TEST-SERIAL-0001", Some(1)).unwrap();
     backup_data[0] = b'X'; // corrupt magic
     let result = backup::restore_backup(
         &backup_data,
         "Pass-Long-Phr4se",
         "TEST-SERIAL-0001",
         Some(0),
-        None,
+        Some(1),
         None,
     );
     assert!(result.is_err(), "Corrupt magic should fail");
@@ -128,7 +128,7 @@ fn test_corrupt_magic_fails() {
 #[test]
 fn test_corrupt_ciphertext_fails() {
     let mut backup_data =
-        backup::create_backup(&[], "Pass-Long-Phr4se", "TEST-SERIAL-0001", None).unwrap();
+        backup::create_backup(&[], "Pass-Long-Phr4se", "TEST-SERIAL-0001", Some(1)).unwrap();
     // Corrupt the ciphertext (after header)
     if backup_data.len() > 55 {
         backup_data[55] ^= 0xFF;
@@ -138,7 +138,7 @@ fn test_corrupt_ciphertext_fails() {
         "Pass-Long-Phr4se",
         "TEST-SERIAL-0001",
         Some(0),
-        None,
+        Some(1),
         None,
     );
     assert!(result.is_err(), "Corrupt ciphertext should fail");
@@ -156,13 +156,13 @@ fn test_restored_objects_retain_attributes() {
     obj.value_len = Some(32);
 
     let backup_data =
-        backup::create_backup(&[obj], "Pass-Long-Phr4se", "TEST-SERIAL-0001", None).unwrap();
+        backup::create_backup(&[obj], "Pass-Long-Phr4se", "TEST-SERIAL-0001", Some(1)).unwrap();
     let restored = backup::restore_backup(
         &backup_data,
         "Pass-Long-Phr4se",
         "TEST-SERIAL-0001",
         Some(0),
-        None,
+        Some(1),
         None,
     )
     .unwrap();
@@ -195,13 +195,13 @@ fn test_large_backup() {
         .collect();
 
     let backup_data =
-        backup::create_backup(&objects, "Pass-Long-Phr4se", "TEST-SERIAL-0001", None).unwrap();
+        backup::create_backup(&objects, "Pass-Long-Phr4se", "TEST-SERIAL-0001", Some(1)).unwrap();
     let restored = backup::restore_backup(
         &backup_data,
         "Pass-Long-Phr4se",
         "TEST-SERIAL-0001",
         Some(0),
-        None,
+        Some(1),
         None,
     )
     .unwrap();
@@ -216,7 +216,7 @@ fn test_large_backup() {
 fn test_serial_mismatch_rejects_restore() {
     let objects = vec![make_test_object(1, "key1", 3)];
     let backup_data =
-        backup::create_backup(&objects, "Pass-Long-Phr4se", "SERIAL-AAA", None).unwrap();
+        backup::create_backup(&objects, "Pass-Long-Phr4se", "SERIAL-AAA", Some(1)).unwrap();
 
     // Restore with wrong serial should fail
     let result = backup::restore_backup(
@@ -224,7 +224,7 @@ fn test_serial_mismatch_rejects_restore() {
         "Pass-Long-Phr4se",
         "SERIAL-BBB",
         Some(0),
-        None,
+        Some(1),
         None,
     );
     assert!(
@@ -243,7 +243,7 @@ fn test_replay_attack_detection() {
 
     let objects = vec![make_test_object(1, "key1", 3)];
     let backup_data =
-        backup::create_backup(&objects, "Pass-Long-Phr4se", "TEST-SERIAL-0001", None).unwrap();
+        backup::create_backup(&objects, "Pass-Long-Phr4se", "TEST-SERIAL-0001", Some(1)).unwrap();
 
     let mut consumed = HashSet::new();
 
@@ -253,7 +253,7 @@ fn test_replay_attack_detection() {
         "Pass-Long-Phr4se",
         "TEST-SERIAL-0001",
         Some(0),
-        None,
+        Some(1),
         Some(&mut consumed),
     );
     assert!(result.is_ok(), "First restore should succeed");
@@ -265,7 +265,7 @@ fn test_replay_attack_detection() {
         "Pass-Long-Phr4se",
         "TEST-SERIAL-0001",
         Some(0),
-        None,
+        Some(1),
         Some(&mut consumed),
     );
     assert!(result.is_err(), "Replay of same backup must be rejected");
@@ -279,7 +279,7 @@ fn test_replay_attack_detection() {
 fn test_backup_age_default_accepts_fresh() {
     let objects = vec![make_test_object(1, "key1", 3)];
     let backup_data =
-        backup::create_backup(&objects, "Pass-Long-Phr4se", "TEST-SERIAL-0001", None).unwrap();
+        backup::create_backup(&objects, "Pass-Long-Phr4se", "TEST-SERIAL-0001", Some(1)).unwrap();
 
     // Default max_age (None → 30 days) should accept a fresh backup
     let result = backup::restore_backup(
@@ -287,7 +287,7 @@ fn test_backup_age_default_accepts_fresh() {
         "Pass-Long-Phr4se",
         "TEST-SERIAL-0001",
         None,
-        None,
+        Some(1),
         None,
     );
     assert!(result.is_ok(), "Fresh backup should pass default age check");
@@ -297,7 +297,7 @@ fn test_backup_age_default_accepts_fresh() {
 fn test_backup_age_disabled_accepts_any() {
     let objects = vec![make_test_object(1, "key1", 3)];
     let backup_data =
-        backup::create_backup(&objects, "Pass-Long-Phr4se", "TEST-SERIAL-0001", None).unwrap();
+        backup::create_backup(&objects, "Pass-Long-Phr4se", "TEST-SERIAL-0001", Some(1)).unwrap();
 
     // max_age_secs=0 disables the age check
     let result = backup::restore_backup(
@@ -305,7 +305,7 @@ fn test_backup_age_disabled_accepts_any() {
         "Pass-Long-Phr4se",
         "TEST-SERIAL-0001",
         Some(0),
-        None,
+        Some(1),
         None,
     );
     assert!(
@@ -322,7 +322,7 @@ fn test_backup_age_disabled_accepts_any() {
 fn test_backup_single_bit_flip_detected() {
     let objects = vec![make_test_object(1, "key1", 3)];
     let backup_data =
-        backup::create_backup(&objects, "Pass-Long-Phr4se", "TEST-SERIAL-0001", None).unwrap();
+        backup::create_backup(&objects, "Pass-Long-Phr4se", "TEST-SERIAL-0001", Some(1)).unwrap();
 
     // Flip a single bit in the ciphertext region (after the 52-byte header)
     for offset in [52, 53, 60, backup_data.len() - 1, backup_data.len() - 16] {
@@ -334,7 +334,7 @@ fn test_backup_single_bit_flip_detected() {
                 "Pass-Long-Phr4se",
                 "TEST-SERIAL-0001",
                 Some(0),
-                None,
+                Some(1),
                 None,
             );
             assert!(

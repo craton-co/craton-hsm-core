@@ -699,13 +699,16 @@ fn test_pbkdf2_different_salts() {
 fn test_pbkdf2_derive_key() {
     use craton_hsm::store::encrypted_store::derive_key_from_pin;
 
+    // Iterations pinned to 1: this test checks salt/determinism behavior, not
+    // the work factor, so there is no need to pay the 1,000,000-iteration
+    // default on every run. Both derivations under test use the same count.
     let pin = b"test-pin";
-    let (key1, salt1) = derive_key_from_pin(pin, None, None);
-    let (key2, _) = derive_key_from_pin(pin, Some(&salt1), None);
+    let (key1, salt1) = derive_key_from_pin(pin, None, Some(1));
+    let (key2, _) = derive_key_from_pin(pin, Some(&salt1), Some(1));
 
     assert_eq!(key1, key2, "Same PIN + same salt should produce same key");
 
-    let (key3, _) = derive_key_from_pin(pin, None, None);
+    let (key3, _) = derive_key_from_pin(pin, None, Some(1));
     // Different salt -> different key (with overwhelming probability)
     assert_ne!(key1, key3, "Different salts should produce different keys");
 }
@@ -724,7 +727,7 @@ fn test_encrypted_store_roundtrip() {
     let store = EncryptedStore::new(Some(db_path.to_str().unwrap())).unwrap();
     assert!(store.is_available());
 
-    let (key, _) = derive_key_from_pin(b"test-pin", None, None);
+    let (key, _) = derive_key_from_pin(b"test-pin", None, Some(1));
     let data = b"sensitive key material";
 
     store.store_encrypted("test-key", data, &key).unwrap();
@@ -740,8 +743,8 @@ fn test_encrypted_store_wrong_key() {
     let db_path = dir.path().join("test.redb");
     let store = EncryptedStore::new(Some(db_path.to_str().unwrap())).unwrap();
 
-    let (key1, _) = derive_key_from_pin(b"pin1", None, None);
-    let (key2, _) = derive_key_from_pin(b"pin2", None, None);
+    let (key1, _) = derive_key_from_pin(b"pin1", None, Some(1));
+    let (key2, _) = derive_key_from_pin(b"pin2", None, Some(1));
 
     store.store_encrypted("test-key", b"secret", &key1).unwrap();
     let result = store.load_encrypted("test-key", &key2);
@@ -759,7 +762,7 @@ fn test_encrypted_store_delete() {
     let db_path = dir.path().join("test.redb");
     let store = EncryptedStore::new(Some(db_path.to_str().unwrap())).unwrap();
 
-    let (key, _) = derive_key_from_pin(b"pin", None, None);
+    let (key, _) = derive_key_from_pin(b"pin", None, Some(1));
     store.store_encrypted("to-delete", b"data", &key).unwrap();
     store.delete("to-delete").unwrap();
 
@@ -779,7 +782,7 @@ fn test_encrypted_store_list_keys() {
     let db_path = dir.path().join("test.redb");
     let store = EncryptedStore::new(Some(db_path.to_str().unwrap())).unwrap();
 
-    let (key, _) = derive_key_from_pin(b"pin", None, None);
+    let (key, _) = derive_key_from_pin(b"pin", None, Some(1));
     store.store_encrypted("key-a", b"data-a", &key).unwrap();
     store.store_encrypted("key-b", b"data-b", &key).unwrap();
     store.store_encrypted("key-c", b"data-c", &key).unwrap();

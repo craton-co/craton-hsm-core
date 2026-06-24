@@ -50,12 +50,19 @@ if [[ "${CRATON_CI_CONTAINER:-}" != "1" ]]; then
         MAIN_PREFIX=$'\033[36m[MAIN]\033[0m'
         SHARD3_PREFIX=$'\033[35m[SHARD3]\033[0m'
 
+        # Capture each container's full output to a temp log (in addition to
+        # streaming it prefixed) so we can name the exact failing job(s) at the
+        # end instead of a generic "one or more failed".
+        MAIN_LOG="$(mktemp)"
+        SHARD3_LOG="$(mktemp)"
+
         echo "==> Starting Container 1 (Main Jobs)..."
         (
             set -euo pipefail
             docker run "${DOCKER_ARGS[@]}" \
                 -v craton-ci-target-main:/app/target \
-                craton_hsm_ci:latest run_main "$TARGET" 2>&1 | sed "s/^/${MAIN_PREFIX} /"
+                craton_hsm_ci:latest run_main "$TARGET" 2>&1 \
+                | tee "$MAIN_LOG" | sed "s/^/${MAIN_PREFIX} /"
         ) &
         PID_MAIN=$!
 
@@ -64,19 +71,44 @@ if [[ "${CRATON_CI_CONTAINER:-}" != "1" ]]; then
             set -euo pipefail
             docker run "${DOCKER_ARGS[@]}" \
                 -v craton-ci-target-shard3:/app/target \
-                craton_hsm_ci:latest run_shard3 "$TARGET" 2>&1 | sed "s/^/${SHARD3_PREFIX} /"
+                craton_hsm_ci:latest run_shard3 "$TARGET" 2>&1 \
+                | tee "$SHARD3_LOG" | sed "s/^/${SHARD3_PREFIX} /"
         ) &
         PID_SHARD3=$!
 
-        FAIL=0
-        wait $PID_MAIN || FAIL=1
-        wait $PID_SHARD3 || FAIL=1
+        MAIN_RC=0
+        SHARD3_RC=0
+        wait $PID_MAIN || MAIN_RC=$?
+        wait $PID_SHARD3 || SHARD3_RC=$?
 
-        if [[ $FAIL -ne 0 ]]; then
-            echo -e "\n\033[0;31m✗ One or more container jobs failed.\033[0m"
+        # Strip ANSI colour codes (the literal ESC byte works with any sed).
+        strip_ansi() { sed $'s/\033\\[[0-9;]*m//g'; }
+        # Print the distinct job names a container's summary marked "✗ FAIL".
+        failed_jobs() { strip_ansi <"$1" | grep -aE '✗ FAIL' | sed -E 's/.*✗ FAIL[: ]+//; s/[[:space:]]+$//' | sort -u; }
+        # Report a failed container: list its failing jobs, or fall back to the
+        # raw exit code if none could be parsed (e.g. the container died early).
+        report_container() {
+            local label="$1" log="$2" rc="$3"
+            local jobs
+            jobs="$(failed_jobs "$log" || true)"
+            if [[ -n "$jobs" ]]; then
+                while IFS= read -r j; do
+                    echo -e "    \033[0;31m✗\033[0m ${label}: ${j}"
+                done <<<"$jobs"
+            else
+                echo -e "    \033[0;31m✗\033[0m ${label}: container exited with status ${rc} (see output above)"
+            fi
+        }
+
+        if [[ $MAIN_RC -ne 0 || $SHARD3_RC -ne 0 ]]; then
+            echo -e "\n\033[0;31m✗ CI failed. Failing job(s):\033[0m"
+            [[ $MAIN_RC -ne 0 ]] && report_container "Main container" "$MAIN_LOG" "$MAIN_RC"
+            [[ $SHARD3_RC -ne 0 ]] && report_container "Shard 3 container" "$SHARD3_LOG" "$SHARD3_RC"
+            rm -f "$MAIN_LOG" "$SHARD3_LOG"
             exit 1
         else
             echo -e "\n\033[0;32m✓ All container jobs passed.\033[0m"
+            rm -f "$MAIN_LOG" "$SHARD3_LOG"
             exit 0
         fi
     else
@@ -291,6 +323,7 @@ job_test_main() {
         --test random_and_session \
         --test session_state_machine \
         --test supplementary_functions \
+        --test token_state_persistence \
         -- --test-threads=1 2>&1; then
         echo -e "  ${GREEN}✓${NC} PKCS#11 compliance tests passed"
     else
