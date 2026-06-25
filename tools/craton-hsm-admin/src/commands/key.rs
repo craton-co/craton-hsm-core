@@ -318,6 +318,32 @@ pub fn import(
     Ok(())
 }
 
+/// Decide whether a delete requires the tiered (type-back) confirmation.
+///
+/// `--force` alone is rejected for any key whose class is `CKO_PRIVATE_KEY` /
+/// `CKO_SECRET_KEY` or whose `CKA_SENSITIVE` attribute is true. These are
+/// irrecoverable on destroy, so we demand the user prove they meant *this*
+/// specific key.
+pub(crate) fn requires_tiered_confirmation(class: u64, sensitive: bool) -> bool {
+    sensitive || class == CKO_PRIVATE_KEY as u64 || class == CKO_SECRET_KEY as u64
+}
+
+/// Build the challenge string the user must retype to authorize destruction.
+///
+/// Prefer the trimmed label when non-empty (the user already knows it from
+/// `key list`); otherwise fall back to a truncated hex of the handle so there
+/// is still a stable string to retype.
+fn deletion_challenge(label: &str, handle: CK_OBJECT_HANDLE) -> String {
+    let trimmed = label.trim();
+    if !trimmed.is_empty() {
+        trimmed.to_string()
+    } else {
+        // 8-hex-char truncated ID — distinct enough to prevent muscle-memory
+        // retyping of a digit and short enough to type without error.
+        format!("{:08x}", handle as u64)
+    }
+}
+
 /// Delete a key by handle.
 pub fn delete(config_path: &str, handle: u64, force: bool) -> CliResult {
     let config = load_config(config_path)?;
@@ -343,7 +369,39 @@ pub fn delete(config_path: &str, handle: u64, force: bool) -> CliResult {
         )
     };
 
-    if !force {
+    let tiered = requires_tiered_confirmation(orig_class as u64, orig_sensitive);
+
+    if tiered {
+        // `--force` alone is NOT enough for sensitive / private / secret keys.
+        // The user must retype the key's label (or truncated hex ID) so a
+        // single shell alias cannot wipe an irrecoverable secret.
+        let challenge = deletion_challenge(&label, handle);
+        eprintln!();
+        eprintln!(
+            "WARNING: this is irreversible. The key cannot be recovered once destroyed."
+        );
+        eprintln!(
+            "  Handle: {}   Class: {}   Sensitive: {}",
+            handle,
+            output::object_class_name(orig_class as u64),
+            orig_sensitive
+        );
+        eprint!(
+            "Type the key's {} exactly to confirm deletion: ",
+            if label.trim().is_empty() {
+                "truncated ID"
+            } else {
+                "label"
+            }
+        );
+        let mut typed = String::new();
+        std::io::stdin().read_line(&mut typed)?;
+        if typed.trim() != challenge {
+            println!("Aborted: confirmation string did not match.");
+            logout(&hsm);
+            return Ok(());
+        }
+    } else if !force {
         eprint!("Delete object {} (label: '{}')? [y/N] ", handle, label);
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
@@ -395,4 +453,62 @@ fn load_config(path: &str) -> Result<HsmConfig, Box<dyn std::error::Error>> {
         .validate()
         .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn private_key_requires_tiered_confirmation() {
+        // CKO_PRIVATE_KEY must always trigger the type-back prompt,
+        // regardless of CKA_SENSITIVE — the class alone is enough to
+        // mark it as irrecoverable.
+        assert!(requires_tiered_confirmation(CKO_PRIVATE_KEY as u64, false));
+        assert!(requires_tiered_confirmation(CKO_PRIVATE_KEY as u64, true));
+    }
+
+    #[test]
+    fn secret_key_requires_tiered_confirmation() {
+        // Symmetric secrets (AES, HMAC keys, etc.) are also irrecoverable.
+        assert!(requires_tiered_confirmation(CKO_SECRET_KEY as u64, false));
+        assert!(requires_tiered_confirmation(CKO_SECRET_KEY as u64, true));
+    }
+
+    #[test]
+    fn public_key_non_sensitive_does_not_require_tiered_confirmation() {
+        // Public keys are by definition not secret — `--force` should
+        // remain a quick path for scripted cleanup.
+        assert!(!requires_tiered_confirmation(CKO_PUBLIC_KEY as u64, false));
+    }
+
+    #[test]
+    fn sensitive_flag_alone_is_enough() {
+        // Even an "other" object class (e.g. CKO_DATA) must require the
+        // tiered confirm if it has been marked sensitive. We don't want
+        // to leak through a class enum we forgot to enumerate.
+        assert!(requires_tiered_confirmation(CKO_DATA as u64, true));
+        // Same class, non-sensitive: ordinary y/N path is fine.
+        assert!(!requires_tiered_confirmation(CKO_DATA as u64, false));
+    }
+
+    #[test]
+    fn challenge_prefers_label_when_present() {
+        assert_eq!(deletion_challenge("my-rsa-key", 7), "my-rsa-key");
+        // Surrounding whitespace must not change the expected typing.
+        assert_eq!(deletion_challenge("  spaced  ", 7), "spaced");
+    }
+
+    #[test]
+    fn challenge_falls_back_to_truncated_hex_for_empty_label() {
+        // 0x12345678 -> "12345678"
+        assert_eq!(
+            deletion_challenge("", 0x1234_5678 as CK_OBJECT_HANDLE),
+            "12345678"
+        );
+        assert_eq!(
+            deletion_challenge("   ", 0xdead_beef as CK_OBJECT_HANDLE),
+            "deadbeef"
+        );
+    }
 }
