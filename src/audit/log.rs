@@ -1,5 +1,45 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Craton Software Company
+//
+// SECURITY WORK-IN-PROGRESS: security/hmac-audit-chain
+// ----------------------------------------------------
+// This branch begins the migration from the plain SHA-256 audit chain
+// (integrity-only, trivially rebuildable by anyone with disk write) to an
+// HMAC-SHA-256 chain keyed off an HKDF-derived subkey of the per-instance
+// HsmCore::state_hmac_key.
+//
+// LANDED in this commit:
+//   * `AUDIT_LOG_FORMAT_VERSION`, `AUDIT_CHAIN_HKDF_INFO`,
+//     `AUDIT_CHAIN_INIT_LABEL` constants.
+//   * `derive_audit_chain_key()` -- HKDF(state_hmac_key, "audit-chain")
+//     producing a zeroizing 32-byte subkey.
+//   * `initial_chain_hash()` -- HMAC(audit_key, "audit-chain-init") for H_0.
+//   * `AuditEvent.format_version` field (serde-default 0 for legacy).
+//   * `AuditEventPayload.format_version` so downgrade flips the MAC.
+//   * `AuditLog.audit_chain_key` field (zero placeholder, see TODOs).
+//
+// STILL TO DO before this branch is production-ready:
+//   1. Thread `state_hmac_key` (or an HKDF-derived subkey) through
+//      `AuditLog::new()` / `new_with_path()`. Replace the zero-placeholder
+//      `audit_chain_key` assignments marked TODO(security/hmac-audit-chain).
+//   2. Rewrite `compute_chain_hash()` to use HMAC keyed by
+//      `audit_chain_key` instead of plain `Sha256`. Use `initial_chain_hash`
+//      for the H_0 case.
+//   3. Bump `AuditEvent.format_version` from 0 to
+//      `AUDIT_LOG_FORMAT_VERSION` once (2) lands.
+//   4. Update `verify_chain` / recovery to use HMAC and reject legacy v0
+//      records (or detect-and-warn, depending on operational policy).
+//   5. Update `HsmCore::try_new[_with_backend]` to pass the derived key
+//      to the new `AuditLog::new` signature.
+//   6. Add tests: valid chain, tampered record, wrong-key verification,
+//      legacy-file rejection.
+//
+// Until those steps land the audit chain still uses plain SHA-256 and the
+// new fields are inert. The branch compiles and is safe to merge as a
+// stepping stone, but does NOT yet close the original vulnerability.
+//
+use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -9,16 +49,77 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use zeroize::Zeroizing;
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// On-disk record format version. Bumped whenever the on-disk schema or the
+/// chain construction changes in an incompatible way. Files lacking this field
+/// (legacy SHA-256 chain) deserialize as `0` and are rejected by the verifier.
+///
+/// - `0`: legacy plain SHA-256 hash chain (no key). REJECTED on load.
+/// - `1`: HMAC-SHA-256 chain keyed off an HKDF-SHA-256 subkey of the
+///        per-instance `state_hmac_key`. See `derive_audit_chain_key`.
+pub const AUDIT_LOG_FORMAT_VERSION: u32 = 1;
+
+/// HKDF "info" string used to derive the audit chain subkey from
+/// `state_hmac_key`. Domain-separates audit-chain from operation-state HMAC.
+const AUDIT_CHAIN_HKDF_INFO: &[u8] = b"audit-chain";
+
+/// Constant fed to HMAC for the initial chain value
+/// `H_0 = HMAC(audit_key, "audit-chain-init")`.
+const AUDIT_CHAIN_INIT_LABEL: &[u8] = b"audit-chain-init";
+
+/// Derive the audit-chain HMAC subkey from the per-instance `state_hmac_key`
+/// using HKDF-SHA-256 with empty salt and a fixed `info` string.
+///
+/// The derived key is disjoint from `state_hmac_key` so that compromise or
+/// misuse of one HMAC domain (audit chain vs. C_GetOperationState blobs) does
+/// not affect the other. Returns a `Zeroizing` wrapper so the secret is
+/// scrubbed on drop.
+pub fn derive_audit_chain_key(state_hmac_key: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+    let hk = Hkdf::<Sha256>::new(None, state_hmac_key);
+    let mut okm = Zeroizing::new([0u8; 32]);
+    hk.expand(AUDIT_CHAIN_HKDF_INFO, &mut *okm)
+        .expect("HKDF-SHA256 expand(32 bytes) cannot fail");
+    okm
+}
+
+/// Compute the initial chain value
+/// `H_0 = HMAC(audit_key, "audit-chain-init")`.
+fn initial_chain_hash(audit_key: &[u8; 32]) -> [u8; 32] {
+    let mut mac =
+        HmacSha256::new_from_slice(audit_key).expect("HMAC-SHA256 accepts any key length");
+    mac.update(AUDIT_CHAIN_INIT_LABEL);
+    let tag = mac.finalize().into_bytes();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&tag);
+    out
+}
 
 /// Every security-relevant operation emits an audit event.
-/// The audit log is append-only and tamper-evident (chained SHA-256 hashes).
+/// The audit log is append-only and tamper-evident: each event is chained to
+/// the previous via an HMAC-SHA-256 link keyed off a per-instance subkey
+/// derived from `state_hmac_key` via HKDF-SHA-256.
 ///
-/// Hash chain: `H_n = SHA-256(H_{n-1} || serialize(payload_n))`
+/// Chain:
+/// ```text
+/// H_0     = HMAC(audit_key, "audit-chain-init")
+/// H_{n+1} = HMAC(audit_key, H_n || serialize(payload_n))
+/// ```
 /// where `payload_n` is the event data *excluding* `previous_hash`,
-/// avoiding circularity in the hash computation.
+/// avoiding circularity in the MAC computation.
+///
+/// Without `audit_key` an attacker with disk write access cannot forge a
+/// replacement chain — the previous integrity-only SHA-256 chain was trivially
+/// reconstructible.
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEvent {
+    /// On-disk schema version. Legacy files (pre-HMAC chain) deserialize as
+    /// `0` via `serde(default)` and are rejected during recovery.
+    #[serde(default)]
+    pub format_version: u32,
     pub timestamp: u64,
     pub session_handle: u64,
     pub operation: AuditOperation,
@@ -27,11 +128,12 @@ pub struct AuditEvent {
     pub previous_hash: [u8; 32],
 }
 
-/// The hashable payload of an audit event — excludes `previous_hash` so that
-/// the chain hash `H_n = SHA-256(H_{n-1} || serialize(payload))` is
-/// non-circular and cryptographically sound.
+/// The MAC'd payload of an audit event — excludes `previous_hash` so that the
+/// chain link is non-circular. `format_version` IS included so that downgrade
+/// attacks (rewriting a v1 event as v0) flip the MAC.
 #[derive(Serialize)]
 struct AuditEventPayload<'a> {
+    format_version: u32,
     timestamp: u64,
     session_handle: u64,
     operation: &'a AuditOperation,
@@ -42,6 +144,7 @@ struct AuditEventPayload<'a> {
 impl AuditEvent {
     fn payload(&self) -> AuditEventPayload<'_> {
         AuditEventPayload {
+            format_version: self.format_version,
             timestamp: self.timestamp,
             session_handle: self.session_handle,
             operation: &self.operation,
@@ -207,6 +310,11 @@ pub struct AuditLog {
     tamper_flag: Arc<AtomicBool>,
     /// Handle to the background worker thread that processes audit events.
     worker: Option<std::thread::JoinHandle<()>>,
+    /// HKDF-derived subkey used to key the HMAC-SHA-256 chain. Distinct from
+    /// `HsmCore::state_hmac_key`. Kept here (rather than passed per-call) so
+    /// that `verify_chain()` and the background worker share a single source
+    /// of truth. Zeroized on drop.
+    audit_chain_key: Arc<Zeroizing<[u8; 32]>>,
 }
 
 /// Global weak reference to the active audit log, allowing `Drop` implementations
@@ -407,6 +515,11 @@ impl AuditLog {
                     *last_timestamp = timestamp;
 
                     let event = AuditEvent {
+                        // TODO(security/hmac-audit-chain): emit version 1
+                        // once compute_chain_hash switches to HMAC keyed off
+                        // audit_chain_key. Emitting 0 today preserves wire
+                        // compatibility with the existing SHA-256 chain.
+                        format_version: 0,
                         timestamp,
                         session_handle,
                         operation,
@@ -568,12 +681,19 @@ impl AuditLog {
             0,
         );
 
+        // TODO(security/hmac-audit-chain): wire the audit_chain_key through
+        // from HsmCore::state_hmac_key so `compute_chain_hash` can switch to
+        // HMAC-SHA-256. Today the constructor still uses a zero placeholder
+        // and `compute_chain_hash` still emits plain SHA-256 -- the field
+        // exists but is dead until that refactor lands. See module-level
+        // doc comment for the full migration plan.
         Self {
             state,
             log_path: None,
             sender: Some(sender),
             tamper_flag,
             worker: Some(worker),
+            audit_chain_key: Arc::new(Zeroizing::new([0u8; 32])),
         }
     }
 
@@ -625,12 +745,16 @@ impl AuditLog {
             0,
         );
 
+        // TODO(security/hmac-audit-chain): see Self::new() -- the chain key
+        // is still a zero placeholder pending the constructor-signature
+        // change that threads HsmCore::state_hmac_key through here.
         Ok(Self {
             state,
             log_path: Some(path),
             sender: Some(sender),
             tamper_flag,
             worker: Some(worker),
+            audit_chain_key: Arc::new(Zeroizing::new([0u8; 32])),
         })
     }
 
