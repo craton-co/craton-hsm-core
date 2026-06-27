@@ -25,15 +25,9 @@ use crate::pkcs11_abi::types::CK_MECHANISM_TYPE;
 //    returns `Arc` (no clone of the inner key), and supports both private and
 //    public RSA keys.
 //
-// All three caches are bounded at `RSA_KEY_CACHE_MAX` entries and use
-// **deterministic LRU eviction** (oldest entry removed on overflow). The
-// values are wrapped in `ZeroizingRsaKey` / `ZeroizingRsaPublicKey` so the
-// bignum heap allocations are scrubbed when the last `Arc` reference drops,
-// which happens on eviction (or `clear_rsa_key_cache`).
+// When either cache is full (64 entries), a single arbitrary entry is evicted
+// instead of clearing the entire map, avoiding thundering-herd repopulation.
 
-use indexmap::IndexMap;
-use parking_lot::Mutex;
-use std::ops::Deref;
 use std::sync::{Arc, LazyLock};
 use zeroize::Zeroize;
 
@@ -41,17 +35,102 @@ use zeroize::Zeroize;
 const RSA_KEY_CACHE_MAX: usize = 64;
 
 // ---------------------------------------------------------------------------
-// Zeroizing wrappers
+// Handle-based Arc caches (fast path)
 // ---------------------------------------------------------------------------
 
-/// Wrapper around `RsaPrivateKey` that zeroizes the PKCS#8 DER encoding on
-/// drop and overwrites the bignum allocations with a minimal dummy key.
+/// Handle-based RSA private key cache.
+///
+/// Keyed by (slot_id, handle) to prevent cross-slot cache collisions.
+/// The Arc avoids cloning RSA BigNums on cache hits but note that
+/// SigningKey construction still requires a clone due to the rsa crate's
+/// ownership API.
+static RSA_PRIV_CACHE: LazyLock<dashmap::DashMap<(u64, u64), Arc<RsaPrivateKey>>> =
+    LazyLock::new(|| dashmap::DashMap::with_capacity(RSA_KEY_CACHE_MAX));
+
+/// Handle-based RSA public key cache.
+///
+/// Keyed by (slot_id, handle) to prevent cross-slot cache collisions.
+/// The Arc avoids cloning RSA BigNums on cache hits but note that
+/// SigningKey construction still requires a clone due to the rsa crate's
+/// ownership API.
+static RSA_PUB_CACHE: LazyLock<dashmap::DashMap<(u64, u64), Arc<RsaPublicKey>>> =
+    LazyLock::new(|| dashmap::DashMap::with_capacity(RSA_KEY_CACHE_MAX));
+
+/// Evict one arbitrary entry from a `DashMap` when it is at capacity.
+/// This avoids clearing the entire cache (thundering herd) while keeping
+/// the implementation simple (no LRU metadata overhead).
+fn evict_one_if_full<K: std::hash::Hash + Eq + Clone, V>(map: &dashmap::DashMap<K, V>) {
+    if map.len() >= RSA_KEY_CACHE_MAX {
+        if let Some(entry) = map.iter().next() {
+            let key = entry.key().clone();
+            drop(entry); // release the read guard before removing
+            map.remove(&key);
+        }
+    }
+}
+
+/// Cache an already-parsed RSA private key by (slot_id, handle).
+pub fn cache_rsa_private_key(slot_id: u64, handle: u64, key: Arc<RsaPrivateKey>) {
+    evict_one_if_full(&RSA_PRIV_CACHE);
+    RSA_PRIV_CACHE.insert((slot_id, handle), key);
+}
+
+/// Get a cached RSA private key by (slot_id, handle). Returns `None` on miss.
+pub fn get_cached_rsa_private_key(slot_id: u64, handle: u64) -> Option<Arc<RsaPrivateKey>> {
+    RSA_PRIV_CACHE
+        .get(&(slot_id, handle))
+        .map(|entry| Arc::clone(entry.value()))
+}
+
+/// Cache an already-parsed RSA public key by (slot_id, handle).
+pub fn cache_rsa_public_key(slot_id: u64, handle: u64, key: Arc<RsaPublicKey>) {
+    evict_one_if_full(&RSA_PUB_CACHE);
+    RSA_PUB_CACHE.insert((slot_id, handle), key);
+}
+
+/// Get a cached RSA public key by (slot_id, handle). Returns `None` on miss.
+pub fn get_cached_rsa_public_key(slot_id: u64, handle: u64) -> Option<Arc<RsaPublicKey>> {
+    RSA_PUB_CACHE
+        .get(&(slot_id, handle))
+        .map(|entry| Arc::clone(entry.value()))
+}
+
+/// Evict all cached keys for a given (slot_id, handle) pair (call on C_DestroyObject).
+pub fn evict_cached_keys(slot_id: u64, handle: u64) {
+    RSA_PRIV_CACHE.remove(&(slot_id, handle));
+    RSA_PUB_CACHE.remove(&(slot_id, handle));
+}
+
+/// Evict every cached RSA key (both private and public) that belongs to
+/// `slot_id`.  Intended for slot-wide events such as `C_InitToken`, which
+/// destroys all objects on the token and therefore invalidates every
+/// `(slot_id, handle)` entry for that slot.
+///
+/// Handles persist across same-slot sessions per the PKCS#11 spec, so this
+/// MUST NOT be called from `C_CloseSession` / `C_CloseAllSessions`.
+pub fn clear_for_slot(slot_id: u64) {
+    RSA_PRIV_CACHE.retain(|&(s, _), _| s != slot_id);
+    RSA_PUB_CACHE.retain(|&(s, _), _| s != slot_id);
+}
+
+/// Drop every entry from both handle-based RSA caches.  Intended for
+/// process-wide cleanup such as `C_Finalize`.
+pub fn clear_all() {
+    RSA_PRIV_CACHE.clear();
+    RSA_PUB_CACHE.clear();
+}
+
+// ---------------------------------------------------------------------------
+// DER-hash cache (legacy / slow path)
+// ---------------------------------------------------------------------------
+
+/// Wrapper around `RsaPrivateKey` that zeroizes the PKCS#8 DER encoding on drop.
 ///
 /// The `rsa` crate's `RsaPrivateKey` does not implement `Zeroize` (its bignums
 /// are heap-allocated via `num-bigint`). We work around this by re-exporting
-/// the key to PKCS#8 DER, zeroizing those bytes, and reassigning the inner
-/// struct to a minimal dummy key. This ensures sensitive key material does
-/// not linger in freed heap memory after eviction.
+/// the key to PKCS#8 DER, zeroizing those bytes, and overwriting the struct's
+/// in-memory fields with a minimal dummy key. This ensures sensitive key material
+/// does not linger in freed heap memory.
 struct ZeroizingRsaKey {
     key: RsaPrivateKey,
 }
@@ -59,13 +138,6 @@ struct ZeroizingRsaKey {
 impl ZeroizingRsaKey {
     fn new(key: RsaPrivateKey) -> Self {
         Self { key }
-    }
-}
-
-impl Deref for ZeroizingRsaKey {
-    type Target = RsaPrivateKey;
-    fn deref(&self) -> &RsaPrivateKey {
-        &self.key
     }
 }
 
@@ -93,142 +165,14 @@ impl Drop for ZeroizingRsaKey {
     }
 }
 
-/// Wrapper around `RsaPublicKey` paired with `ZeroizingRsaKey` for symmetry
-/// in the cache layer. Public keys are not secret, but their bignum modulus
-/// is still heap-allocated; on drop we overwrite with a minimal dummy so the
-/// allocator reclaims the underlying buffers promptly.
-struct ZeroizingRsaPublicKey {
-    key: RsaPublicKey,
-}
-
-impl ZeroizingRsaPublicKey {
-    fn new(key: RsaPublicKey) -> Self {
-        Self { key }
-    }
-}
-
-impl Deref for ZeroizingRsaPublicKey {
-    type Target = RsaPublicKey;
-    fn deref(&self) -> &RsaPublicKey {
-        &self.key
-    }
-}
-
-impl Drop for ZeroizingRsaPublicKey {
-    fn drop(&mut self) {
-        // Overwrite the in-memory struct fields by assigning a minimal dummy
-        // public key. This forces the allocator to drop the original bignum
-        // heap allocations and keeps behaviour symmetric with the private-key
-        // wrapper.
-        use rsa::BigUint;
-        if let Ok(dummy) = RsaPublicKey::new(BigUint::from(3u32), BigUint::from(3u32)) {
-            self.key = dummy;
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// LRU helper (deterministic eviction)
-// ---------------------------------------------------------------------------
-
-/// Insert `value` under `key`, evicting the oldest entry first if the map is
-/// at capacity. Insertion order is preserved by `IndexMap`, so the front of
-/// the map is always the least-recently-used entry (assuming `lru_get` is
-/// used for reads).
-fn lru_insert<K, V>(map: &mut IndexMap<K, V>, key: K, value: V)
-where
-    K: std::hash::Hash + Eq,
-{
-    if !map.contains_key(&key) && map.len() >= RSA_KEY_CACHE_MAX {
-        // Evict the oldest entry (front of the IndexMap).
-        map.shift_remove_index(0);
-    }
-    // `insert` overwrites without changing position; for a fresh key it
-    // appends to the back (most-recently-used).
-    map.insert(key, value);
-}
-
-/// Look up `key` and, on hit, move the entry to the back of the map so it
-/// becomes most-recently-used. Returns a clone of the value (typically an
-/// `Arc`, so this is cheap).
-fn lru_get<K, V>(map: &mut IndexMap<K, V>, key: &K) -> Option<V>
-where
-    K: std::hash::Hash + Eq,
-    V: Clone,
-{
-    let idx = map.get_index_of(key)?;
-    let last = map.len() - 1;
-    if idx != last {
-        map.move_index(idx, last);
-    }
-    map.get(key).cloned()
-}
-
-// ---------------------------------------------------------------------------
-// Handle-based Arc caches (fast path)
-// ---------------------------------------------------------------------------
-
-/// Handle-based RSA private key cache.
-///
-/// Keyed by (slot_id, handle) to prevent cross-slot cache collisions. Values
-/// are wrapped in `ZeroizingRsaKey` so bignum allocations are scrubbed when
-/// the last `Arc` strong reference drops (on eviction or
-/// `clear_rsa_key_cache`).
-static RSA_PRIV_CACHE: LazyLock<Mutex<IndexMap<(u64, u64), Arc<ZeroizingRsaKey>>>> =
-    LazyLock::new(|| Mutex::new(IndexMap::with_capacity(RSA_KEY_CACHE_MAX)));
-
-/// Handle-based RSA public key cache.
-///
-/// Keyed by (slot_id, handle) to prevent cross-slot cache collisions. Values
-/// are wrapped in `ZeroizingRsaPublicKey` so bignum allocations are reclaimed
-/// promptly on eviction.
-static RSA_PUB_CACHE: LazyLock<Mutex<IndexMap<(u64, u64), Arc<ZeroizingRsaPublicKey>>>> =
-    LazyLock::new(|| Mutex::new(IndexMap::with_capacity(RSA_KEY_CACHE_MAX)));
-
-/// Cache an already-parsed RSA private key by (slot_id, handle).
-fn cache_rsa_private_key(slot_id: u64, handle: u64, key: Arc<ZeroizingRsaKey>) {
-    let mut map = RSA_PRIV_CACHE.lock();
-    lru_insert(&mut map, (slot_id, handle), key);
-}
-
-/// Get a cached RSA private key by (slot_id, handle). Returns `None` on miss.
-/// On hit, the entry is promoted to most-recently-used.
-fn get_cached_rsa_private_key(slot_id: u64, handle: u64) -> Option<Arc<ZeroizingRsaKey>> {
-    let mut map = RSA_PRIV_CACHE.lock();
-    lru_get(&mut map, &(slot_id, handle))
-}
-
-/// Cache an already-parsed RSA public key by (slot_id, handle).
-fn cache_rsa_public_key(slot_id: u64, handle: u64, key: Arc<ZeroizingRsaPublicKey>) {
-    let mut map = RSA_PUB_CACHE.lock();
-    lru_insert(&mut map, (slot_id, handle), key);
-}
-
-/// Get a cached RSA public key by (slot_id, handle). Returns `None` on miss.
-/// On hit, the entry is promoted to most-recently-used.
-fn get_cached_rsa_public_key(slot_id: u64, handle: u64) -> Option<Arc<ZeroizingRsaPublicKey>> {
-    let mut map = RSA_PUB_CACHE.lock();
-    lru_get(&mut map, &(slot_id, handle))
-}
-
-/// Evict all cached keys for a given (slot_id, handle) pair (call on C_DestroyObject).
-pub fn evict_cached_keys(slot_id: u64, handle: u64) {
-    RSA_PRIV_CACHE.lock().shift_remove(&(slot_id, handle));
-    RSA_PUB_CACHE.lock().shift_remove(&(slot_id, handle));
-}
-
-// ---------------------------------------------------------------------------
-// DER-hash cache (legacy / slow path)
-// ---------------------------------------------------------------------------
-
 /// Cache of parsed RSA private keys, keyed by SHA-256(DER).
-/// Values are wrapped in `ZeroizingRsaKey` to best-effort zeroize key
-/// material on eviction.
+/// Uses DashMap for lock-free concurrent access. Values are wrapped in
+/// `ZeroizingRsaKey` to best-effort zeroize key material on eviction.
 ///
 /// **Slow path** — prefer the handle-based `RSA_PRIV_CACHE` when an object
 /// handle is available.
-static RSA_KEY_CACHE: LazyLock<Mutex<IndexMap<[u8; 32], ZeroizingRsaKey>>> =
-    LazyLock::new(|| Mutex::new(IndexMap::with_capacity(RSA_KEY_CACHE_MAX)));
+static RSA_KEY_CACHE: LazyLock<dashmap::DashMap<[u8; 32], ZeroizingRsaKey>> =
+    LazyLock::new(|| dashmap::DashMap::with_capacity(RSA_KEY_CACHE_MAX));
 
 /// Parse an RSA private key from PKCS#8 DER, using the DER-hash cache.
 ///
@@ -238,43 +182,39 @@ static RSA_KEY_CACHE: LazyLock<Mutex<IndexMap<[u8; 32], ZeroizingRsaKey>>> =
 fn parse_rsa_private_key(der: &[u8]) -> HsmResult<RsaPrivateKey> {
     let cache_key: [u8; 32] = Sha256::digest(der).into();
 
-    // Fast path: cache hit (still clones — use handle cache to avoid this).
-    {
-        let mut map = RSA_KEY_CACHE.lock();
-        if let Some(idx) = map.get_index_of(&cache_key) {
-            let last = map.len() - 1;
-            if idx != last {
-                map.move_index(idx, last);
-            }
-            // SAFETY: idx is in bounds (just looked up); ZeroizingRsaKey
-            // derefs to RsaPrivateKey which we clone out.
-            if let Some(entry) = map.get(&cache_key) {
-                return Ok(entry.key.clone());
-            }
-        }
+    // Fast path: cache hit (still clones — use handle cache to avoid this)
+    if let Some(entry) = RSA_KEY_CACHE.get(&cache_key) {
+        return Ok(entry.value().key.clone());
     }
 
-    // Slow path: parse and cache (lock dropped during parsing).
+    // Slow path: parse and cache
     let private_key = RsaPrivateKey::from_pkcs8_der(der).map_err(|_| HsmError::KeyHandleInvalid)?;
 
-    {
-        let mut map = RSA_KEY_CACHE.lock();
-        lru_insert(
-            &mut map,
-            cache_key,
-            ZeroizingRsaKey::new(private_key.clone()),
-        );
-    }
+    // Evict one arbitrary entry instead of clearing the whole cache.
+    evict_one_if_full_zeroizing(&RSA_KEY_CACHE);
+
+    RSA_KEY_CACHE.insert(cache_key, ZeroizingRsaKey::new(private_key.clone()));
     Ok(private_key)
 }
 
+/// Single-entry eviction for the ZeroizingRsaKey DER-hash cache.
+fn evict_one_if_full_zeroizing(map: &dashmap::DashMap<[u8; 32], ZeroizingRsaKey>) {
+    if map.len() >= RSA_KEY_CACHE_MAX {
+        if let Some(entry) = map.iter().next() {
+            let key = *entry.key();
+            drop(entry);
+            map.remove(&key);
+        }
+    }
+}
+
 /// Clear all RSA key caches. Called on C_Finalize / C_InitToken.
-/// Each evicted private-key entry is zeroized via `ZeroizingRsaKey::drop()`
-/// (and similarly for public keys via `ZeroizingRsaPublicKey::drop()`).
+/// Each evicted private-key entry in the DER-hash cache is zeroized via
+/// `ZeroizingRsaKey::drop()`.
 pub fn clear_rsa_key_cache() {
-    RSA_KEY_CACHE.lock().clear();
-    RSA_PRIV_CACHE.lock().clear();
-    RSA_PUB_CACHE.lock().clear();
+    RSA_KEY_CACHE.clear();
+    RSA_PRIV_CACHE.clear();
+    RSA_PUB_CACHE.clear();
 }
 
 /// Minimum RSA modulus size in bits. Keys below this threshold are rejected
@@ -652,21 +592,21 @@ pub fn rsa_pkcs1v15_sign_cached(
         Some(HashAlg::Sha256) => {
             use rsa::pkcs1v15::SigningKey;
             use rsa::signature::Signer;
-            let signing_key = SigningKey::<Sha256>::new((**key).clone());
+            let signing_key = SigningKey::<Sha256>::new((*key).clone());
             let signature = signing_key.sign(data);
             Ok(signature.to_vec())
         }
         Some(HashAlg::Sha384) => {
             use rsa::pkcs1v15::SigningKey;
             use rsa::signature::Signer;
-            let signing_key = SigningKey::<Sha384>::new((**key).clone());
+            let signing_key = SigningKey::<Sha384>::new((*key).clone());
             let signature = signing_key.sign(data);
             Ok(signature.to_vec())
         }
         Some(HashAlg::Sha512) => {
             use rsa::pkcs1v15::SigningKey;
             use rsa::signature::Signer;
-            let signing_key = SigningKey::<Sha512>::new((**key).clone());
+            let signing_key = SigningKey::<Sha512>::new((*key).clone());
             let signature = signing_key.sign(data);
             Ok(signature.to_vec())
         }
@@ -693,7 +633,7 @@ pub fn rsa_pkcs1v15_verify_cached(
         Some(HashAlg::Sha256) => {
             use rsa::pkcs1v15::VerifyingKey;
             use rsa::signature::Verifier;
-            let verifying_key = VerifyingKey::<Sha256>::new((**key).clone());
+            let verifying_key = VerifyingKey::<Sha256>::new((*key).clone());
             let sig = rsa::pkcs1v15::Signature::try_from(signature)
                 .map_err(|_| HsmError::SignatureInvalid)?;
             Ok(verifying_key.verify(data, &sig).is_ok())
@@ -701,7 +641,7 @@ pub fn rsa_pkcs1v15_verify_cached(
         Some(HashAlg::Sha384) => {
             use rsa::pkcs1v15::VerifyingKey;
             use rsa::signature::Verifier;
-            let verifying_key = VerifyingKey::<Sha384>::new((**key).clone());
+            let verifying_key = VerifyingKey::<Sha384>::new((*key).clone());
             let sig = rsa::pkcs1v15::Signature::try_from(signature)
                 .map_err(|_| HsmError::SignatureInvalid)?;
             Ok(verifying_key.verify(data, &sig).is_ok())
@@ -709,7 +649,7 @@ pub fn rsa_pkcs1v15_verify_cached(
         Some(HashAlg::Sha512) => {
             use rsa::pkcs1v15::VerifyingKey;
             use rsa::signature::Verifier;
-            let verifying_key = VerifyingKey::<Sha512>::new((**key).clone());
+            let verifying_key = VerifyingKey::<Sha512>::new((*key).clone());
             let sig = rsa::pkcs1v15::Signature::try_from(signature)
                 .map_err(|_| HsmError::SignatureInvalid)?;
             Ok(verifying_key.verify(data, &sig).is_ok())
@@ -742,17 +682,17 @@ pub fn rsa_pss_sign_cached(
 
     match hash_alg {
         HashAlg::Sha256 => {
-            let signing_key = SigningKey::<Sha256>::new((**key).clone());
+            let signing_key = SigningKey::<Sha256>::new((*key).clone());
             let signature = signing_key.sign_with_rng(&mut rng, data);
             Ok(signature.to_vec())
         }
         HashAlg::Sha384 => {
-            let signing_key = SigningKey::<Sha384>::new((**key).clone());
+            let signing_key = SigningKey::<Sha384>::new((*key).clone());
             let signature = signing_key.sign_with_rng(&mut rng, data);
             Ok(signature.to_vec())
         }
         HashAlg::Sha512 => {
-            let signing_key = SigningKey::<Sha512>::new((**key).clone());
+            let signing_key = SigningKey::<Sha512>::new((*key).clone());
             let signature = signing_key.sign_with_rng(&mut rng, data);
             Ok(signature.to_vec())
         }
@@ -778,19 +718,19 @@ pub fn rsa_pss_verify_cached(
 
     match hash_alg {
         HashAlg::Sha256 => {
-            let verifying_key = VerifyingKey::<Sha256>::new((**key).clone());
+            let verifying_key = VerifyingKey::<Sha256>::new((*key).clone());
             let sig =
                 rsa::pss::Signature::try_from(signature).map_err(|_| HsmError::SignatureInvalid)?;
             Ok(verifying_key.verify(data, &sig).is_ok())
         }
         HashAlg::Sha384 => {
-            let verifying_key = VerifyingKey::<Sha384>::new((**key).clone());
+            let verifying_key = VerifyingKey::<Sha384>::new((*key).clone());
             let sig =
                 rsa::pss::Signature::try_from(signature).map_err(|_| HsmError::SignatureInvalid)?;
             Ok(verifying_key.verify(data, &sig).is_ok())
         }
         HashAlg::Sha512 => {
-            let verifying_key = VerifyingKey::<Sha512>::new((**key).clone());
+            let verifying_key = VerifyingKey::<Sha512>::new((*key).clone());
             let sig =
                 rsa::pss::Signature::try_from(signature).map_err(|_| HsmError::SignatureInvalid)?;
             Ok(verifying_key.verify(data, &sig).is_ok())
@@ -879,12 +819,11 @@ fn get_or_parse_private_key(
     slot_id: u64,
     handle: u64,
     der: &[u8],
-) -> HsmResult<Arc<ZeroizingRsaKey>> {
+) -> HsmResult<Arc<RsaPrivateKey>> {
     if let Some(k) = get_cached_rsa_private_key(slot_id, handle) {
         return Ok(k);
     }
-    let parsed = RsaPrivateKey::from_pkcs8_der(der).map_err(|_| HsmError::KeyHandleInvalid)?;
-    let k = Arc::new(ZeroizingRsaKey::new(parsed));
+    let k = Arc::new(RsaPrivateKey::from_pkcs8_der(der).map_err(|_| HsmError::KeyHandleInvalid)?);
     cache_rsa_private_key(slot_id, handle, Arc::clone(&k));
     Ok(k)
 }
@@ -895,14 +834,13 @@ fn get_or_build_public_key(
     handle: u64,
     modulus: &[u8],
     public_exponent: &[u8],
-) -> HsmResult<Arc<ZeroizingRsaPublicKey>> {
+) -> HsmResult<Arc<RsaPublicKey>> {
     if let Some(k) = get_cached_rsa_public_key(slot_id, handle) {
         return Ok(k);
     }
     let n = rsa::BigUint::from_bytes_be(modulus);
     let e = rsa::BigUint::from_bytes_be(public_exponent);
-    let built = RsaPublicKey::new(n, e).map_err(|_| HsmError::KeyHandleInvalid)?;
-    let k = Arc::new(ZeroizingRsaPublicKey::new(built));
+    let k = Arc::new(RsaPublicKey::new(n, e).map_err(|_| HsmError::KeyHandleInvalid)?);
     cache_rsa_public_key(slot_id, handle, Arc::clone(&k));
     Ok(k)
 }
@@ -1340,21 +1278,21 @@ pub(crate) fn rsa_pss_sign_prehashed_cached(
 
     match hash_alg {
         HashAlg::Sha256 => {
-            let signing_key = SigningKey::<Sha256>::new((**key).clone());
+            let signing_key = SigningKey::<Sha256>::new((*key).clone());
             let signature = signing_key
                 .sign_prehash_with_rng(&mut rng, digest)
                 .map_err(|_| HsmError::GeneralError)?;
             Ok(signature.to_vec())
         }
         HashAlg::Sha384 => {
-            let signing_key = SigningKey::<Sha384>::new((**key).clone());
+            let signing_key = SigningKey::<Sha384>::new((*key).clone());
             let signature = signing_key
                 .sign_prehash_with_rng(&mut rng, digest)
                 .map_err(|_| HsmError::GeneralError)?;
             Ok(signature.to_vec())
         }
         HashAlg::Sha512 => {
-            let signing_key = SigningKey::<Sha512>::new((**key).clone());
+            let signing_key = SigningKey::<Sha512>::new((*key).clone());
             let signature = signing_key
                 .sign_prehash_with_rng(&mut rng, digest)
                 .map_err(|_| HsmError::GeneralError)?;
@@ -1384,15 +1322,15 @@ pub(crate) fn rsa_pss_verify_prehashed_cached(
 
     match hash_alg {
         HashAlg::Sha256 => {
-            let verifying_key = VerifyingKey::<Sha256>::new((**key).clone());
+            let verifying_key = VerifyingKey::<Sha256>::new((*key).clone());
             Ok(verifying_key.verify_prehash(digest, &sig).is_ok())
         }
         HashAlg::Sha384 => {
-            let verifying_key = VerifyingKey::<Sha384>::new((**key).clone());
+            let verifying_key = VerifyingKey::<Sha384>::new((*key).clone());
             Ok(verifying_key.verify_prehash(digest, &sig).is_ok())
         }
         HashAlg::Sha512 => {
-            let verifying_key = VerifyingKey::<Sha512>::new((**key).clone());
+            let verifying_key = VerifyingKey::<Sha512>::new((*key).clone());
             Ok(verifying_key.verify_prehash(digest, &sig).is_ok())
         }
     }
@@ -1649,67 +1587,6 @@ mod tests {
     }
 
     #[test]
-    fn clear_rsa_key_cache_drains_handle_caches() {
-        // Populate both the private- and public-key handle caches via the
-        // public sign/verify entry points, then verify that
-        // `clear_rsa_key_cache()` drains them.  The DER-hash cache
-        // (RSA_KEY_CACHE) is also cleared, but since it is private to this
-        // module we observe its drainage indirectly: a fresh parse after
-        // `clear_rsa_key_cache()` must yield a new Arc (no ptr-eq).
-        let (slot, handle) = unique_ids();
-        let (priv_der, modulus, pub_exp) = fresh_rsa_keypair();
-        let msg = b"clear-cache test";
-
-        // Populate private-key handle cache via sign_cached.
-        let sig = rsa_pkcs1v15_sign_cached(slot, handle, &priv_der, msg, Some(HashAlg::Sha256))
-            .expect("sign");
-        // Populate public-key handle cache via verify_cached.
-        let ok = rsa_pkcs1v15_verify_cached(
-            slot,
-            handle,
-            &modulus,
-            &pub_exp,
-            msg,
-            &sig,
-            Some(HashAlg::Sha256),
-        )
-        .expect("verify");
-        assert!(ok);
-
-        assert!(
-            get_cached_rsa_private_key(slot, handle).is_some(),
-            "precondition: private-key cache populated"
-        );
-        assert!(
-            get_cached_rsa_public_key(slot, handle).is_some(),
-            "precondition: public-key cache populated"
-        );
-
-        clear_rsa_key_cache();
-
-        assert!(
-            get_cached_rsa_private_key(slot, handle).is_none(),
-            "clear_rsa_key_cache must drain RSA_PRIV_CACHE"
-        );
-        assert!(
-            get_cached_rsa_public_key(slot, handle).is_none(),
-            "clear_rsa_key_cache must drain RSA_PUB_CACHE"
-        );
-
-        // Re-populate after clear and confirm the new Arc is independent of
-        // any pre-clear cached value (proves the entry really was dropped,
-        // not just hidden by a duplicate insert).
-        let _ = rsa_pkcs1v15_sign_cached(slot, handle, &priv_der, msg, Some(HashAlg::Sha256))
-            .expect("sign after clear");
-        assert!(
-            get_cached_rsa_private_key(slot, handle).is_some(),
-            "post-clear sign should repopulate the private-key cache"
-        );
-
-        evict_cached_keys(slot, handle);
-    }
-
-    #[test]
     fn evict_cached_keys_clears_public_entry() {
         let (slot, handle) = unique_ids();
         let (priv_der, modulus, pub_exp) = fresh_rsa_keypair();
@@ -1734,98 +1611,87 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------
-    // LRU eviction and zeroize-on-drop coverage
-    // ------------------------------------------------------------------
-
-    /// `lru_insert` evicts the front (least-recently-inserted) entry on
-    /// overflow. Validated against a local `IndexMap` so that the test
-    /// does not interfere with the global RSA caches.
     #[test]
-    fn lru_insert_evicts_oldest_first() {
-        let mut map: IndexMap<u64, u64> = IndexMap::new();
-        // Fill the cache to capacity.
-        for i in 0..(RSA_KEY_CACHE_MAX as u64) {
-            lru_insert(&mut map, i, i * 10);
-        }
-        assert_eq!(map.len(), RSA_KEY_CACHE_MAX);
+    fn clear_for_slot_drops_only_targeted_slot() {
+        // Populate two distinct slots in both caches; make sure clearing one
+        // leaves the other untouched.
+        let (slot_a, handle_a) = unique_ids();
+        let (slot_b, handle_b) = unique_ids();
+        let (der_a, mod_a, exp_a) = fresh_rsa_keypair();
+        let (der_b, mod_b, exp_b) = fresh_rsa_keypair();
+
+        // Populate private-key cache for both slots.
+        let _ =
+            rsa_pkcs1v15_sign_cached(slot_a, handle_a, &der_a, b"x", Some(HashAlg::Sha256)).unwrap();
+        let _ =
+            rsa_pkcs1v15_sign_cached(slot_b, handle_b, &der_b, b"x", Some(HashAlg::Sha256)).unwrap();
+
+        // Populate public-key cache for both slots via OAEP encrypt.
+        let _ = rsa_oaep_encrypt_cached(slot_a, handle_a, &mod_a, &exp_a, b"x", OaepHash::Sha256)
+            .unwrap();
+        let _ = rsa_oaep_encrypt_cached(slot_b, handle_b, &mod_b, &exp_b, b"x", OaepHash::Sha256)
+            .unwrap();
+
+        assert!(get_cached_rsa_private_key(slot_a, handle_a).is_some());
+        assert!(get_cached_rsa_public_key(slot_a, handle_a).is_some());
+        assert!(get_cached_rsa_private_key(slot_b, handle_b).is_some());
+        assert!(get_cached_rsa_public_key(slot_b, handle_b).is_some());
+
+        clear_for_slot(slot_a);
+
         assert!(
-            map.contains_key(&0),
-            "first key must still be present at cap"
+            get_cached_rsa_private_key(slot_a, handle_a).is_none(),
+            "clear_for_slot must drop private entries in the targeted slot"
+        );
+        assert!(
+            get_cached_rsa_public_key(slot_a, handle_a).is_none(),
+            "clear_for_slot must drop public entries in the targeted slot"
+        );
+        assert!(
+            get_cached_rsa_private_key(slot_b, handle_b).is_some(),
+            "clear_for_slot must NOT touch entries in other slots"
+        );
+        assert!(
+            get_cached_rsa_public_key(slot_b, handle_b).is_some(),
+            "clear_for_slot must NOT touch public entries in other slots"
         );
 
-        // One more insert should evict key 0 (the oldest), not anything else.
-        let overflow_key = RSA_KEY_CACHE_MAX as u64;
-        lru_insert(&mut map, overflow_key, overflow_key * 10);
-        assert_eq!(map.len(), RSA_KEY_CACHE_MAX);
-        assert!(
-            !map.contains_key(&0),
-            "oldest entry must be evicted deterministically"
-        );
-        assert!(map.contains_key(&1), "second-oldest must remain");
-        assert!(
-            map.contains_key(&overflow_key),
-            "newly inserted entry must be present"
-        );
+        // Tidy up so we don't leak entries to other tests.
+        evict_cached_keys(slot_b, handle_b);
     }
 
-    /// `lru_get` promotes the accessed entry to most-recently-used, so a
-    /// subsequent overflow does not evict it.
     #[test]
-    fn lru_get_promotes_to_most_recently_used() {
-        let mut map: IndexMap<u64, u64> = IndexMap::new();
-        for i in 0..(RSA_KEY_CACHE_MAX as u64) {
-            lru_insert(&mut map, i, i * 10);
-        }
+    fn clear_all_drops_every_entry() {
+        // Seed both caches across two slots, then assert clear_all wipes them.
+        let (slot_a, handle_a) = unique_ids();
+        let (slot_b, handle_b) = unique_ids();
+        let (der_a, mod_a, exp_a) = fresh_rsa_keypair();
+        let (der_b, _mod_b, _exp_b) = fresh_rsa_keypair();
 
-        // Touch key 0 — it should now be the newest entry.
-        let v = lru_get(&mut map, &0);
-        assert_eq!(v, Some(0));
+        let _ =
+            rsa_pkcs1v15_sign_cached(slot_a, handle_a, &der_a, b"x", Some(HashAlg::Sha256)).unwrap();
+        let _ =
+            rsa_pkcs1v15_sign_cached(slot_b, handle_b, &der_b, b"x", Some(HashAlg::Sha256)).unwrap();
+        let _ = rsa_oaep_encrypt_cached(slot_a, handle_a, &mod_a, &exp_a, b"x", OaepHash::Sha256)
+            .unwrap();
 
-        // Overflow: the eviction victim should now be key 1, not key 0.
-        let overflow_key = RSA_KEY_CACHE_MAX as u64;
-        lru_insert(&mut map, overflow_key, overflow_key * 10);
+        assert!(get_cached_rsa_private_key(slot_a, handle_a).is_some());
+        assert!(get_cached_rsa_private_key(slot_b, handle_b).is_some());
+        assert!(get_cached_rsa_public_key(slot_a, handle_a).is_some());
+
+        clear_all();
+
         assert!(
-            map.contains_key(&0),
-            "key 0 was touched and must survive the next eviction"
+            get_cached_rsa_private_key(slot_a, handle_a).is_none(),
+            "clear_all must drop the private cache"
         );
         assert!(
-            !map.contains_key(&1),
-            "key 1 became the oldest after key 0 was promoted, so it must be evicted"
+            get_cached_rsa_private_key(slot_b, handle_b).is_none(),
+            "clear_all must drop the private cache across slots"
         );
-    }
-
-    /// The cache wrapper's `Drop` runs when the cache evicts the entry: we
-    /// hold a `Weak<ZeroizingRsaKey>` outside the cache, then ask the cache
-    /// to drop its strong reference. After eviction the `Weak` must no
-    /// longer upgrade — which is only possible if the wrapper was dropped,
-    /// running the zeroization logic.
-    #[test]
-    fn cache_eviction_drops_zeroizing_wrapper() {
-        let (slot, handle) = unique_ids();
-        let (der, _, _) = fresh_rsa_keypair();
-        // Populate via the public API path.
-        let _ = rsa_pkcs1v15_sign_cached(slot, handle, &der, b"x", Some(HashAlg::Sha256)).unwrap();
-        let arc =
-            get_cached_rsa_private_key(slot, handle).expect("populated above; must be present");
-        let weak = Arc::downgrade(&arc);
-        drop(arc); // release our local strong ref
-
-        // The cache still holds a strong reference, so weak can be upgraded.
         assert!(
-            weak.upgrade().is_some(),
-            "cache must retain a strong reference until eviction"
-        );
-
-        // Evict from the cache — this should be the only remaining strong ref.
-        evict_cached_keys(slot, handle);
-
-        // With no strong references left, the Arc — and therefore the
-        // ZeroizingRsaKey wrapper — must have been dropped, running the
-        // zeroize-on-drop logic.
-        assert!(
-            weak.upgrade().is_none(),
-            "evicting the cache entry must drop ZeroizingRsaKey (Weak should no longer upgrade)"
+            get_cached_rsa_public_key(slot_a, handle_a).is_none(),
+            "clear_all must drop the public cache"
         );
     }
 }
