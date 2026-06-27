@@ -320,6 +320,9 @@ pub extern "C" fn C_Finalize(p_reserved: CK_VOID_PTR) -> CK_RV {
         // Invalidate all thread-local HSM caches.
         HSM_GENERATION.fetch_add(1, Ordering::Release);
         CACHED_HSM.with(|c| *c.borrow_mut() = None);
+        // Drop every backend handle-cache entry. The process is winding down
+        // its Cryptoki state; the next C_Initialize gets a clean cache.
+        crate::crypto::sign::clear_all();
         CKR_OK
     })
     .unwrap_or(CKR_GENERAL_ERROR)
@@ -541,6 +544,10 @@ pub extern "C" fn C_InitToken(
         hsm.object_store.clear_persist_key();
         // All keys are destroyed — safe to reset all GCM/IV counters
         crate::crypto::encrypt::force_reset_all_counters();
+        // Drop every backend handle-cache entry for this slot. The token wipe
+        // invalidates the (slot_id, handle) keys, so a later handle-reuse
+        // must not be served from a stale cache.
+        crate::crypto::sign::clear_for_slot(slot_id as u64);
 
         match token.init_token(pin, &label) {
             Ok(()) => CKR_OK,
