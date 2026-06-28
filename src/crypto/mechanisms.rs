@@ -5,11 +5,16 @@ use crate::pkcs11_abi::constants::*;
 use crate::pkcs11_abi::types::{CK_MECHANISM_TYPE, CK_RV};
 
 /// Check if a mechanism is supported for signing
+///
+/// Note: raw `CKM_RSA_PKCS` (PKCS#1 v1.5 without a built-in hash) is intentionally
+/// omitted — the underlying signer requires a DigestInfo prefix and the helpers
+/// in `crypto::sign` reject it. Advertising it here would let `C_SignInit`
+/// succeed only for `C_Sign` / `C_SignFinal` to fail. See `mechanism_to_hash`
+/// and `rsa_pkcs1v15_sign` for the defense-in-depth reject.
 pub fn is_sign_mechanism(mechanism: CK_MECHANISM_TYPE) -> bool {
     matches!(
         mechanism,
-        CKM_RSA_PKCS
-            | CKM_SHA256_RSA_PKCS
+        CKM_SHA256_RSA_PKCS
             | CKM_SHA384_RSA_PKCS
             | CKM_SHA512_RSA_PKCS
             | CKM_RSA_PKCS_PSS
@@ -95,7 +100,8 @@ pub fn supported_mechanisms() -> Vec<CK_MECHANISM_TYPE> {
     vec![
         // RSA
         CKM_RSA_PKCS_KEY_PAIR_GEN,
-        CKM_RSA_PKCS,
+        // Note: raw CKM_RSA_PKCS is intentionally not advertised — the signer
+        // requires a hash alg, so callers must use CKM_SHAxxx_RSA_PKCS variants.
         CKM_SHA256_RSA_PKCS,
         CKM_SHA384_RSA_PKCS,
         CKM_SHA512_RSA_PKCS,
