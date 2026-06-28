@@ -250,7 +250,11 @@ fn test_get_mechanism_list_count() {
 }
 
 // =============================================================================
-// 12. C_GetMechanismList — contains CKM_RSA_PKCS, CKM_AES_GCM, CKM_SHA256
+// 12. C_GetMechanismList — contains CKM_SHA256_RSA_PKCS, CKM_AES_GCM, CKM_SHA256
+//
+// Note: raw CKM_RSA_PKCS is intentionally NOT advertised (the signer requires
+// a hash alg / DigestInfo prefix), so callers must use the CKM_SHAxxx_RSA_PKCS
+// hash-prefixed variants. Verify the prefixed variant is present instead.
 // =============================================================================
 #[test]
 fn test_get_mechanism_list_contents() {
@@ -264,8 +268,12 @@ fn test_get_mechanism_list_contents() {
     assert_eq!(rv, CKR_OK);
 
     assert!(
-        mechs.contains(&CKM_RSA_PKCS),
-        "Mechanism list should contain CKM_RSA_PKCS"
+        !mechs.contains(&CKM_RSA_PKCS),
+        "Mechanism list must NOT contain raw CKM_RSA_PKCS (unsupported)"
+    );
+    assert!(
+        mechs.contains(&CKM_SHA256_RSA_PKCS),
+        "Mechanism list should contain CKM_SHA256_RSA_PKCS"
     );
     assert!(
         mechs.contains(&CKM_AES_GCM),
@@ -278,31 +286,43 @@ fn test_get_mechanism_list_contents() {
 }
 
 // =============================================================================
-// 13. C_GetMechanismInfo — CKM_RSA_PKCS: key sizes and SIGN|VERIFY flags
+// 13. C_GetMechanismInfo — raw CKM_RSA_PKCS is unsupported (returns
+// CKR_MECHANISM_INVALID). The hash-prefixed CKM_SHA256_RSA_PKCS variant
+// advertises SIGN|VERIFY flags instead.
 // =============================================================================
 #[test]
 fn test_get_mechanism_info_rsa_pkcs() {
     ensure_init();
     let mut mech_info: CK_MECHANISM_INFO = unsafe { std::mem::zeroed() };
     let rv = C_GetMechanismInfo(0, CKM_RSA_PKCS, &mut mech_info);
+    assert_eq!(
+        rv, CKR_MECHANISM_INVALID,
+        "Raw CKM_RSA_PKCS must report CKR_MECHANISM_INVALID (signer needs a hash alg)"
+    );
+
+    let mut mech_info: CK_MECHANISM_INFO = unsafe { std::mem::zeroed() };
+    let rv = C_GetMechanismInfo(0, CKM_SHA256_RSA_PKCS, &mut mech_info);
     assert_eq!(rv, CKR_OK);
     let min_key_size = mech_info.min_key_size;
     let max_key_size = mech_info.max_key_size;
     let flags = mech_info.flags;
-    assert_eq!(min_key_size, 2048, "RSA PKCS min key size should be 2048");
+    assert_eq!(
+        min_key_size, 2048,
+        "RSA SHA256-PKCS min key size should be 2048"
+    );
     assert!(
         max_key_size >= 4096,
-        "RSA PKCS max key size should be >= 4096"
+        "RSA SHA256-PKCS max key size should be >= 4096"
     );
     assert_ne!(
         flags & CKF_SIGN_FLAG,
         0,
-        "CKM_RSA_PKCS should have CKF_SIGN_FLAG"
+        "CKM_SHA256_RSA_PKCS should have CKF_SIGN_FLAG"
     );
     assert_ne!(
         mech_info.flags & CKF_VERIFY_FLAG,
         0,
-        "CKM_RSA_PKCS should have CKF_VERIFY_FLAG"
+        "CKM_SHA256_RSA_PKCS should have CKF_VERIFY_FLAG"
     );
 }
 
