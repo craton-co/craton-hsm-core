@@ -5,11 +5,10 @@
 //! Supports mutual TLS (mTLS) when a client CA is configured.
 //! Without mTLS, any TLS client can connect — a warning is logged.
 //!
-//! NOTE (#17): This module provides rustls-native TLS configuration as an
-//! alternative to tonic's built-in TLS. Currently main.rs uses tonic's
-//! ServerTlsConfig directly. This module is retained for advanced use cases
-//! (e.g., custom certificate verifiers, CRL checking) and will be integrated
-//! when CRL/OCSP support is added.
+//! `main.rs` calls [`load_tls_config`] directly and wraps the resulting
+//! `rustls::ServerConfig` with `tokio_rustls::TlsAcceptor`, bypassing tonic's
+//! built-in `ServerTlsConfig` so we can enforce TLS 1.3 minimum and apply
+//! CRL revocation checking.
 
 use rustls::server::WebPkiClientVerifier;
 use rustls::RootCertStore;
@@ -111,55 +110,4 @@ pub fn load_tls_config(
     config.alpn_protocols = vec![b"h2".to_vec()]; // gRPC requires HTTP/2
 
     Ok(config)
-}
-
-/// Wrap a tonic server with TLS if cert/key are configured.
-pub fn make_tls_acceptor(
-    cert_path: &str,
-    key_path: &str,
-    client_ca_path: Option<&str>,
-    client_crl_path: Option<&str>,
-) -> Result<Arc<ServerConfig>, Box<dyn std::error::Error>> {
-    let config = load_tls_config(cert_path, key_path, client_ca_path, client_crl_path)?;
-    Ok(Arc::new(config))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use arc_swap::ArcSwap;
-
-    /// A minimal stand-in `ServerConfig` factory for the swap test. We use the
-    /// no-client-auth path with a self-signed-style cert/key generated in
-    /// memory via rcgen would add a dev-dep — instead we exercise the swap
-    /// mechanism using two distinct `Arc`s wrapping a sentinel type that
-    /// implements the same swap contract as `ServerConfig`.
-    ///
-    /// The point of the test is to verify the `ArcSwap` semantics that the
-    /// SIGHUP handler relies on: a load after a store sees the new value, and
-    /// already-cloned `Arc`s remain valid (so in-flight TLS handshakes are not
-    /// disturbed).
-    #[derive(Debug, Eq, PartialEq)]
-    struct Sentinel(u32);
-
-    #[test]
-    fn arcswap_store_then_load_returns_new_value() {
-        let swap = ArcSwap::from_pointee(Sentinel(1));
-        assert_eq!(swap.load().0, 1);
-        swap.store(Arc::new(Sentinel(2)));
-        assert_eq!(swap.load().0, 2);
-    }
-
-    #[test]
-    fn arcswap_preserves_old_arc_after_store() {
-        // Simulates an in-flight connection: the worker grabs a Guard / Arc
-        // before the swap, and the swap must not invalidate it. After the
-        // store, the snapshot still resolves to the old value while a fresh
-        // load resolves to the new one.
-        let swap = ArcSwap::from_pointee(Sentinel(1));
-        let snapshot = swap.load_full(); // Arc<Sentinel>
-        swap.store(Arc::new(Sentinel(2)));
-        assert_eq!(snapshot.0, 1, "old Arc must remain valid after swap");
-        assert_eq!(swap.load().0, 2, "new load must see the stored value");
-    }
 }
