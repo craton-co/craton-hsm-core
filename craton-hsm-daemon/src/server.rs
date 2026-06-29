@@ -2367,6 +2367,7 @@ impl HsmService for HsmServiceImpl {
 
         // Use actual crypto backend from configuration instead of hardcoded string
         let crypto_backend = self.hsm.algorithm_config().crypto_backend.clone();
+        let fips_mode = self.hsm.algorithm_config().fips_approved_only;
 
         Ok(Response::new(HealthCheckResponse {
             healthy: true,
@@ -2375,7 +2376,7 @@ impl HsmService for HsmServiceImpl {
             active_sessions: 0,
             total_objects: 0,
             crypto_backend,
-            fips_mode: false,
+            fips_mode,
         }))
     }
 }
@@ -2550,5 +2551,51 @@ fn hsm_err_to_status(e: craton_hsm::error::HsmError) -> Status {
         | HsmError::AuditChainBroken(_) => Status::internal("Internal error"),
 
         HsmError::SessionClosed => Status::aborted("Session closed"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use craton_hsm::config::config::HsmConfig;
+    use craton_hsm::core::HsmCore;
+
+    fn make_service(fips_approved_only: bool) -> HsmServiceImpl {
+        let mut config = HsmConfig::default();
+        // Keep the audit log in-memory so the test doesn't write to disk.
+        config.audit.enabled = false;
+        config.algorithms.fips_approved_only = fips_approved_only;
+        let hsm = Arc::new(HsmCore::new(&config));
+        HsmServiceImpl::new(hsm, 1024, 1024, 0, 0)
+    }
+
+    #[tokio::test]
+    async fn health_check_reports_fips_mode_true_when_configured() {
+        let service = make_service(true);
+        let response = service
+            .health_check(Request::new(HealthCheckRequest {}))
+            .await
+            .expect("health_check should succeed");
+        let body = response.into_inner();
+        assert!(body.healthy, "health_check should report healthy");
+        assert!(
+            body.fips_mode,
+            "fips_mode must mirror algorithm_config().fips_approved_only"
+        );
+    }
+
+    #[tokio::test]
+    async fn health_check_reports_fips_mode_false_by_default() {
+        let service = make_service(false);
+        let response = service
+            .health_check(Request::new(HealthCheckRequest {}))
+            .await
+            .expect("health_check should succeed");
+        let body = response.into_inner();
+        assert!(body.healthy, "health_check should report healthy");
+        assert!(
+            !body.fips_mode,
+            "fips_mode must be false when fips_approved_only is false"
+        );
     }
 }
