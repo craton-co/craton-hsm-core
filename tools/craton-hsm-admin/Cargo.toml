@@ -1,6 +1,6 @@
 [package]
 name = "craton-hsm-admin"
-version = "0.3.1"
+version = "0.3.0"
 edition = "2021"
 description = "Admin CLI for Craton HSM — token init, key management, PIN operations"
 license = "Apache-2.0"
@@ -11,25 +11,12 @@ name = "craton-hsm-admin"
 path = "src/main.rs"
 
 [dependencies]
-craton-hsm = { path = "../.." }
+craton-hsm = { version = "0.9.1", path = "../.." }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 comfy-table = "7"
 rpassword = "7"
 zeroize = { version = "1", features = ["derive"] }
 
-# Key parsing for `key import` (PEM/DER decoding of PKCS#8, PKCS#1, SPKI).
-# `rsa` re-exports the `pkcs1`/`pkcs8`/`spki` traits we need for RSA;
-# `p256` / `p384` cover SEC1-encoded EC public points and PKCS#8 EC private keys.
-rsa = { version = "0.9", features = ["pem"] }
-p256 = { version = "0.13", features = ["pem", "pkcs8"] }
-p384 = { version = "0.13", features = ["pem", "pkcs8"] }
-pkcs8 = { version = "0.10", features = ["pem"] }
-spki = "0.7"
-sec1 = { version = "0.7", features = ["der"] }
-const-oid = "0.9"
-
 [dev-dependencies]
 tempfile = "3"
-rand = "0.8"
-rand_core = { version = "0.6", features = ["getrandom"] }

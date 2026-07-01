@@ -1170,20 +1170,93 @@ impl AuditLog {
     /// Returns `Ok(count)` if the chain is valid,
     /// `Err(index)` with the index of the first broken link.
     pub fn verify_chain(&self) -> Result<usize, usize> {
-        let state = self.state.read();
-        let mut expected_hash = [0u8; 32];
-        for (i, entry) in state.entries.iter().enumerate() {
-            if entry.previous_hash != expected_hash {
-                return Err(i);
-            }
-            match compute_chain_hash(&expected_hash, entry) {
-                Ok(h) => expected_hash = h,
-                Err(_) => return Err(i),
-            }
+        verify_chain_entries(&self.state.read().entries)
+    }
+}
+
+/// Load the entire NDJSON audit log at `path` into a vector of [`AuditEvent`]s.
+///
+/// Each non-empty line is parsed as a single JSON-encoded `AuditEvent`. Blank
+/// lines are skipped. This is the canonical loader for off-line consumers
+/// (admin CLI, SIEM exporters, forensic tools) that need the on-disk events
+/// without spinning up a full [`AuditLog`] instance.
+///
+/// Returns `Ok(entries)` on success — including an empty `Vec` if the file
+/// exists but contains no events. Returns an `HsmError::AuditChainBroken`
+/// variant carrying a human-readable reason on I/O or deserialization failure,
+/// and propagates `NotFound` as `HsmError::GeneralError` so callers can match
+/// on `std::io::ErrorKind` via [`std::fs::File::open`] if they want a more
+/// specific message — most callers should check `path.exists()` first.
+///
+/// # Security
+///
+/// This function reads the audit log from disk verbatim. Callers must verify
+/// that the requesting principal has Security Officer privileges before
+/// exposing the returned events.
+pub fn load_entries_from_file(path: &Path) -> Result<Vec<AuditEvent>, crate::error::HsmError> {
+    let file = std::fs::File::open(path).map_err(|e| {
+        tracing::error!("Audit log load: cannot open {}: {}", path.display(), e);
+        crate::error::HsmError::AuditChainBroken(format!(
+            "could not open log file {}: {}",
+            path.display(),
+            e,
+        ))
+    })?;
+
+    let reader = std::io::BufReader::new(file);
+    let mut entries = Vec::new();
+
+    for (line_num, line_result) in reader.lines().enumerate() {
+        let line = line_result.map_err(|e| {
+            crate::error::HsmError::AuditChainBroken(format!(
+                "I/O error at line {}: {}",
+                line_num + 1,
+                e,
+            ))
+        })?;
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
         }
-        Ok(state.entries.len())
+
+        let event: AuditEvent = serde_json::from_str(trimmed).map_err(|e| {
+            crate::error::HsmError::AuditChainBroken(format!(
+                "failed to deserialize line {}: {}",
+                line_num + 1,
+                e,
+            ))
+        })?;
+
+        entries.push(event);
     }
 
+    Ok(entries)
+}
+
+/// Verify the SHA-256 hash chain over a slice of [`AuditEvent`]s.
+///
+/// Returns `Ok(count)` if every event's `previous_hash` matches the running
+/// chain and serialization succeeds, `Err(index)` with the zero-based index
+/// of the first broken or unserializable link otherwise.
+///
+/// Used by both the in-memory [`AuditLog::verify_chain`] method and off-line
+/// consumers that loaded entries via [`load_entries_from_file`].
+pub fn verify_chain_entries(entries: &[AuditEvent]) -> Result<usize, usize> {
+    let mut expected_hash = [0u8; 32];
+    for (i, entry) in entries.iter().enumerate() {
+        if entry.previous_hash != expected_hash {
+            return Err(i);
+        }
+        match compute_chain_hash(&expected_hash, entry) {
+            Ok(h) => expected_hash = h,
+            Err(_) => return Err(i),
+        }
+    }
+    Ok(entries.len())
+}
+
+impl AuditLog {
     /// Register this `AuditLog` instance as the global logger for the crate.
     /// Used by `record_zeroization()` and other free functions.
     pub fn register_global_logger(self: &Arc<Self>) {
