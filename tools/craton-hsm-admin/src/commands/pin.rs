@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Craton Software Company
-use craton_hsm::config::config::HsmConfig;
+use super::load_config;
 use craton_hsm::core::HsmCore;
 use craton_hsm::pkcs11_abi::constants::*;
 use zeroize::Zeroizing;
@@ -211,12 +211,4 @@ pub fn reset(config_path: &str) -> CliResult {
     token.logout().ok();
     println!("User PIN reset successfully.");
     Ok(())
-}
-
-fn load_config(path: &str) -> Result<HsmConfig, Box<dyn std::error::Error>> {
-    let config = HsmConfig::load_from_path(path)?;
-    config
-        .validate()
-        .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
-    Ok(config)
 }

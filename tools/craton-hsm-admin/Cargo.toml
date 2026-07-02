@@ -17,6 +17,18 @@ serde_json = "1"
 comfy-table = "7"
 rpassword = "7"
 zeroize = { version = "1", features = ["derive"] }
+# Crates added by fix/admin-key-import-parse-and-class for PEM/DER parsing; kept
+# here so this branch combines cleanly with import-parse without losing them
+# when merged into an integration branch.
+rsa = "0.9"
+p256 = { version = "0.13", features = ["ecdsa", "pem"] }
+p384 = { version = "0.13", features = ["ecdsa", "pem"] }
+pkcs8 = { version = "0.10", features = ["pem"] }
+spki = { version = "0.7", features = ["pem"] }
+sec1 = { version = "0.7", features = ["pem"] }
+const-oid = "0.9"
 
 [dev-dependencies]
 tempfile = "3"
+rand = "0.8"
+rand_core = "0.6"

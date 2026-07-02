@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Craton Software Company
+use super::load_config;
 use crate::output;
-use craton_hsm::config::config::HsmConfig;
 use craton_hsm::core::HsmCore;
 use craton_hsm::pkcs11_abi::constants::*;
-use craton_hsm::pkcs11_abi::types::{CK_ATTRIBUTE_TYPE, CK_OBJECT_HANDLE, CK_ULONG};
-use zeroize::{Zeroize, Zeroizing};
-
-use super::import_parse::ParsedKey;
+use craton_hsm::pkcs11_abi::types::{CK_ATTRIBUTE_TYPE, CK_OBJECT_HANDLE};
+use zeroize::Zeroizing;
 
 type CliResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -156,154 +154,52 @@ pub fn list(config_path: &str, json: bool) -> CliResult {
     Ok(())
 }
 
-/// Encode a `CK_ULONG`-typed attribute value the way the lib expects.
-/// The store uses `from_ne_bytes::<CK_ULONG>` when reading these attrs, so
-/// we MUST emit native-endian bytes sized to the platform's `c_ulong`.
-fn ck_ulong_bytes(val: CK_ULONG) -> Vec<u8> {
-    val.to_ne_bytes().to_vec()
-}
+/// Import a key from file (PEM or DER).
+pub fn import(config_path: &str, file: &str, label: &str, key_type: &str) -> CliResult {
+    let config = load_config(config_path)?;
+    let hsm = HsmCore::new(&config);
 
-/// Import a key from a PEM or DER file.
-///
-/// Parses the input first (PKCS#8, PKCS#1, SPKI, SEC1) so the import emits
-/// the correct PKCS#11 attribute template for the key form. The object class
-/// is inferred from the parsed structure: `--class`, when supplied, only
-/// confirms that inference and triggers a clear error on mismatch — it never
-/// overrides the parser. For AES, `--class` is ignored (always secret key).
-pub fn import(
-    config_path: &str,
-    file: &str,
-    label: &str,
-    key_type: &str,
-    class: Option<&str>,
-    yes: bool,
-) -> CliResult {
-    let upper_type = key_type.to_uppercase();
+    // Require authentication before importing keys
+    authenticate_user(&hsm)?;
 
-    // Wrap raw file bytes in Zeroizing — without it the bytes (and any
-    // intermediate copies) persist in freed heap until the allocator reuses
-    // the pages.
+    // Wrap key data in Zeroizing so it is scrubbed from memory after use.
+    // Without this, the raw key bytes from std::fs::read persist in freed
+    // heap memory until the allocator reuses the pages.
     let key_data = Zeroizing::new(std::fs::read(file).map_err(|_| "Failed to read key file.")?);
 
-    // Parse the input and build the attribute template. AES is special-cased:
-    // there is no standard PEM/DER container for raw AES key bytes, so we
-    // keep the historical "file contents are the key bytes" behaviour for
-    // it but enforce CKO_SECRET_KEY.
-    let (mut template, display): (Vec<(CK_ATTRIBUTE_TYPE, Vec<u8>)>, String) = match upper_type
-        .as_str()
-    {
-        "AES" => {
-            if class.is_some_and(|c| !c.eq_ignore_ascii_case("secret")) {
-                return Err(format!(
-                    "AES keys are always class=secret; got --class {}",
-                    class.unwrap()
-                )
-                .into());
-            }
-            // Defense-in-depth: refuse obviously-wrong AES key sizes.
-            // PKCS#11 requires CKA_VALUE_LEN in bytes for secret keys.
-            let len = key_data.len();
-            if !matches!(len, 16 | 24 | 32) {
-                return Err(format!(
-                    "AES key file must contain 16, 24, or 32 raw bytes; got {}",
-                    len
-                )
-                .into());
-            }
-            let mut tpl: Vec<(CK_ATTRIBUTE_TYPE, Vec<u8>)> = vec![
-                (CKA_CLASS, ck_ulong_bytes(CKO_SECRET_KEY)),
-                (CKA_KEY_TYPE, ck_ulong_bytes(CKK_AES)),
-                (CKA_LABEL, label.as_bytes().to_vec()),
-                (CKA_TOKEN, vec![1u8]),
-                (CKA_PRIVATE, vec![1u8]),
-                (CKA_SENSITIVE, vec![1u8]),
-                (CKA_VALUE_LEN, ck_ulong_bytes(len as CK_ULONG)),
-                (CKA_VALUE, key_data.as_slice().to_vec()),
-            ];
-            // Sanity: nothing in `tpl` should outlive the function. The
-            // outer for-loop at the end will zeroize each value buffer.
-            let _ = &mut tpl;
-            (tpl, format!("AES (secret, {} bits)", len * 8))
-        }
-        "RSA" | "EC" => {
-            // Parse — fails fast on garbage input rather than silently
-            // creating an unusable HSM object.
-            let parsed = ParsedKey::from_bytes(&key_data).map_err(|e| {
-                format!(
-                    "Failed to parse key file as PEM/DER: {}. \
-                     Supported: PKCS#8 PRIVATE KEY, SPKI PUBLIC KEY, \
-                     PKCS#1 RSA PRIVATE/PUBLIC KEY, SEC1 EC PRIVATE KEY.",
-                    e
-                )
-            })?;
-
-            // Enforce --type matches the parsed structure.
-            let parsed_type = parsed.key_type_name();
-            if parsed_type != upper_type {
-                return Err(format!(
-                    "--type {} does not match parsed key (got {}). Refusing to import.",
-                    upper_type, parsed_type
-                )
-                .into());
-            }
-
-            // Infer class from structure; reject if --class disagrees.
-            // The parser is authoritative; --class is merely a confirmation.
-            parsed
-                .confirm_class(class)
-                .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
-
-            let display = parsed.display_summary();
-            let template = parsed.into_template(label);
-            (template, display)
-        }
+    // Determine CKA_KEY_TYPE and CKA_CLASS based on --type argument
+    let (ck_key_type, ck_class) = match key_type.to_uppercase().as_str() {
+        "RSA" => (CKK_RSA, CKO_PRIVATE_KEY),
+        "EC" => (CKK_EC, CKO_PRIVATE_KEY),
+        "AES" => (CKK_AES, CKO_SECRET_KEY),
         other => {
             return Err(format!("Unsupported key type: '{}'. Use RSA, EC, or AES", other).into())
         }
     };
 
-    // Show what we're about to import and require explicit confirmation
-    // (or --yes). Importing a private key is irreversible and visible to
-    // everyone with token access, so we make the user agree to the parsed
-    // identity, not just the on-disk file name.
-    eprintln!("About to import key:");
-    eprintln!("  File:   {}", file);
-    eprintln!("  Label:  {}", label);
-    eprintln!("  {}", display);
-    if !yes {
-        eprint!("Proceed with import? [y/N] ");
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        if !input.trim().eq_ignore_ascii_case("y") {
-            // Zero out the staged template before we bail.
-            for (_attr, ref mut value) in &mut template {
-                value.zeroize();
-            }
-            return Err("Import cancelled.".into());
-        }
-    }
-
-    // Now authenticate. We deliberately parse and confirm BEFORE prompting
-    // for the PIN — there is no reason to harvest a PIN when we already
-    // know the input is bogus or the user changed their mind.
-    let config = load_config(config_path)?;
-    let hsm = HsmCore::new(&config);
-    if let Err(e) = authenticate_user(&hsm) {
-        for (_attr, ref mut value) in &mut template {
-            value.zeroize();
-        }
-        return Err(e);
-    }
+    // Build attribute template.
+    // SECURITY: key_data.to_vec() creates an unprotected copy of the raw key bytes.
+    // We must explicitly zeroize the template after create_object consumes it.
+    let mut template: Vec<(CK_ATTRIBUTE_TYPE, Vec<u8>)> = vec![
+        (CKA_CLASS, (ck_class as u64).to_le_bytes().to_vec()),
+        (CKA_KEY_TYPE, (ck_key_type as u64).to_le_bytes().to_vec()),
+        (CKA_LABEL, label.as_bytes().to_vec()),
+        (CKA_TOKEN, vec![1u8]), // token object
+        (CKA_PRIVATE, vec![1u8]),
+        (CKA_SENSITIVE, vec![1u8]),
+        (CKA_VALUE, key_data.to_vec()),
+    ];
+    // key_data (Zeroizing<Vec<u8>>) is dropped here, scrubbing the file contents.
 
     let handle = hsm
         .object_store()
         .create_object(&template)
         .map_err(|e| format!("Failed to import key: {:?}", e));
 
-    // Zero all template value buffers — especially CKA_VALUE / CKA_PRIVATE_EXPONENT
-    // / CKA_PRIME_* which contain unprotected copies of the secret material.
+    // Zeroize all template value buffers — especially CKA_VALUE which contains
+    // the raw key material that was copied out of the Zeroizing wrapper.
     for (_attr, ref mut value) in &mut template {
-        value.zeroize();
+        zeroize::Zeroize::zeroize(value.as_mut_slice());
     }
     drop(template);
 
@@ -312,36 +208,10 @@ pub fn import(
     println!("Key imported successfully.");
     println!("  Handle: {}", handle);
     println!("  Label:  {}", label);
-    println!("  {}", display);
+    println!("  Type:   {}", key_type.to_uppercase());
 
     logout(&hsm);
     Ok(())
-}
-
-/// Decide whether a delete requires the tiered (type-back) confirmation.
-///
-/// `--force` alone is rejected for any key whose class is `CKO_PRIVATE_KEY` /
-/// `CKO_SECRET_KEY` or whose `CKA_SENSITIVE` attribute is true. These are
-/// irrecoverable on destroy, so we demand the user prove they meant *this*
-/// specific key.
-pub(crate) fn requires_tiered_confirmation(class: u64, sensitive: bool) -> bool {
-    sensitive || class == CKO_PRIVATE_KEY as u64 || class == CKO_SECRET_KEY as u64
-}
-
-/// Build the challenge string the user must retype to authorize destruction.
-///
-/// Prefer the trimmed label when non-empty (the user already knows it from
-/// `key list`); otherwise fall back to a truncated hex of the handle so there
-/// is still a stable string to retype.
-fn deletion_challenge(label: &str, handle: CK_OBJECT_HANDLE) -> String {
-    let trimmed = label.trim();
-    if !trimmed.is_empty() {
-        trimmed.to_string()
-    } else {
-        // 8-hex-char truncated ID — distinct enough to prevent muscle-memory
-        // retyping of a digit and short enough to type without error.
-        format!("{:08x}", handle as u64)
-    }
 }
 
 /// Delete a key by handle.
@@ -369,39 +239,7 @@ pub fn delete(config_path: &str, handle: u64, force: bool) -> CliResult {
         )
     };
 
-    let tiered = requires_tiered_confirmation(orig_class as u64, orig_sensitive);
-
-    if tiered {
-        // `--force` alone is NOT enough for sensitive / private / secret keys.
-        // The user must retype the key's label (or truncated hex ID) so a
-        // single shell alias cannot wipe an irrecoverable secret.
-        let challenge = deletion_challenge(&label, handle);
-        eprintln!();
-        eprintln!(
-            "WARNING: this is irreversible. The key cannot be recovered once destroyed."
-        );
-        eprintln!(
-            "  Handle: {}   Class: {}   Sensitive: {}",
-            handle,
-            output::object_class_name(orig_class as u64),
-            orig_sensitive
-        );
-        eprint!(
-            "Type the key's {} exactly to confirm deletion: ",
-            if label.trim().is_empty() {
-                "truncated ID"
-            } else {
-                "label"
-            }
-        );
-        let mut typed = String::new();
-        std::io::stdin().read_line(&mut typed)?;
-        if typed.trim() != challenge {
-            println!("Aborted: confirmation string did not match.");
-            logout(&hsm);
-            return Ok(());
-        }
-    } else if !force {
+    if !force {
         eprint!("Delete object {} (label: '{}')? [y/N] ", handle, label);
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
@@ -445,70 +283,4 @@ pub fn delete(config_path: &str, handle: u64, force: bool) -> CliResult {
     println!("Object {} deleted.", handle);
     logout(&hsm);
     Ok(())
-}
-
-fn load_config(path: &str) -> Result<HsmConfig, Box<dyn std::error::Error>> {
-    let config = HsmConfig::load_from_path(path)?;
-    config
-        .validate()
-        .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
-    Ok(config)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn private_key_requires_tiered_confirmation() {
-        // CKO_PRIVATE_KEY must always trigger the type-back prompt,
-        // regardless of CKA_SENSITIVE — the class alone is enough to
-        // mark it as irrecoverable.
-        assert!(requires_tiered_confirmation(CKO_PRIVATE_KEY as u64, false));
-        assert!(requires_tiered_confirmation(CKO_PRIVATE_KEY as u64, true));
-    }
-
-    #[test]
-    fn secret_key_requires_tiered_confirmation() {
-        // Symmetric secrets (AES, HMAC keys, etc.) are also irrecoverable.
-        assert!(requires_tiered_confirmation(CKO_SECRET_KEY as u64, false));
-        assert!(requires_tiered_confirmation(CKO_SECRET_KEY as u64, true));
-    }
-
-    #[test]
-    fn public_key_non_sensitive_does_not_require_tiered_confirmation() {
-        // Public keys are by definition not secret — `--force` should
-        // remain a quick path for scripted cleanup.
-        assert!(!requires_tiered_confirmation(CKO_PUBLIC_KEY as u64, false));
-    }
-
-    #[test]
-    fn sensitive_flag_alone_is_enough() {
-        // Even an "other" object class (e.g. CKO_DATA) must require the
-        // tiered confirm if it has been marked sensitive. We don't want
-        // to leak through a class enum we forgot to enumerate.
-        assert!(requires_tiered_confirmation(CKO_DATA as u64, true));
-        // Same class, non-sensitive: ordinary y/N path is fine.
-        assert!(!requires_tiered_confirmation(CKO_DATA as u64, false));
-    }
-
-    #[test]
-    fn challenge_prefers_label_when_present() {
-        assert_eq!(deletion_challenge("my-rsa-key", 7), "my-rsa-key");
-        // Surrounding whitespace must not change the expected typing.
-        assert_eq!(deletion_challenge("  spaced  ", 7), "spaced");
-    }
-
-    #[test]
-    fn challenge_falls_back_to_truncated_hex_for_empty_label() {
-        // 0x12345678 -> "12345678"
-        assert_eq!(
-            deletion_challenge("", 0x1234_5678 as CK_OBJECT_HANDLE),
-            "12345678"
-        );
-        assert_eq!(
-            deletion_challenge("   ", 0xdead_beef as CK_OBJECT_HANDLE),
-            "deadbeef"
-        );
-    }
 }

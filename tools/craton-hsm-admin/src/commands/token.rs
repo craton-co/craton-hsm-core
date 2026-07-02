@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Craton Software Company
+use super::load_config;
 use crate::output;
-use craton_hsm::config::config::HsmConfig;
 use craton_hsm::core::HsmCore;
 use zeroize::Zeroizing;
 
@@ -9,7 +9,7 @@ type CliResult = Result<(), Box<dyn std::error::Error>>;
 
 /// Initialize a new token with the given label.
 pub fn init(config_path: &str, label: &str) -> CliResult {
-    let config = load_config_strict(config_path)?;
+    let config = load_config(config_path)?;
     let hsm = HsmCore::new(&config);
     let token = hsm
         .slot_manager()
@@ -140,21 +140,4 @@ pub fn status(config_path: &str, json: bool) -> CliResult {
     }
 
     Ok(())
-}
-
-fn load_config(path: &str) -> Result<HsmConfig, Box<dyn std::error::Error>> {
-    let config = HsmConfig::load_from_path(path)?;
-    config
-        .validate()
-        .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
-    Ok(config)
-}
-
-/// Strict config loading for mutating operations — fails if config is missing.
-fn load_config_strict(path: &str) -> Result<HsmConfig, Box<dyn std::error::Error>> {
-    let config = HsmConfig::load_from_path(path)?;
-    config
-        .validate()
-        .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
-    Ok(config)
 }
