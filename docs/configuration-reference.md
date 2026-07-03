@@ -23,6 +23,7 @@ The following validation rules are enforced on load:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CRATON_HSM_CONFIG` | `craton_hsm.toml` | Path to the configuration file |
+| `RUST_LOG_FORMAT` | `text` | `craton-hsm-daemon` log formatter: `text` (human-readable, default), `json` (structured — consume directly in Loki / ELK / Datadog), or `compact` (slightly smaller per-record than `text`). Unknown values fall back to `text` and emit a `warn!` after init. |
 
 ## `[token]` — Token & Slot Settings
 
