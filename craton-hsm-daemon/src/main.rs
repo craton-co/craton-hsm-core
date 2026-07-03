@@ -32,8 +32,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .install_default()
         .expect("Failed to install rustls CryptoProvider");
 
-    // Initialize tracing
-    tracing_subscriber::fmt().with_target(false).init();
+    // Initialize tracing. Honor RUST_LOG_FORMAT to switch the formatter so
+    // operators can pick a layout that suits their log shipper:
+    //   - text    (default): human-readable, single-line per event
+    //   - json    : structured JSON (Loki / ELK / Datadog ingest natively)
+    //   - compact : like text but slightly smaller per record
+    // Unknown values fall back to text and emit a warn! after init.
+    let raw_format = std::env::var("RUST_LOG_FORMAT").ok();
+    let (chosen, unknown) = classify_log_format(raw_format.as_deref());
+    init_tracing(chosen);
+    if let Some(unknown_val) = unknown {
+        tracing::warn!(
+            requested = %unknown_val,
+            "Unknown RUST_LOG_FORMAT value; falling back to 'text'. \
+             Valid values: text, json, compact."
+        );
+    }
 
     // (#10-fix) Canonicalize config path to prevent symlink attacks and
     // provide clear error messages with absolute paths.
@@ -364,4 +378,104 @@ fn spawn_crl_refresh(
             }
         }
     });
+}
+
+/// Tracing output format selected from `RUST_LOG_FORMAT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogFormat {
+    Text,
+    Json,
+    Compact,
+}
+
+/// Classify the value of `RUST_LOG_FORMAT` into a `LogFormat`. Unknown
+/// (non-empty) values are returned alongside `LogFormat::Text` so the
+/// caller can `warn!` after the subscriber is installed. `None` /
+/// empty string select the default (`Text`) silently.
+fn classify_log_format(raw: Option<&str>) -> (LogFormat, Option<String>) {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None => (LogFormat::Text, None),
+        Some(v) => match v.to_ascii_lowercase().as_str() {
+            "text" => (LogFormat::Text, None),
+            "json" => (LogFormat::Json, None),
+            "compact" => (LogFormat::Compact, None),
+            _ => (LogFormat::Text, Some(v.to_string())),
+        },
+    }
+}
+
+/// Install the global tracing subscriber using the chosen formatter.
+///
+/// Each formatter branch is a different concrete type, so we cannot
+/// store the builder in a variable and call `.init()` once — we have
+/// to branch all the way through to `.init()`.
+fn init_tracing(format: LogFormat) {
+    match format {
+        LogFormat::Json => {
+            tracing_subscriber::fmt()
+                .json()
+                .with_target(false)
+                .flatten_event(true)
+                .init();
+        }
+        LogFormat::Compact => {
+            tracing_subscriber::fmt()
+                .compact()
+                .with_target(false)
+                .init();
+        }
+        LogFormat::Text => {
+            tracing_subscriber::fmt().with_target(false).init();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_default_is_text() {
+        assert_eq!(classify_log_format(None), (LogFormat::Text, None));
+        assert_eq!(classify_log_format(Some("")), (LogFormat::Text, None));
+        assert_eq!(classify_log_format(Some("   ")), (LogFormat::Text, None));
+    }
+
+    #[test]
+    fn classify_known_values() {
+        assert_eq!(classify_log_format(Some("text")), (LogFormat::Text, None));
+        assert_eq!(classify_log_format(Some("json")), (LogFormat::Json, None));
+        assert_eq!(
+            classify_log_format(Some("compact")),
+            (LogFormat::Compact, None)
+        );
+    }
+
+    #[test]
+    fn classify_is_case_insensitive_and_trims() {
+        assert_eq!(classify_log_format(Some("JSON")), (LogFormat::Json, None));
+        assert_eq!(classify_log_format(Some("Json")), (LogFormat::Json, None));
+        assert_eq!(
+            classify_log_format(Some("  compact  ")),
+            (LogFormat::Compact, None)
+        );
+    }
+
+    #[test]
+    fn classify_unknown_falls_back_to_text_with_warning() {
+        let (fmt, unknown) = classify_log_format(Some("yaml"));
+        assert_eq!(fmt, LogFormat::Text);
+        assert_eq!(unknown.as_deref(), Some("yaml"));
+    }
+
+    #[test]
+    fn init_tracing_does_not_panic() {
+        // We can only call init_tracing() once per process because it installs
+        // a global subscriber. Pick a format and verify the call succeeds.
+        // The chosen format here is intentionally not the default so that we
+        // also exercise a non-default branch end-to-end.
+        init_tracing(LogFormat::Compact);
+        // A second call would return Err from try_init internally, but
+        // `.init()` panics on failure, so we don't repeat the call here.
+    }
 }
