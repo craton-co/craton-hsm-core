@@ -114,18 +114,61 @@ fn initial_chain_hash(audit_key: &[u8; 32]) -> [u8; 32] {
 /// replacement chain — the previous integrity-only SHA-256 chain was trivially
 /// reconstructible.
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct AuditEvent {
-    /// On-disk schema version. Legacy files (pre-HMAC chain) deserialize as
-    /// `0` via `serde(default)` and are rejected during recovery.
-    #[serde(default)]
-    pub format_version: u32,
     pub timestamp: u64,
     pub session_handle: u64,
     pub operation: AuditOperation,
     pub key_id: Option<String>,
     pub result: AuditResult,
     pub previous_hash: [u8; 32],
+}
+
+#[derive(Serialize, Deserialize)]
+struct AuditEventDisk {
+    #[serde(default)]
+    format_version: u32,
+    timestamp: u64,
+    session_handle: u64,
+    operation: AuditOperation,
+    key_id: Option<String>,
+    result: AuditResult,
+    previous_hash: [u8; 32],
+}
+
+impl Serialize for AuditEvent {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("AuditEvent", 7)?;
+        state.serialize_field("format_version", &0u32)?;
+        state.serialize_field("timestamp", &self.timestamp)?;
+        state.serialize_field("session_handle", &self.session_handle)?;
+        state.serialize_field("operation", &self.operation)?;
+        state.serialize_field("key_id", &self.key_id)?;
+        state.serialize_field("result", &self.result)?;
+        state.serialize_field("previous_hash", &self.previous_hash)?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for AuditEvent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let disk = AuditEventDisk::deserialize(deserializer)?;
+        Ok(AuditEvent {
+            timestamp: disk.timestamp,
+            session_handle: disk.session_handle,
+            operation: disk.operation,
+            key_id: disk.key_id,
+            result: disk.result,
+            previous_hash: disk.previous_hash,
+        })
+    }
 }
 
 /// The MAC'd payload of an audit event — excludes `previous_hash` so that the
@@ -144,7 +187,7 @@ struct AuditEventPayload<'a> {
 impl AuditEvent {
     fn payload(&self) -> AuditEventPayload<'_> {
         AuditEventPayload {
-            format_version: self.format_version,
+            format_version: 0,
             timestamp: self.timestamp,
             session_handle: self.session_handle,
             operation: &self.operation,
@@ -515,11 +558,6 @@ impl AuditLog {
                     *last_timestamp = timestamp;
 
                     let event = AuditEvent {
-                        // TODO(security/hmac-audit-chain): emit version 1
-                        // once compute_chain_hash switches to HMAC keyed off
-                        // audit_chain_key. Emitting 0 today preserves wire
-                        // compatibility with the existing SHA-256 chain.
-                        format_version: 0,
                         timestamp,
                         session_handle,
                         operation,

@@ -1,13 +1,55 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Craton Software Company
-use crate::commands::{authenticate_so, logout};
 use craton_hsm::config::config::HsmConfig;
 use craton_hsm::core::HsmCore;
+use craton_hsm::pkcs11_abi::constants::CKU_SO;
 use craton_hsm::pkcs11_abi::types::CK_SLOT_ID;
 use craton_hsm::store::backup;
 use craton_hsm::store::object::StoredObject;
 use std::path::Path;
 use zeroize::Zeroizing;
+
+/// Authenticate as SO on the given slot, with retry and backoff.
+fn authenticate_so(hsm: &HsmCore, slot_id: CK_SLOT_ID) -> Result<(), Box<dyn std::error::Error>> {
+    let token = hsm
+        .slot_manager()
+        .get_token(slot_id)
+        .map_err(|_| "Failed to access token.")?;
+
+    if !token.is_initialized() {
+        return Err("Token is not initialized. Run 'token init' first.".into());
+    }
+
+    const MAX_ATTEMPTS: u32 = 3;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let pin = Zeroizing::new(rpassword::prompt_password("Enter SO PIN: ")?);
+        match token.login(CKU_SO, pin.as_bytes()) {
+            Ok(_) => return Ok(()),
+            Err(_) => {
+                let remaining = MAX_ATTEMPTS - attempt;
+                if remaining == 0 {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    return Err("SO authentication failed. Maximum attempts reached.".into());
+                }
+                let delay = std::time::Duration::from_secs(attempt as u64);
+                eprintln!(
+                    "SO login failed. {} attempt(s) remaining. Retrying in {}s...",
+                    remaining,
+                    delay.as_secs()
+                );
+                std::thread::sleep(delay);
+            }
+        }
+    }
+    Err("SO authentication failed.".into())
+}
+
+/// Log out the active session on the given slot.
+fn logout(hsm: &HsmCore, slot_id: CK_SLOT_ID) {
+    if let Ok(token) = hsm.slot_manager().get_token(slot_id) {
+        token.logout().ok();
+    }
+}
 
 /// Slot id administered by every admin CLI command (single-slot model).
 const ADMIN_SLOT_ID: CK_SLOT_ID = 0;

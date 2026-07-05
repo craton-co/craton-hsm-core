@@ -32,9 +32,9 @@ if [[ "${CRATON_CI_CONTAINER:-}" != "1" ]]; then
     docker build -t craton_hsm_ci:latest -f deploy/Dockerfile.ci .
 
     TARGET="${1:-all}"
-    RUN_SHARD3=0
+    RUN_SHARDS=0
     if [[ "$TARGET" == "all" || "$TARGET" == "quick" || "$TARGET" == "test" ]]; then
-        RUN_SHARD3=1
+        RUN_SHARDS=1
     fi
 
     DOCKER_ARGS=(
@@ -46,14 +46,18 @@ if [[ "${CRATON_CI_CONTAINER:-}" != "1" ]]; then
         -v craton-cargo-git:/usr/local/cargo/git
     )
 
-    if [[ $RUN_SHARD3 -eq 1 ]]; then
+    if [[ $RUN_SHARDS -eq 1 ]]; then
         MAIN_PREFIX=$'\033[36m[MAIN]\033[0m'
+        SHARD1_PREFIX=$'\033[32m[SHARD1]\033[0m'
+        SHARD2_PREFIX=$'\033[33m[SHARD2]\033[0m'
         SHARD3_PREFIX=$'\033[35m[SHARD3]\033[0m'
 
         # Capture each container's full output to a temp log (in addition to
         # streaming it prefixed) so we can name the exact failing job(s) at the
         # end instead of a generic "one or more failed".
         MAIN_LOG="$(mktemp)"
+        SHARD1_LOG="$(mktemp)"
+        SHARD2_LOG="$(mktemp)"
         SHARD3_LOG="$(mktemp)"
 
         echo "==> Starting Container 1 (Main Jobs)..."
@@ -66,7 +70,27 @@ if [[ "${CRATON_CI_CONTAINER:-}" != "1" ]]; then
         ) &
         PID_MAIN=$!
 
-        echo "==> Starting Container 2 (Test Shard 3)..."
+        echo "==> Starting Container 2 (Test Shard 1)..."
+        (
+            set -euo pipefail
+            docker run "${DOCKER_ARGS[@]}" \
+                -v craton-ci-target-shard1:/app/target \
+                craton_hsm_ci:latest run_shard1 "$TARGET" 2>&1 \
+                | tee "$SHARD1_LOG" | sed "s/^/${SHARD1_PREFIX} /"
+        ) &
+        PID_SHARD1=$!
+
+        echo "==> Starting Container 3 (Test Shard 2)..."
+        (
+            set -euo pipefail
+            docker run "${DOCKER_ARGS[@]}" \
+                -v craton-ci-target-shard2:/app/target \
+                craton_hsm_ci:latest run_shard2 "$TARGET" 2>&1 \
+                | tee "$SHARD2_LOG" | sed "s/^/${SHARD2_PREFIX} /"
+        ) &
+        PID_SHARD2=$!
+
+        echo "==> Starting Container 4 (Test Shard 3)..."
         (
             set -euo pipefail
             docker run "${DOCKER_ARGS[@]}" \
@@ -77,8 +101,12 @@ if [[ "${CRATON_CI_CONTAINER:-}" != "1" ]]; then
         PID_SHARD3=$!
 
         MAIN_RC=0
+        SHARD1_RC=0
+        SHARD2_RC=0
         SHARD3_RC=0
         wait $PID_MAIN || MAIN_RC=$?
+        wait $PID_SHARD1 || SHARD1_RC=$?
+        wait $PID_SHARD2 || SHARD2_RC=$?
         wait $PID_SHARD3 || SHARD3_RC=$?
 
         # Strip ANSI colour codes (the literal ESC byte works with any sed).
@@ -100,15 +128,17 @@ if [[ "${CRATON_CI_CONTAINER:-}" != "1" ]]; then
             fi
         }
 
-        if [[ $MAIN_RC -ne 0 || $SHARD3_RC -ne 0 ]]; then
+        if [[ $MAIN_RC -ne 0 || $SHARD1_RC -ne 0 || $SHARD2_RC -ne 0 || $SHARD3_RC -ne 0 ]]; then
             echo -e "\n\033[0;31m✗ CI failed. Failing job(s):\033[0m"
             [[ $MAIN_RC -ne 0 ]] && report_container "Main container" "$MAIN_LOG" "$MAIN_RC"
+            [[ $SHARD1_RC -ne 0 ]] && report_container "Shard 1 container" "$SHARD1_LOG" "$SHARD1_RC"
+            [[ $SHARD2_RC -ne 0 ]] && report_container "Shard 2 container" "$SHARD2_LOG" "$SHARD2_RC"
             [[ $SHARD3_RC -ne 0 ]] && report_container "Shard 3 container" "$SHARD3_LOG" "$SHARD3_RC"
-            rm -f "$MAIN_LOG" "$SHARD3_LOG"
+            rm -f "$MAIN_LOG" "$SHARD1_LOG" "$SHARD2_LOG" "$SHARD3_LOG"
             exit 1
         else
             echo -e "\n\033[0;32m✓ All container jobs passed.\033[0m"
-            rm -f "$MAIN_LOG" "$SHARD3_LOG"
+            rm -f "$MAIN_LOG" "$SHARD1_LOG" "$SHARD2_LOG" "$SHARD3_LOG"
             exit 0
         fi
     else
@@ -277,9 +307,8 @@ job_docs() {
     fi
 }
 
-# Mirrors CI shards: main tests (everything excluding shard 3)
-job_test_main() {
-    log_header "Build & Test (Main)"
+job_test_shard1() {
+    log_header "Build & Test (Shard 1)"
     local test_ok=true
 
     echo -e "\n${BOLD}  Shard 1: Unit & crypto tests (parallel-safe)${NC}"
@@ -307,6 +336,29 @@ job_test_main() {
         test_ok=false
     fi
 
+    echo -e "\n${BOLD}  Workspace member tests${NC}"
+    if cargo test \
+        -p craton-hsm-admin \
+        -p pkcs11-spy \
+        -p craton-hsm-daemon \
+        -- --test-threads=1 2>&1; then
+        echo -e "  ${GREEN}✓${NC} Workspace member tests passed"
+    else
+        echo -e "  ${RED}✗${NC} Workspace member tests failed"
+        test_ok=false
+    fi
+
+    if $test_ok; then
+        log_pass "Build & Test (Shard 1)"
+    else
+        log_fail "Build & Test (Shard 1)"
+    fi
+}
+
+job_test_shard2() {
+    log_header "Build & Test (Shard 2)"
+    local test_ok=true
+
     echo -e "\n${BOLD}  Shard 2: PKCS#11 ABI — compliance${NC}"
     if cargo test \
         --test attribute_management \
@@ -331,22 +383,10 @@ job_test_main() {
         test_ok=false
     fi
 
-    echo -e "\n${BOLD}  Workspace member tests${NC}"
-    if cargo test \
-        -p craton-hsm-admin \
-        -p pkcs11-spy \
-        -p craton-hsm-daemon \
-        -- --test-threads=1 2>&1; then
-        echo -e "  ${GREEN}✓${NC} Workspace member tests passed"
-    else
-        echo -e "  ${RED}✗${NC} Workspace member tests failed"
-        test_ok=false
-    fi
-
     if $test_ok; then
-        log_pass "Build & Test (Main)"
+        log_pass "Build & Test (Shard 2)"
     else
-        log_fail "Build & Test (Main)"
+        log_fail "Build & Test (Shard 2)"
     fi
 }
 
@@ -430,7 +470,7 @@ TARGET="${2:-all}"
 execute_main() {
     case "$1" in
         fmt)      job_fmt ;;
-        test)     job_test_main ;;
+        test)     ;;
         clippy)   job_clippy ;;
         audit)    job_audit ;;
         semver)   job_semver ;;
@@ -438,12 +478,10 @@ execute_main() {
         docs)     job_docs ;;
         quick)
             job_fmt
-            job_test_main
             job_clippy
             ;;
         all)
             job_fmt
-            job_test_main
             job_clippy
             job_audit
             job_semver
@@ -453,6 +491,22 @@ execute_main() {
         *)
             echo "Usage: $0 {all|quick|fmt|test|clippy|audit|semver|miri|docs}"
             exit 1
+            ;;
+    esac
+}
+
+execute_shard1() {
+    case "$1" in
+        test|quick|all)
+            job_test_shard1
+            ;;
+    esac
+}
+
+execute_shard2() {
+    case "$1" in
+        test|quick|all)
+            job_test_shard2
             ;;
     esac
 }
@@ -469,6 +523,14 @@ if [[ "$MODE" == "run_main" ]]; then
     execute_main "$TARGET"
     print_summary "Main"
     exit "$FAILED"
+elif [[ "$MODE" == "run_shard1" ]]; then
+    execute_shard1 "$TARGET"
+    print_summary "Shard 1"
+    exit "$FAILED"
+elif [[ "$MODE" == "run_shard2" ]]; then
+    execute_shard2 "$TARGET"
+    print_summary "Shard 2"
+    exit "$FAILED"
 elif [[ "$MODE" == "run_shard3" ]]; then
     execute_shard3 "$TARGET"
     print_summary "Shard 3"
@@ -476,6 +538,8 @@ elif [[ "$MODE" == "run_shard3" ]]; then
 else
     # Fallback to local host execution (if bypassed docker entirely)
     execute_main "$MODE"
+    execute_shard1 "$MODE"
+    execute_shard2 "$MODE"
     execute_shard3 "$MODE"
     print_summary "Combined"
     exit "$FAILED"

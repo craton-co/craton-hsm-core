@@ -152,11 +152,9 @@ fn main() {
                 file,
                 label,
                 key_type,
-                class,
-                yes,
-            } => {
-                commands::key::import(&cli.config, &file, &label, &key_type, class.as_deref(), yes)
-            }
+                class: _class,
+                yes: _yes,
+            } => commands::key::import(&cli.config, &file, &label, &key_type),
             KeyAction::Delete { handle, force } => {
                 commands::key::delete(&cli.config, handle, force)
             }

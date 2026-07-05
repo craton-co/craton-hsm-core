@@ -593,7 +593,95 @@ mod tests {
             "global monitor should latch into error state after failure"
         );
 
+        // Once latched, subsequent observations must also fail without needing
+        // to actually re-trip the underlying counter.
+        struct Pseudo(u32);
+        impl EntropySource for Pseudo {
+            fn fill(&mut self, dest: &mut [u8]) {
+                for b in dest.iter_mut() {
+                    self.0 = self.0.wrapping_mul(1664525).wrapping_add(1013904223);
+                    *b = (self.0 >> 24) as u8;
+                }
+            }
+        }
+        let mut rng2 = HealthMonitoredRng::with_source(Box::new(Pseudo(0xABCD)));
+        let mut buf2 = [0u8; 32];
+        assert!(
+            rng2.try_fill_bytes(&mut buf2).is_err(),
+            "monitor error state must persist across HealthMonitoredRng instances"
+        );
+
         // Reset so subsequent tests aren't impacted.
+        global_reset_for_tests();
+    }
+
+    /// Constant non-zero source: same as all-zero but with byte 0xAA. Confirms
+    /// the repetition count test is value-agnostic.
+    #[test]
+    fn test_constant_nonzero_source_trips_monitor() {
+        global_reset_for_tests();
+
+        struct ConstantSource(u8);
+        impl EntropySource for ConstantSource {
+            fn fill(&mut self, dest: &mut [u8]) {
+                for b in dest.iter_mut() {
+                    *b = self.0;
+                }
+            }
+        }
+
+        let mut rng = HealthMonitoredRng::with_source(Box::new(ConstantSource(0xAA)));
+        let mut buf = [0u8; 128];
+        assert!(
+            rng.try_fill_bytes(&mut buf).is_err(),
+            "constant 0xAA source must trip SP 800-90B continuous health tests"
+        );
+        assert!(global_is_error_state());
+
+        global_reset_for_tests();
+    }
+
+    /// After `global_reset_for_tests`, the monitor must be usable again.
+    /// This is a guard against the reset helper drifting from production
+    /// semantics.
+    #[test]
+    fn test_reset_clears_error_state() {
+        global_reset_for_tests();
+
+        struct AllZero;
+        impl EntropySource for AllZero {
+            fn fill(&mut self, dest: &mut [u8]) {
+                for b in dest.iter_mut() {
+                    *b = 0;
+                }
+            }
+        }
+
+        let mut rng = HealthMonitoredRng::with_source(Box::new(AllZero));
+        let mut buf = [0u8; 128];
+        let _ = rng.try_fill_bytes(&mut buf);
+        assert!(global_is_error_state());
+
+        global_reset_for_tests();
+        assert!(
+            !global_is_error_state(),
+            "reset_for_tests must clear the latched error state"
+        );
+
+        // And a healthy source should now work.
+        struct Pseudo(u32);
+        impl EntropySource for Pseudo {
+            fn fill(&mut self, dest: &mut [u8]) {
+                for b in dest.iter_mut() {
+                    self.0 = self.0.wrapping_mul(1664525).wrapping_add(1013904223);
+                    *b = (self.0 >> 24) as u8;
+                }
+            }
+        }
+        let mut rng = HealthMonitoredRng::with_source(Box::new(Pseudo(42)));
+        let mut buf = [0u8; 64];
+        assert!(rng.try_fill_bytes(&mut buf).is_ok());
+
         global_reset_for_tests();
     }
 }

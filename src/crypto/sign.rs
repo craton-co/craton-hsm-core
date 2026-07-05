@@ -1621,10 +1621,10 @@ mod tests {
         let (der_b, mod_b, exp_b) = fresh_rsa_keypair();
 
         // Populate private-key cache for both slots.
-        let _ =
-            rsa_pkcs1v15_sign_cached(slot_a, handle_a, &der_a, b"x", Some(HashAlg::Sha256)).unwrap();
-        let _ =
-            rsa_pkcs1v15_sign_cached(slot_b, handle_b, &der_b, b"x", Some(HashAlg::Sha256)).unwrap();
+        let _ = rsa_pkcs1v15_sign_cached(slot_a, handle_a, &der_a, b"x", Some(HashAlg::Sha256))
+            .unwrap();
+        let _ = rsa_pkcs1v15_sign_cached(slot_b, handle_b, &der_b, b"x", Some(HashAlg::Sha256))
+            .unwrap();
 
         // Populate public-key cache for both slots via OAEP encrypt.
         let _ = rsa_oaep_encrypt_cached(slot_a, handle_a, &mod_a, &exp_a, b"x", OaepHash::Sha256)
@@ -1668,10 +1668,10 @@ mod tests {
         let (der_a, mod_a, exp_a) = fresh_rsa_keypair();
         let (der_b, _mod_b, _exp_b) = fresh_rsa_keypair();
 
-        let _ =
-            rsa_pkcs1v15_sign_cached(slot_a, handle_a, &der_a, b"x", Some(HashAlg::Sha256)).unwrap();
-        let _ =
-            rsa_pkcs1v15_sign_cached(slot_b, handle_b, &der_b, b"x", Some(HashAlg::Sha256)).unwrap();
+        let _ = rsa_pkcs1v15_sign_cached(slot_a, handle_a, &der_a, b"x", Some(HashAlg::Sha256))
+            .unwrap();
+        let _ = rsa_pkcs1v15_sign_cached(slot_b, handle_b, &der_b, b"x", Some(HashAlg::Sha256))
+            .unwrap();
         let _ = rsa_oaep_encrypt_cached(slot_a, handle_a, &mod_a, &exp_a, b"x", OaepHash::Sha256)
             .unwrap();
 
