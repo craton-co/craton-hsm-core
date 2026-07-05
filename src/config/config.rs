@@ -322,9 +322,16 @@ impl HsmConfig {
         // to prevent an attacker from planting a permissive config file.
         #[cfg(feature = "fips")]
         {
-            tracing::info!(
-                "FIPS mode active (compile-time) — using hardcoded secure defaults, ignoring config files"
+            tracing::warn!(
+                "FIPS mode active (compile-time, `--features fips`) — using hardcoded secure \
+                 defaults and IGNORING craton_hsm.toml entirely, including persist_objects, \
+                 storage_path, and all other settings. If you need persistence or other \
+                 non-default settings in FIPS mode, build without the `fips` feature (note that \
+                 `--all-features` includes it)."
             );
+            if std::path::Path::new("craton_hsm.toml").exists() {
+                tracing::warn!("craton_hsm.toml exists but is being ignored in FIPS mode");
+            }
             return Ok(Self::fips_defaults());
         }
 
