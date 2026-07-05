@@ -1,13 +1,45 @@
 # cargo-deny configuration for Craton HSM
 # https://embarkstudios.github.io/cargo-deny/
+#
+# Policy: any vulnerability, unmaintained advisory, unapproved license,
+# unknown source, or unexplained duplicate crate fails CI. Exceptions are
+# documented inline with the reason and (where relevant) the review cadence.
 
 [advisories]
-# RUSTSEC-2023-0071: rsa crate Marvin Attack — no fixed version available.
-# We mitigate by not exposing raw RSA decryption; revisit when rsa crate ships a fix.
-ignore = ["RUSTSEC-2023-0071"]
+# In cargo-deny >= 0.16, every advisory (vulnerability / unmaintained /
+# unsound / yanked / notice) is a hard error unless silenced below. The
+# ignore list is reviewed quarterly — last reviewed 2026-05-07.
+ignore = [
+    # rsa crate Marvin Attack timing sidechannel. No fixed upstream version
+    # exists yet. We mitigate by not exposing raw RSA decryption to callers;
+    # the only RSA decrypt path is PKCS#1 v1.5 / OAEP through the HSM API
+    # with constant-time padding checks. Revisit when rsa ships a fix.
+    { id = "RUSTSEC-2023-0071", reason = "no upstream fix; mitigated by API surface" },
+
+    # rustls-pemfile unmaintained — pulled in transitively by the daemon's
+    # TLS stack. Tracked for the next daemon dependency sweep.
+    { id = "RUSTSEC-2025-0134", reason = "transitive daemon TLS dep; update pending" },
+
+    # aws-lc-fips-sys / aws-lc-sys / rustls-webpki — optional FIPS backend
+    # and daemon TLS dependencies. Updates pending the next aws-lc-rs and
+    # rustls release cycles. Mirrors the ignore list in the
+    # security-audit.yml workflow so `cargo audit` and `cargo deny` agree.
+    { id = "RUSTSEC-2026-0042", reason = "optional aws-lc-fips backend; update pending" },
+    { id = "RUSTSEC-2026-0044", reason = "transitive via optional aws-lc-rs" },
+    { id = "RUSTSEC-2026-0045", reason = "transitive via optional aws-lc-rs" },
+    { id = "RUSTSEC-2026-0046", reason = "transitive via optional aws-lc-rs" },
+    { id = "RUSTSEC-2026-0047", reason = "transitive via optional aws-lc-rs" },
+    { id = "RUSTSEC-2026-0048", reason = "transitive via optional aws-lc-rs" },
+    { id = "RUSTSEC-2026-0049", reason = "daemon TLS dep (rustls-webpki); update pending" },
+    { id = "RUSTSEC-2026-0098", reason = "daemon TLS dep (rustls-webpki); update pending" },
+    { id = "RUSTSEC-2026-0099", reason = "daemon TLS dep (rustls-webpki); update pending" },
+    { id = "RUSTSEC-2026-0104", reason = "daemon TLS dep (rustls-webpki); update pending" },
+]
 
 [licenses]
-# Allow these license expressions
+# SPDX expressions accepted for first- and third-party code. Anything not
+# on this list fails the check — add new entries with a one-line note on
+# why the license is acceptable for a security/crypto project.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -22,22 +54,60 @@ allow = [
     "OpenSSL",
     "CC0-1.0",
 ]
-# Confidence threshold for license detection
+# Confidence threshold for license detection from license text.
 confidence-threshold = 0.8
-# Allow ring's OpenSSL-derived license (used by aws-lc-rs / rustls)
+# ring is licensed under a custom mix derived from OpenSSL/ISC/MIT.
+# cargo-deny cannot parse this from the LICENSE file alone, so we list
+# the components explicitly. This is the conventional exception for
+# anything that depends on aws-lc-rs or rustls.
 exceptions = [
     { allow = ["ISC", "MIT", "OpenSSL"], name = "ring" },
 ]
 
 [bans]
-# Warn on multiple versions of the same crate
-multiple-versions = "warn"
-# Highlight specific crates that should be audited carefully
+# Duplicate crate versions are an error by default. Exceptions live in
+# [bans.skip-tree] below and must be justified — multiple versions of a
+# crypto trait crate (e.g. rand_core, signature) bloat the binary and
+# make it harder to reason about which implementation is in use.
+multiple-versions = "deny"
+# Wildcards in version requirements are forbidden — they make the
+# dependency set non-reproducible.
+wildcards = "deny"
+# Highlight all crates in the dependency graph during duplicate
+# diagnostics so reviewers can see exactly which path pulled in a
+# conflicting version.
 highlight = "all"
 
+# Explicitly-accepted duplicate trees. Each entry is justified inline.
+# When removing an entry, also remove the corresponding alias in
+# Cargo.toml (e.g. `rand_core_new`, `getrandom_new`) if applicable.
+skip-tree = [
+    # The PQC crates (ml-kem / ml-dsa / slh-dsa) depend on the next-generation
+    # RustCrypto trait crates (rand_core 0.10, signature 3.0-rc, digest 0.11,
+    # sha2 0.11-rc, sha3 0.11-rc, hmac 0.13-rc, cipher next, spki 0.8-rc,
+    # pkcs8 0.11-rc, der next, const-oid next, getrandom 0.4, etc.) while the
+    # classical RustCrypto crates (rsa, ecdsa, ed25519-dalek, p256, p384,
+    # elliptic-curve) still pin the 0.6/0.10/0.7/0.10/0.12/0.13 series.
+    # Cargo.toml aliases `rand_core_new` and `getrandom_new` exist for this
+    # reason — see the top-of-file comment there. Remove this skip-tree once
+    # the RustCrypto ecosystem converges (track:
+    # https://github.com/RustCrypto/traits/issues/1438).
+    { crate = "ml-kem", reason = "PQC migration: RustCrypto 0.x vs RC trait split" },
+    { crate = "ml-dsa", reason = "PQC migration: RustCrypto 0.x vs RC trait split" },
+    { crate = "slh-dsa", reason = "PQC migration: RustCrypto 0.x vs RC trait split" },
+
+    # The `cipher = "0.5"` direct dep in Cargo.toml lives alongside the
+    # AES family (`aes`, `cbc`, `ctr`, `aes-gcm`, `aes-kw`) which still
+    # pins `cipher = "0.4"`. This pulls in `inout 0.1` and `inout 0.2`
+    # alongside `cipher 0.4` and `cipher 0.5`. Drop this skip when the
+    # AES crates publish a 0.5-cipher-compatible release.
+    { crate = "cipher@0.4", reason = "AES family on cipher 0.4 vs direct cipher 0.5 dep" },
+]
+
 [sources]
-# Only allow crates from crates.io
+# Only allow crates from crates.io. Anything else (git, alt-registry) is a
+# hard error — we want the dependency closure auditable from the public
+# registry alone.
 unknown-registry = "deny"
 unknown-git = "deny"
-# Allow specific git sources if needed
 allow-git = []

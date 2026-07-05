@@ -2,13 +2,22 @@
 // Copyright 2026 Craton Software Company
 // Attribute management ABI tests — exercises C_GetAttributeValue, C_SetAttributeValue,
 // C_FindObjectsInit/FindObjects/FindObjectsFinal through the PKCS#11 C ABI.
+//
+// NOTE: Must run with --test-threads=1 due to shared global PKCS#11 state.
+// A process-wide Mutex in setup_user_session() enforces this automatically.
 
 use craton_hsm::pkcs11_abi::constants::*;
 use craton_hsm::pkcs11_abi::functions::*;
 use craton_hsm::pkcs11_abi::types::*;
 use std::ptr;
+use std::sync::{Mutex, MutexGuard};
 
 mod common;
+
+/// Process-wide lock that serialises every test in this binary.
+/// Each test holds the guard for its entire lifetime via the tuple returned
+/// by `setup_user_session`, preventing concurrent token/session mutation.
+static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn ck_ulong_bytes(val: CK_ULONG) -> Vec<u8> {
     val.to_ne_bytes().to_vec()
@@ -23,12 +32,19 @@ fn ensure_init() {
     );
 }
 
+/// Acquire the global test serialisation lock.
+/// Returns the guard so the caller keeps it alive for the test duration.
+fn acquire_test_lock() -> MutexGuard<'static, ()> {
+    TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn cleanup_session(session: CK_SESSION_HANDLE) {
     let _ = C_Logout(session);
     let _ = C_CloseSession(session);
 }
 
-fn setup_user_session() -> CK_SESSION_HANDLE {
+fn setup_user_session() -> (CK_SESSION_HANDLE, MutexGuard<'static, ()>) {
+    let _guard = acquire_test_lock();
     ensure_init();
     // Close any existing sessions to ensure clean state
     let _ = C_CloseAllSessions(0);
@@ -77,7 +93,7 @@ fn setup_user_session() -> CK_SESSION_HANDLE {
         user_pin.len() as CK_ULONG,
     );
     assert_eq!(rv, CKR_OK);
-    session
+    (session, _guard)
 }
 
 fn generate_aes_key(session: CK_SESSION_HANDLE, label: &[u8]) -> CK_OBJECT_HANDLE {
@@ -179,7 +195,7 @@ fn generate_aes_key_with_id(
 
 #[test]
 fn test_get_label_attribute() {
-    let session = setup_user_session();
+    let (session, _guard) = setup_user_session();
     let label = b"my_test_key_001";
     let key = generate_aes_key(session, label);
 
@@ -198,7 +214,7 @@ fn test_get_label_attribute() {
 
 #[test]
 fn test_get_id_attribute() {
-    let session = setup_user_session();
+    let (session, _guard) = setup_user_session();
     let id = b"\x01\x02\x03\x04";
     let key = generate_aes_key_with_id(session, b"id_key", id);
 
@@ -217,7 +233,7 @@ fn test_get_id_attribute() {
 
 #[test]
 fn test_get_class_attribute() {
-    let session = setup_user_session();
+    let (session, _guard) = setup_user_session();
     let key = generate_aes_key(session, b"class_test");
     let mut class_val: CK_ULONG = 0;
     let mut template = [CK_ATTRIBUTE {
@@ -233,7 +249,7 @@ fn test_get_class_attribute() {
 
 #[test]
 fn test_get_key_type_attribute() {
-    let session = setup_user_session();
+    let (session, _guard) = setup_user_session();
     let key = generate_aes_key(session, b"kt_test");
     let mut kt: CK_ULONG = 0;
     let mut template = [CK_ATTRIBUTE {
@@ -249,7 +265,7 @@ fn test_get_key_type_attribute() {
 
 #[test]
 fn test_get_encrypt_permission_attribute() {
-    let session = setup_user_session();
+    let (session, _guard) = setup_user_session();
     let key = generate_aes_key(session, b"enc_perm");
     let mut enc_val: CK_BBOOL = CK_FALSE;
     let mut template = [CK_ATTRIBUTE {
@@ -265,7 +281,7 @@ fn test_get_encrypt_permission_attribute() {
 
 #[test]
 fn test_get_decrypt_permission_attribute() {
-    let session = setup_user_session();
+    let (session, _guard) = setup_user_session();
     let key = generate_aes_key(session, b"dec_perm");
     let mut dec_val: CK_BBOOL = CK_FALSE;
     let mut template = [CK_ATTRIBUTE {
@@ -281,7 +297,7 @@ fn test_get_decrypt_permission_attribute() {
 
 #[test]
 fn test_get_sensitive_attribute() {
-    let session = setup_user_session();
+    let (session, _guard) = setup_user_session();
     let key = generate_aes_key(session, b"sens_test");
     let mut sens: CK_BBOOL = CK_TRUE;
     let mut template = [CK_ATTRIBUTE {
@@ -297,7 +313,7 @@ fn test_get_sensitive_attribute() {
 
 #[test]
 fn test_get_extractable_attribute() {
-    let session = setup_user_session();
+    let (session, _guard) = setup_user_session();
     let key = generate_aes_key(session, b"extr_test");
     let mut extr: CK_BBOOL = CK_FALSE;
     let mut template = [CK_ATTRIBUTE {
@@ -318,7 +334,7 @@ fn test_get_extractable_attribute() {
 
 #[test]
 fn test_get_attribute_null_value_returns_size() {
-    let session = setup_user_session();
+    let (session, _guard) = setup_user_session();
     let key = generate_aes_key(session, b"size_query");
 
     let mut template = [CK_ATTRIBUTE {
@@ -335,7 +351,7 @@ fn test_get_attribute_null_value_returns_size() {
 
 #[test]
 fn test_get_attribute_invalid_handle() {
-    let session = setup_user_session();
+    let (session, _guard) = setup_user_session();
     let mut val: CK_ULONG = 0;
     let mut template = [CK_ATTRIBUTE {
         attr_type: CKA_CLASS,
@@ -349,7 +365,7 @@ fn test_get_attribute_invalid_handle() {
 
 #[test]
 fn test_get_multiple_attributes_at_once() {
-    let session = setup_user_session();
+    let (session, _guard) = setup_user_session();
     let key = generate_aes_key(session, b"multi_attr");
 
     let mut class_val: CK_ULONG = 0;
@@ -386,7 +402,7 @@ fn test_get_multiple_attributes_at_once() {
 
 #[test]
 fn test_set_label_attribute() {
-    let session = setup_user_session();
+    let (session, _guard) = setup_user_session();
     let key = generate_aes_key(session, b"old_label");
 
     let new_label = b"new_label_val";
@@ -416,7 +432,7 @@ fn test_set_label_attribute() {
 
 #[test]
 fn test_set_id_attribute() {
-    let session = setup_user_session();
+    let (session, _guard) = setup_user_session();
     let key = generate_aes_key(session, b"id_set_test");
 
     let new_id = b"\xAA\xBB\xCC\xDD";
@@ -445,7 +461,7 @@ fn test_set_id_attribute() {
 
 #[test]
 fn test_set_attribute_invalid_handle() {
-    let session = setup_user_session();
+    let (session, _guard) = setup_user_session();
     let new_label = b"test";
     let mut template = [CK_ATTRIBUTE {
         attr_type: CKA_LABEL,
@@ -463,7 +479,7 @@ fn test_set_attribute_invalid_handle() {
 
 #[test]
 fn test_find_objects_by_label() {
-    let session = setup_user_session();
+    let (session, _guard) = setup_user_session();
     let label = b"find_me_label";
     let _key = generate_aes_key(session, label);
 
@@ -488,7 +504,7 @@ fn test_find_objects_by_label() {
 
 #[test]
 fn test_find_objects_by_class() {
-    let session = setup_user_session();
+    let (session, _guard) = setup_user_session();
     let _key = generate_aes_key(session, b"class_find");
     let class_val = ck_ulong_bytes(CKO_SECRET_KEY);
 
@@ -512,7 +528,7 @@ fn test_find_objects_by_class() {
 
 #[test]
 fn test_find_objects_by_id() {
-    let session = setup_user_session();
+    let (session, _guard) = setup_user_session();
     let id = b"\xDE\xAD\xBE\xEF";
     let _key = generate_aes_key_with_id(session, b"id_find", id);
 
@@ -536,7 +552,7 @@ fn test_find_objects_by_id() {
 
 #[test]
 fn test_find_objects_no_match() {
-    let session = setup_user_session();
+    let (session, _guard) = setup_user_session();
     let label = b"nonexistent_unique_xyz_12345";
 
     let mut find_template = [CK_ATTRIBUTE {
@@ -559,7 +575,7 @@ fn test_find_objects_no_match() {
 
 #[test]
 fn test_find_objects_empty_template() {
-    let session = setup_user_session();
+    let (session, _guard) = setup_user_session();
     let _key = generate_aes_key(session, b"empty_tmpl_find");
 
     // Empty template → match all objects
@@ -578,7 +594,7 @@ fn test_find_objects_empty_template() {
 
 #[test]
 fn test_find_objects_after_set_label() {
-    let session = setup_user_session();
+    let (session, _guard) = setup_user_session();
     let key = generate_aes_key(session, b"before_rename");
 
     // Change label
@@ -611,7 +627,7 @@ fn test_find_objects_after_set_label() {
 
 #[test]
 fn test_find_objects_final_without_init() {
-    let session = setup_user_session();
+    let (session, _guard) = setup_user_session();
     // FindObjectsFinal without FindObjectsInit — should return error or OK
     let rv = C_FindObjectsFinal(session);
     // Per PKCS#11 spec, this should return CKR_OPERATION_NOT_INITIALIZED
@@ -626,7 +642,7 @@ fn test_find_objects_final_without_init() {
 
 #[test]
 fn test_find_objects_multiple_with_same_label() {
-    let session = setup_user_session();
+    let (session, _guard) = setup_user_session();
     let label = b"dup_label";
     let _k1 = generate_aes_key(session, label);
     let _k2 = generate_aes_key(session, label);
@@ -660,7 +676,7 @@ fn test_find_objects_multiple_with_same_label() {
 
 #[test]
 fn test_get_value_of_sensitive_key() {
-    let session = setup_user_session();
+    let (session, _guard) = setup_user_session();
     // Generate a sensitive key
     let mut mechanism = CK_MECHANISM {
         mechanism: CKM_AES_KEY_GEN,
@@ -710,7 +726,7 @@ fn test_get_value_of_sensitive_key() {
 
 #[test]
 fn test_get_value_len_attribute() {
-    let session = setup_user_session();
+    let (session, _guard) = setup_user_session();
     let key = generate_aes_key(session, b"vlen_test");
     let mut val_len: CK_ULONG = 0;
     let mut template = [CK_ATTRIBUTE {
@@ -726,7 +742,7 @@ fn test_get_value_len_attribute() {
 
 #[test]
 fn test_find_and_get_combined_workflow() {
-    let session = setup_user_session();
+    let (session, _guard) = setup_user_session();
     let label = b"workflow_test";
     let id = b"\x11\x22\x33";
     let key = generate_aes_key_with_id(session, label, id);

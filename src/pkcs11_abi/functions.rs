@@ -744,13 +744,11 @@ pub extern "C" fn C_GetMechanismInfo(
             },
             // Note: raw CKM_RSA_PKCS is intentionally not advertised — the signer
             // requires a hash alg, so callers must use CKM_SHAxxx_RSA_PKCS variants.
-            CKM_SHA256_RSA_PKCS | CKM_SHA384_RSA_PKCS | CKM_SHA512_RSA_PKCS => {
-                CK_MECHANISM_INFO {
-                    min_key_size: 2048 as CK_ULONG,
-                    max_key_size: 4096 as CK_ULONG,
-                    flags: CKF_SIGN_FLAG | CKF_VERIFY_FLAG,
-                }
-            }
+            CKM_SHA256_RSA_PKCS | CKM_SHA384_RSA_PKCS | CKM_SHA512_RSA_PKCS => CK_MECHANISM_INFO {
+                min_key_size: 2048 as CK_ULONG,
+                max_key_size: 4096 as CK_ULONG,
+                flags: CKF_SIGN_FLAG | CKF_VERIFY_FLAG,
+            },
             CKM_RSA_PKCS_PSS
             | CKM_SHA256_RSA_PKCS_PSS
             | CKM_SHA384_RSA_PKCS_PSS

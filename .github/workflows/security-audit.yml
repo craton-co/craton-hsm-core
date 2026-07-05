@@ -1,17 +1,16 @@
 name: Security Audit
 
-# Run weekly and when dependency files change on main.
-# Advisory databases don't change with code, so this doesn't need to run on every PR.
+# Supply-chain checks: cargo-deny (advisories / licenses / sources / bans)
+# and cargo-audit (RustSec advisory DB). Runs on every PR and push to main
+# so a new transitive dep cannot land without being scanned, and daily on
+# cron so newly published advisories are noticed even when no code changes.
 on:
   schedule:
-    - cron: '17 8 * * 1'  # Monday 8:17 AM UTC
+    - cron: '0 6 * * *'  # Daily 06:00 UTC — new RustSec advisories land any day.
   push:
     branches: [main, master]
-    paths:
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'deny.toml'
-      - '**/Cargo.toml'
+  pull_request:
+    branches: [main, master]
   workflow_dispatch:  # Allow manual trigger
 
 env:
@@ -29,25 +28,31 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Install cargo-audit
-        uses: taiki-e/install-action@d858f8113943481093e02986a7586a4819a3bfd6 # v2
-        with:
-          tool: cargo-audit
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2
 
-      - name: Install cargo-deny
+      - name: Install cargo-audit & cargo-deny
         uses: taiki-e/install-action@d858f8113943481093e02986a7586a4819a3bfd6 # v2
         with:
-          tool: cargo-deny
+          tool: cargo-audit,cargo-deny
+
+      - name: Run cargo-deny (advisories / licenses / sources / bans)
+        # Ignores and skip-trees live in deny.toml so a single source of
+        # truth governs both local and CI runs. Bans now fail CI on
+        # unexplained duplicate crates and wildcard version requirements
+        # — exceptions are documented inline in deny.toml.
+        run: cargo deny check
 
       - name: Run cargo-audit (CVE check)
-        # Ignored advisories — review quarterly (last reviewed 2026-05-07):
-        # RUSTSEC-2023-0071: rsa crate Marvin Attack — no fix available yet
-        # RUSTSEC-2026-0042: aws-lc-fips-sys — optional FIPS backend, update pending
-        # RUSTSEC-2026-004[4-8]: aws-lc-sys — transitive via optional aws-lc-rs
-        # RUSTSEC-2026-0049: rustls-webpki — daemon TLS dep, update pending
-        # RUSTSEC-2026-009[8-9]: rustls-webpki — daemon TLS dep, update pending
-        # RUSTSEC-2026-0104: rustls-webpki — daemon TLS dep, update pending
-        # RUSTSEC-2025-0134: rustls-pemfile — daemon TLS dep, update pending
+        # Ignored advisories — review quarterly (last reviewed 2026-05-07).
+        # Keep this list in sync with the `ignore` block in deny.toml:
+        #   RUSTSEC-2023-0071: rsa crate Marvin Attack — no fix available yet
+        #   RUSTSEC-2026-0042: aws-lc-fips-sys — optional FIPS backend, update pending
+        #   RUSTSEC-2026-004[4-8]: aws-lc-sys — transitive via optional aws-lc-rs
+        #   RUSTSEC-2026-0049: rustls-webpki — daemon TLS dep, update pending
+        #   RUSTSEC-2026-009[8-9]: rustls-webpki — daemon TLS dep, update pending
+        #   RUSTSEC-2026-0104: rustls-webpki — daemon TLS dep, update pending
+        #   RUSTSEC-2025-0134: rustls-pemfile — daemon TLS dep, update pending
         run: >-
           cargo audit
           --ignore RUSTSEC-2023-0071
@@ -62,6 +67,3 @@ jobs:
           --ignore RUSTSEC-2026-0099
           --ignore RUSTSEC-2026-0104
           --ignore RUSTSEC-2025-0134
-
-      - name: Run cargo-deny (license + advisory)
-        run: cargo deny check advisories licenses
