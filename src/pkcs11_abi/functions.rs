@@ -241,6 +241,32 @@ fn parse_oaep_hash(mech_param: &[u8]) -> Result<crate::crypto::sign::OaepHash, C
 // Core library functions
 // ============================================================================
 
+/// Install a default stderr tracing subscriber if none is registered yet.
+///
+/// This library is most commonly loaded as a bare shared object (`pkcs11-tool`,
+/// OpenSSL engines, Java PKCS#11 providers, etc.), which never registers a
+/// `tracing` subscriber. Without one, every `tracing::warn!` / `tracing::error!`
+/// call in this crate — including security-relevant events like "FIPS mode is
+/// ignoring your config file", lockouts, and permission failures — is silently
+/// discarded, with no way for the operator to learn why something didn't work.
+///
+/// Defaults to WARN level (no `RUST_LOG` support — that would need the
+/// `env-filter` tracing-subscriber feature, an extra dependency not worth
+/// pulling in for this). WARN+ surfaces exactly the security-relevant events
+/// this exists for, without the per-operation INFO noise (session opens,
+/// logins, etc.) a bare CLI-driven consumer would not want by default.
+///
+/// `try_init()` returns `Err` (ignored) if a subscriber is already registered,
+/// so this is a no-op for consumers that install their own (e.g. the daemon,
+/// which calls `tracing_subscriber::fmt().init()` in `main()` before ever
+/// touching `HsmCore`) and for repeated `C_Initialize` calls within one process.
+fn ensure_default_tracing_subscriber() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
 #[no_mangle]
 pub extern "C" fn C_Initialize(p_init_args: CK_VOID_PTR) -> CK_RV {
     catch_unwind(|| {
@@ -249,6 +275,12 @@ pub extern "C" fn C_Initialize(p_init_args: CK_VOID_PTR) -> CK_RV {
         if guard.is_some() {
             return CKR_CRYPTOKI_ALREADY_INITIALIZED;
         }
+
+        // Surface tracing::warn!/error! (config-load results, lockouts,
+        // permission failures) to stderr for bare-.so consumers that never
+        // register their own subscriber. Must run before config loading below
+        // so the FIPS-mode "ignoring your config file" warning is visible.
+        ensure_default_tracing_subscriber();
 
         // Validate init args if provided
         if !p_init_args.is_null() {

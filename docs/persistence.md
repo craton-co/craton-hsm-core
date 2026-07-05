@@ -4,6 +4,8 @@ By default, Craton HSM operates entirely in memory. All token objects (keys, cer
 
 Persistence is opt-in: set `persist_objects = true` in `craton_hsm.toml`. This single flag enables **full persistence** — both the token's initialization state (SO/User PIN hashes, label, and the `initialized` / `user PIN initialized` flags) and objects tagged `CKA_TOKEN=true` survive restarts. With the default `persist_objects = false`, the token is entirely in memory: it re-appears uninitialized on restart and no objects are saved. (Lockout counters always persist, independently of this flag, so brute-force counters cannot be reset by crashing the process.)
 
+> **FIPS builds cannot use this feature.** Compiling with `--features fips` (which `--all-features` silently includes) makes `HsmConfig::load()` skip `craton_hsm.toml` entirely and use hardcoded secure defaults — `persist_objects` is always `false`, `storage_path` is always a default path, and nothing in the file is honored. This is by design: FIPS builds must not read attacker-controlled config from disk. A `tracing::warn!` fires at `C_Initialize` when this happens (visible on stderr — the library installs a default WARN-level subscriber for consumers, like `pkcs11-tool`, that don't register their own). If you need persistence, build **without** the `fips` feature.
+
 ## How It Works
 
 ### Object encryption — wrapped master key
