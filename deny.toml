@@ -11,10 +11,10 @@
 # ignore list is reviewed quarterly — last reviewed 2026-05-07.
 ignore = [
     # rsa crate Marvin Attack timing sidechannel. No fixed upstream version
-    # exists yet. We mitigate by not exposing raw RSA decryption to callers;
-    # the only RSA decrypt path is PKCS#1 v1.5 / OAEP through the HSM API
-    # with constant-time padding checks. Revisit when rsa ships a fix.
-    { id = "RUSTSEC-2023-0071", reason = "no upstream fix; mitigated by API surface" },
+    # exists yet. Release builds refuse every RustCrypto RSA private-key path
+    # (including cached and prehashed operations); the crate remains only for
+    # public-key work, key generation, and debug/explicit compatibility tests.
+    { id = "RUSTSEC-2023-0071", reason = "release private-key operations are hard-disabled pending upstream fix" },
 
     # rustls-pemfile unmaintained — pulled in transitively by the daemon's
     # TLS stack. Tracked for the next daemon dependency sweep.

@@ -46,7 +46,8 @@ jobs:
       - name: Run cargo-audit (CVE check)
         # Ignored advisories — review quarterly (last reviewed 2026-05-07).
         # Keep this list in sync with the `ignore` block in deny.toml:
-        #   RUSTSEC-2023-0071: rsa crate Marvin Attack — no fix available yet
+        #   RUSTSEC-2023-0071: RustCrypto RSA private operations are refused in
+        #                      release artifacts pending an upstream fix
         #   RUSTSEC-2026-0042: aws-lc-fips-sys — optional FIPS backend, update pending
         #   RUSTSEC-2026-004[4-8]: aws-lc-sys — transitive via optional aws-lc-rs
         #   RUSTSEC-2026-0049: rustls-webpki — daemon TLS dep, update pending

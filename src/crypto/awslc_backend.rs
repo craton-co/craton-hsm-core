@@ -224,6 +224,7 @@ impl CryptoBackend for AwsLcBackend {
         digest: &[u8],
         hash_alg: HashAlg,
     ) -> HsmResult<Vec<u8>> {
+        super::sign::require_rustcrypto_rsa_private_ops()?;
         use rsa::pkcs8::DecodePrivateKey;
         use rsa::{Pkcs1v15Sign, RsaPrivateKey};
 
@@ -266,6 +267,7 @@ impl CryptoBackend for AwsLcBackend {
         digest: &[u8],
         hash_alg: HashAlg,
     ) -> HsmResult<Vec<u8>> {
+        super::sign::require_rustcrypto_rsa_private_ops()?;
         use rand::rngs::OsRng;
         use rsa::pkcs8::DecodePrivateKey;
         use rsa::pss::SigningKey;

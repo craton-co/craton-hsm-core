@@ -9,6 +9,23 @@ use crate::error::{HsmError, HsmResult};
 use crate::pkcs11_abi::constants::*;
 use crate::pkcs11_abi::types::CK_MECHANISM_TYPE;
 
+/// RUSTSEC-2023-0071 (Marvin) affects RustCrypto RSA private-key operations.
+/// Release artifacts must use a hardened backend; debug/vector builds can opt
+/// in to these routines only for development coverage.
+pub(crate) fn require_rustcrypto_rsa_private_ops() -> HsmResult<()> {
+    #[cfg(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops"))]
+    {
+        Ok(())
+    }
+    #[cfg(not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")))]
+    {
+        tracing::error!(
+            "RustCrypto RSA private-key operation refused in release due to RUSTSEC-2023-0071; use a hardened backend"
+        );
+        Err(HsmError::MechanismInvalid)
+    }
+}
+
 // ============================================================================
 // RSA Key Caches
 // ============================================================================
@@ -319,6 +336,7 @@ pub fn rsa_pkcs1v15_sign(
     data: &[u8],
     hash_alg: Option<HashAlg>,
 ) -> HsmResult<Vec<u8>> {
+    require_rustcrypto_rsa_private_ops()?;
     use rsa::signature::SignatureEncoding;
 
     validate_data_size(data)?;
@@ -413,6 +431,7 @@ pub fn rsa_pkcs1v15_verify(
 /// instead of `OsRng` directly, ensuring all randomness benefits from
 /// the DRBG's continuous health testing and prediction resistance.
 pub fn rsa_pss_sign(private_key_der: &[u8], data: &[u8], hash_alg: HashAlg) -> HsmResult<Vec<u8>> {
+    require_rustcrypto_rsa_private_ops()?;
     use crate::crypto::drbg::DrbgRng;
     use rsa::pss::SigningKey;
     use rsa::signature::{RandomizedSigner, SignatureEncoding};
@@ -542,6 +561,7 @@ pub fn rsa_oaep_decrypt(
     ciphertext: &[u8],
     hash_alg: OaepHash,
 ) -> HsmResult<Vec<u8>> {
+    require_rustcrypto_rsa_private_ops()?;
     use rsa::Oaep;
 
     let private_key = parse_rsa_private_key(private_key_der)?;
@@ -582,6 +602,7 @@ pub fn rsa_pkcs1v15_sign_cached(
     data: &[u8],
     hash_alg: Option<HashAlg>,
 ) -> HsmResult<Vec<u8>> {
+    require_rustcrypto_rsa_private_ops()?;
     use rsa::signature::SignatureEncoding;
 
     validate_data_size(data)?;
@@ -670,6 +691,7 @@ pub fn rsa_pss_sign_cached(
     data: &[u8],
     hash_alg: HashAlg,
 ) -> HsmResult<Vec<u8>> {
+    require_rustcrypto_rsa_private_ops()?;
     use crate::crypto::drbg::DrbgRng;
     use rsa::pss::SigningKey;
     use rsa::signature::{RandomizedSigner, SignatureEncoding};
@@ -786,6 +808,7 @@ pub fn rsa_oaep_decrypt_cached(
     ciphertext: &[u8],
     hash_alg: OaepHash,
 ) -> HsmResult<Vec<u8>> {
+    require_rustcrypto_rsa_private_ops()?;
     use rsa::Oaep;
 
     let key = get_or_parse_private_key(slot_id, handle, private_key_der)?;
@@ -1084,6 +1107,7 @@ pub(crate) fn rsa_pkcs1v15_sign_prehashed(
     digest: &[u8],
     hash_alg: HashAlg,
 ) -> HsmResult<Vec<u8>> {
+    require_rustcrypto_rsa_private_ops()?;
     validate_digest_length(digest, hash_alg)?;
     let private_key = parse_rsa_private_key(private_key_der)?;
     validate_rsa_private_key_size(&private_key)?;
@@ -1134,6 +1158,7 @@ pub(crate) fn rsa_pss_sign_prehashed(
     digest: &[u8],
     hash_alg: HashAlg,
 ) -> HsmResult<Vec<u8>> {
+    require_rustcrypto_rsa_private_ops()?;
     use crate::crypto::drbg::DrbgRng;
     use rsa::pss::SigningKey;
     use rsa::signature::hazmat::RandomizedPrehashSigner;
@@ -1217,6 +1242,7 @@ pub(crate) fn rsa_pkcs1v15_sign_prehashed_cached(
     digest: &[u8],
     hash_alg: HashAlg,
 ) -> HsmResult<Vec<u8>> {
+    require_rustcrypto_rsa_private_ops()?;
     validate_digest_length(digest, hash_alg)?;
     let key = get_or_parse_private_key(slot_id, handle, private_key_der)?;
     validate_rsa_private_key_size(&key)?;
@@ -1265,6 +1291,7 @@ pub(crate) fn rsa_pss_sign_prehashed_cached(
     digest: &[u8],
     hash_alg: HashAlg,
 ) -> HsmResult<Vec<u8>> {
+    require_rustcrypto_rsa_private_ops()?;
     use crate::crypto::drbg::DrbgRng;
     use rsa::pss::SigningKey;
     use rsa::signature::hazmat::RandomizedPrehashSigner;
@@ -1433,6 +1460,12 @@ pub(crate) fn ecdsa_p384_verify_prehashed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")))]
+    #[test]
+    fn release_build_refuses_rustcrypto_rsa_private_operations() {
+        assert!(require_rustcrypto_rsa_private_ops().is_err());
+    }
 
     /// Use a per-test slot id derived from a counter so that tests run in
     /// parallel without colliding on cache slots.  Handle ids are picked the
