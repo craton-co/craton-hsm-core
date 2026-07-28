@@ -138,11 +138,11 @@ pub fn check_integrity() -> Result<(), String> {
     let module_path = match get_module_path() {
         Some(p) => p,
         None => {
-            // Cannot determine module path — skip integrity check.
-            // This is normal for test binaries, statically linked executables,
-            // and some platform configurations.
-            tracing::warn!("Software integrity test: could not determine module path — skipping");
-            return Ok(());
+            return Err(
+                "Software integrity test: could not determine the loaded module path; \
+             refusing to bypass signature verification"
+                    .to_string(),
+            )
         }
     };
 
