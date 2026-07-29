@@ -344,7 +344,10 @@ pub extern "C" fn C_Finalize(p_reserved: CK_VOID_PTR) -> CK_RV {
         let _ = hsm
             .audit_log
             .record(0, AuditOperation::Finalize, AuditResult::Success, None);
-        hsm.audit_log.flush();
+        if let Err(e) = hsm.audit_log.flush() {
+            tracing::error!(error = %e, "C_Finalize refused: audit log flush failed");
+            return CKR_GENERAL_ERROR;
+        }
 
         // Reset state so a subsequent C_Initialize can succeed (PKCS#11 spec compliant)
         *guard = None;

@@ -13,3 +13,4 @@ pub mod key_material;
 pub mod lifecycle;
 pub mod lockout_store;
 pub mod object;
+pub(crate) mod object_codec;

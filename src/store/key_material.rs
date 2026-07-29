@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Craton Software Company
 use crate::crypto::mlock;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use zeroize::Zeroize;
 
@@ -104,22 +103,5 @@ impl fmt::Debug for RawKeyMaterial {
             .field("length", &self.0.len())
             .field("data", &"[REDACTED]")
             .finish()
-    }
-}
-
-/// Custom Serialize: serialize the raw bytes (they will be encrypted by EncryptedStore).
-impl Serialize for RawKeyMaterial {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_bytes(&self.0)
-    }
-}
-
-/// Custom Deserialize: reconstruct RawKeyMaterial with mlock.
-/// Deserializes into a temporary Vec, then immediately converts to Box<[u8]>
-/// via `new()` — minimizing the window where a Vec could reallocate.
-impl<'de> Deserialize<'de> for RawKeyMaterial {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let bytes: Vec<u8> = Vec::deserialize(deserializer)?;
-        Ok(RawKeyMaterial::new(bytes))
     }
 }

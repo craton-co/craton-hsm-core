@@ -5,14 +5,11 @@
 //! Backup file format:
 //! ```text
 //! [4 bytes: magic "RHBK"]
-//! [4 bytes: version (1) as u32 LE]
+//! [4 bytes: version (2) as u32 LE]
 //! [32 bytes: PBKDF2 salt]
 //! [12 bytes: AES-GCM nonce]
-//! [remaining: AES-256-GCM ciphertext of JSON payload]
+//! [remaining: AES-256-GCM ciphertext of bounded binary payload]
 //! ```
-//!
-//! The JSON payload (before encryption) contains a `BackupPayload` struct
-//! with metadata and a Vec of serialized `StoredObject`s.
 
 use std::collections::HashSet;
 
@@ -20,23 +17,21 @@ use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use rand::rngs::OsRng;
 use rand::RngCore;
-use serde::{Deserialize, Serialize};
-
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{HsmError, HsmResult};
 use crate::store::encrypted_store::derive_key_from_pin;
 use crate::store::object::StoredObject;
+use crate::store::object_codec;
 
 const BACKUP_MAGIC: &[u8; 4] = b"RHBK";
-const BACKUP_VERSION: u32 = 1;
+const BACKUP_VERSION: u32 = 2;
 const SALT_LEN: usize = 32;
 const NONCE_LEN: usize = 12;
 const HEADER_LEN: usize = 4 + 4 + SALT_LEN + NONCE_LEN; // 52 bytes
 const MIN_PASSPHRASE_LEN: usize = 16;
 
-/// Inner JSON payload that gets encrypted in the backup file.
-#[derive(Serialize, Deserialize)]
+/// Inner bounded-binary payload that gets encrypted in the backup file.
 struct BackupPayload {
     version: u32,
     created: String,
@@ -52,6 +47,134 @@ struct BackupPayload {
 
 /// Maximum allowed age of a backup in seconds (default: 30 days).
 const DEFAULT_MAX_BACKUP_AGE_SECS: u64 = 30 * 24 * 3600;
+const MAX_BACKUP_OBJECTS: usize = 10_000;
+const MAX_METADATA_BYTES: usize = 4096;
+
+fn encode_payload(payload: &BackupPayload) -> HsmResult<Zeroizing<Vec<u8>>> {
+    if payload.objects.len() > MAX_BACKUP_OBJECTS || payload.object_count != payload.objects.len() {
+        return Err(HsmError::DataLenRange);
+    }
+    let mut out = Zeroizing::new(Vec::with_capacity(512));
+    put_u32(&mut out, payload.version);
+    put_string(&mut out, &payload.created)?;
+    put_u64(&mut out, payload.created_epoch);
+    put_string(&mut out, &payload.backup_id)?;
+    put_string(&mut out, &payload.token_serial)?;
+    put_u32(&mut out, payload.object_count as u32);
+    for object in &payload.objects {
+        let encoded = object_codec::encode(object)?;
+        if encoded.len() > u32::MAX as usize {
+            return Err(HsmError::DataLenRange);
+        }
+        put_u32(&mut out, encoded.len() as u32);
+        out.extend_from_slice(&encoded);
+    }
+    Ok(out)
+}
+
+fn decode_payload(data: &[u8]) -> HsmResult<BackupPayload> {
+    let mut reader = PayloadReader::new(data);
+    let version = reader.take_u32()?;
+    if version != BACKUP_VERSION {
+        return Err(HsmError::DataInvalid);
+    }
+    let created = reader.take_string()?;
+    let created_epoch = reader.take_u64()?;
+    let backup_id = reader.take_string()?;
+    let token_serial = reader.take_string()?;
+    let object_count = reader.take_u32()? as usize;
+    if object_count > MAX_BACKUP_OBJECTS {
+        return Err(HsmError::DataLenRange);
+    }
+    let mut objects = Vec::with_capacity(object_count);
+    for _ in 0..object_count {
+        let length = reader.take_u32()? as usize;
+        let object_data = reader.take_exact(length)?;
+        objects.push(object_codec::decode(object_data)?);
+    }
+    if !reader.is_empty() {
+        return Err(HsmError::DataInvalid);
+    }
+    Ok(BackupPayload {
+        version,
+        created,
+        created_epoch,
+        backup_id,
+        token_serial,
+        object_count,
+        objects,
+    })
+}
+
+fn put_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_string(out: &mut Vec<u8>, value: &str) -> HsmResult<()> {
+    if value.len() > MAX_METADATA_BYTES {
+        return Err(HsmError::DataLenRange);
+    }
+    put_u32(out, value.len() as u32);
+    out.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+struct PayloadReader<'a> {
+    input: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> PayloadReader<'a> {
+    fn new(input: &'a [u8]) -> Self {
+        Self { input, offset: 0 }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.offset == self.input.len()
+    }
+
+    fn take_exact(&mut self, length: usize) -> HsmResult<&'a [u8]> {
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or(HsmError::DataInvalid)?;
+        let value = self
+            .input
+            .get(self.offset..end)
+            .ok_or(HsmError::DataInvalid)?;
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn take_u32(&mut self) -> HsmResult<u32> {
+        Ok(u32::from_le_bytes(
+            self.take_exact(4)?
+                .try_into()
+                .map_err(|_| HsmError::DataInvalid)?,
+        ))
+    }
+
+    fn take_u64(&mut self) -> HsmResult<u64> {
+        Ok(u64::from_le_bytes(
+            self.take_exact(8)?
+                .try_into()
+                .map_err(|_| HsmError::DataInvalid)?,
+        ))
+    }
+
+    fn take_string(&mut self) -> HsmResult<String> {
+        let length = self.take_u32()? as usize;
+        if length > MAX_METADATA_BYTES {
+            return Err(HsmError::DataLenRange);
+        }
+        let bytes = self.take_exact(length)?;
+        String::from_utf8(bytes.to_vec()).map_err(|_| HsmError::DataInvalid)
+    }
+}
 
 /// Create an encrypted backup blob from a collection of objects.
 ///
@@ -94,7 +217,8 @@ pub fn create_backup(
         .unwrap_or_default()
         .as_secs();
 
-    // Serialize payload to JSON
+    // Serialize through the bounded object codec. This avoids generic parser
+    // allocations containing key material on the restore path.
     let payload = BackupPayload {
         version: BACKUP_VERSION,
         created: chrono_timestamp(),
@@ -104,7 +228,7 @@ pub fn create_backup(
         object_count: objects.len(),
         objects: objects.to_vec(),
     };
-    let mut json = serde_json::to_vec(&payload).map_err(|_| HsmError::GeneralError)?;
+    let plaintext = encode_payload(&payload)?;
 
     // Derive encryption key from passphrase
     let (key, salt) = derive_key_from_pin(passphrase.as_bytes(), None, pbkdf2_iterations);
@@ -118,11 +242,8 @@ pub fn create_backup(
     let cipher = Aes256Gcm::new(aes_key);
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
-        .encrypt(nonce, json.as_ref())
+        .encrypt(nonce, plaintext.as_ref())
         .map_err(|_| HsmError::GeneralError)?;
-
-    // Zeroize plaintext JSON containing key material before dropping
-    json.zeroize();
 
     // Assemble backup file: magic + version + salt + nonce + ciphertext
     let mut output = Vec::with_capacity(HEADER_LEN + ciphertext.len());
@@ -188,11 +309,10 @@ pub fn restore_backup(
         .decrypt(nonce, ciphertext)
         .map_err(|_| HsmError::PinIncorrect)?;
 
-    // Deserialize JSON payload
-    let payload: BackupPayload =
-        serde_json::from_slice(&plaintext).map_err(|_| HsmError::DataInvalid)?;
-
-    // Zeroize decrypted plaintext containing key material
+    // Decode directly from the zeroizing plaintext buffer. Key material is
+    // copied only into RawKeyMaterial; no JSON parser-owned secret buffers are
+    // created along the way.
+    let payload = decode_payload(&plaintext)?;
     plaintext.zeroize();
 
     // Validate object_count matches actual objects — detects payload tampering
