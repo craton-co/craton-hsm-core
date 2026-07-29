@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Craton Software Company
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
+use zeroize::Zeroize;
 
 use crate::pkcs11_abi::constants::*;
 use crate::pkcs11_abi::types::*;
@@ -16,7 +16,7 @@ use crate::store::key_material::RawKeyMaterial;
 /// - **Deactivated**: Past `end_date` — can verify/decrypt but cannot sign/encrypt.
 /// - **Compromised**: Manually marked — blocked from all operations.
 /// - **Destroyed**: Pending physical deletion — handle is invalid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum KeyLifecycleState {
     PreActivation,
     #[default]
@@ -38,19 +38,13 @@ impl fmt::Display for KeyLifecycleState {
     }
 }
 
-/// Serde default helper for boolean fields that default to true.
-fn default_true() -> bool {
-    true
-}
-
 /// Internal representation of a PKCS#11 object stored in the token.
-/// Serializable for persistence to the encrypted store.
-#[derive(Clone, Serialize, Deserialize)]
+/// Uses the bounded binary codec in `store::object_codec` for persistence.
+#[derive(Clone)]
 pub struct StoredObject {
     pub handle: CK_OBJECT_HANDLE,
     /// Slot that owns this object. Used for slot-scoped isolation in multi-slot
     /// deployments — objects created on one slot are not visible from another.
-    #[serde(default)]
     pub slot_id: CK_ULONG,
     pub class: CK_OBJECT_CLASS,
     pub key_type: Option<CK_KEY_TYPE>,
@@ -63,7 +57,6 @@ pub struct StoredObject {
     pub modifiable: bool,
     pub destroyable: bool,
     /// PKCS#11 CKA_COPYABLE: whether C_CopyObject is allowed on this object
-    #[serde(default = "default_true")]
     pub copyable: bool,
     /// Permission attributes
     pub can_encrypt: bool,
@@ -94,21 +87,42 @@ pub struct StoredObject {
     // ========================================================================
     /// CKA_START_DATE: PKCS#11 CK_DATE format (YYYYMMDD, 8 ASCII bytes)
     /// Key is pre-activation before this date.
-    #[serde(default)]
     pub start_date: Option<[u8; 8]>,
 
     /// CKA_END_DATE: PKCS#11 CK_DATE format (YYYYMMDD, 8 ASCII bytes)
     /// Key is deactivated after this date.
-    #[serde(default)]
     pub end_date: Option<[u8; 8]>,
 
     /// SP 800-57 lifecycle state
-    #[serde(default)]
     pub lifecycle_state: KeyLifecycleState,
 
     /// Creation time (Unix epoch seconds)
-    #[serde(default)]
     pub creation_time: u64,
+}
+
+impl Drop for StoredObject {
+    fn drop(&mut self) {
+        self.label.zeroize();
+        self.id.zeroize();
+        if let Some(value) = &mut self.public_key_data {
+            value.zeroize();
+        }
+        if let Some(value) = &mut self.modulus {
+            value.zeroize();
+        }
+        if let Some(value) = &mut self.public_exponent {
+            value.zeroize();
+        }
+        if let Some(value) = &mut self.ec_params {
+            value.zeroize();
+        }
+        if let Some(value) = &mut self.ec_point {
+            value.zeroize();
+        }
+        for value in self.extra_attributes.values_mut() {
+            value.zeroize();
+        }
+    }
 }
 
 impl StoredObject {

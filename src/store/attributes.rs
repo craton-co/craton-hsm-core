@@ -3,7 +3,6 @@
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::sync::Arc;
-use zeroize::Zeroize;
 
 use crate::error::{HsmError, HsmResult};
 use crate::pkcs11_abi::constants::*;
@@ -162,15 +161,10 @@ impl ObjectStore {
 
         for store_key in keys {
             if let Some(data) = store.load_encrypted(&store_key, key)? {
-                // `data` is Zeroizing<Vec<u8>> — automatically zeroized on drop.
-                //
-                // KNOWN RESIDUAL RISK: serde_json internally allocates temporary
-                // buffers during parsing (e.g., for string unescaping). These
-                // intermediate allocations may contain key material fragments and
-                // are not zeroized when freed. This is inherent to serde_json's
-                // design and cannot be fixed without a custom binary deserializer.
-                // Mitigated by mlock on RawKeyMaterial post-deserialization.
-                let result = serde_json::from_slice::<StoredObject>(&data);
+                // The codec reads key bytes directly into RawKeyMaterial; it does
+                // not use a generic deserializer that could leave heap copies of
+                // secret material outside a zeroizing allocation.
+                let result = crate::store::object_codec::decode(&data);
                 match result {
                     Ok(obj) => {
                         // Defense-in-depth: verify critical security invariants
@@ -231,11 +225,9 @@ impl ObjectStore {
         }
         .unwrap_or_else(|| self.generate_store_key(obj.handle));
 
-        match serde_json::to_vec(obj) {
-            Ok(mut data) => {
+        match crate::store::object_codec::encode(obj) {
+            Ok(data) => {
                 let result = store.store_encrypted(&store_key, &data, key);
-                // Zeroize serialized plaintext containing key material before dropping
-                data.zeroize();
                 if let Err(e) = result {
                     tracing::error!("Failed to persist object {}: {:?}", obj.handle, e);
                 }
