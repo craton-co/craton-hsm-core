@@ -334,11 +334,11 @@ fn test_aes_ctr_128_roundtrip() {
     let iv = [0x66u8; 16];
     let plaintext = b"AES-CTR-128 test message";
 
-    let ciphertext = encrypt::aes_ctr_crypt(key.as_bytes(), &iv, plaintext).unwrap();
+    let ciphertext = encrypt::aes_ctr_encrypt(key.as_bytes(), &iv, plaintext).unwrap();
     assert_ne!(ciphertext.as_slice(), plaintext.as_slice());
     assert_eq!(ciphertext.len(), plaintext.len()); // CTR is a stream cipher
 
-    let decrypted = encrypt::aes_ctr_crypt(key.as_bytes(), &iv, &ciphertext).unwrap();
+    let decrypted = encrypt::aes_ctr_decrypt(key.as_bytes(), &iv, &ciphertext).unwrap();
     assert_eq!(decrypted, plaintext);
 }
 
@@ -348,8 +348,8 @@ fn test_aes_ctr_256_roundtrip() {
     let iv = [0xABu8; 16];
     let plaintext = b"AES-CTR-256 test message for roundtrip";
 
-    let ciphertext = encrypt::aes_ctr_crypt(key.as_bytes(), &iv, plaintext).unwrap();
-    let decrypted = encrypt::aes_ctr_crypt(key.as_bytes(), &iv, &ciphertext).unwrap();
+    let ciphertext = encrypt::aes_ctr_encrypt(key.as_bytes(), &iv, plaintext).unwrap();
+    let decrypted = encrypt::aes_ctr_decrypt(key.as_bytes(), &iv, &ciphertext).unwrap();
     assert_eq!(decrypted, plaintext);
 }
 
@@ -359,11 +359,13 @@ fn test_aes_ctr_no_padding() {
     let iv = [0x77u8; 16];
 
     // CTR mode: ciphertext length == plaintext length (no padding)
-    for len in [1, 7, 15, 16, 17, 31, 100] {
+    for (index, len) in [1, 7, 15, 16, 17, 31, 100].into_iter().enumerate() {
+        let mut iv = iv;
+        iv[0] = iv[0].wrapping_add(index as u8);
         let plaintext = vec![0x55u8; len];
-        let ciphertext = encrypt::aes_ctr_crypt(key.as_bytes(), &iv, &plaintext).unwrap();
+        let ciphertext = encrypt::aes_ctr_encrypt(key.as_bytes(), &iv, &plaintext).unwrap();
         assert_eq!(ciphertext.len(), plaintext.len());
-        let decrypted = encrypt::aes_ctr_crypt(key.as_bytes(), &iv, &ciphertext).unwrap();
+        let decrypted = encrypt::aes_ctr_decrypt(key.as_bytes(), &iv, &ciphertext).unwrap();
         assert_eq!(decrypted, plaintext);
     }
 }
@@ -374,7 +376,7 @@ fn test_aes_ctr_invalid_iv_length() {
     let short_iv = [0u8; 12]; // CTR needs 16-byte IV
     let plaintext = b"test";
 
-    let result = encrypt::aes_ctr_crypt(key.as_bytes(), &short_iv, plaintext);
+    let result = encrypt::aes_ctr_encrypt(key.as_bytes(), &short_iv, plaintext);
     assert!(result.is_err(), "Short IV should be rejected for CTR mode");
 }
 

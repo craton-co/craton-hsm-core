@@ -691,6 +691,7 @@ pub fn aes_ctr_decrypt(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> HsmResult<Ve
 /// This function provides **zero nonce-reuse protection**. Nonce reuse in CTR
 /// mode is catastrophic (two-time pad → full plaintext recovery). Migrate to
 /// [`aes_ctr_encrypt`] / [`aes_ctr_decrypt`] immediately.
+#[cfg(feature = "legacy-insecure-ctr")]
 #[deprecated(
     since = "0.2.0",
     note = "Use aes_ctr_encrypt/aes_ctr_decrypt for nonce-reuse protection. \
