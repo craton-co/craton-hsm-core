@@ -21,6 +21,13 @@ default = ["rustcrypto-backend"]
 rustcrypto-backend = []
 awslc-backend = ["dep:aws-lc-rs"]
 fips = []
+# Opt-in compatibility escape hatch for applications that have completed
+# their own nonce-management review. Never enable this in an HSM deployment.
+legacy-insecure-ctr = []
+# Development-only escape hatch for interoperability tests that must exercise
+# RustCrypto RSA private-key operations. Release HSM builds must use a hardened
+# backend such as aws-lc-rs for RSA private operations instead.
+insecure-rustcrypto-rsa-private-ops = []
 
 [dependencies]
 # Cryptographic primitives

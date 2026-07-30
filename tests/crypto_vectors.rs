@@ -285,14 +285,13 @@ fn test_aes_256_ctr_nist_kat() {
     )
     .unwrap();
 
-    let ciphertext = encrypt::aes_ctr_crypt(&key, &iv, &plaintext).unwrap();
+    let ciphertext = encrypt::aes_ctr_encrypt(&key, &iv, &plaintext).unwrap();
     assert_eq!(
         ciphertext, expected_ct,
         "AES-256-CTR must match NIST SP 800-38A F.5.5"
     );
 
-    // CTR mode: encrypt again to decrypt
-    let decrypted = encrypt::aes_ctr_crypt(&key, &iv, &ciphertext).unwrap();
+    let decrypted = encrypt::aes_ctr_decrypt(&key, &iv, &ciphertext).unwrap();
     assert_eq!(
         decrypted, plaintext,
         "AES-256-CTR decrypt must match original plaintext"
