@@ -79,8 +79,13 @@ See [FIPS Mode Guide](fips-mode-guide.md) for deployment details.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `bind` | string | `"127.0.0.1:5696"` | gRPC listen address and port |
-| `tls_cert` | string | *(none)* | Path to PEM certificate file for mutual TLS |
-| `tls_key` | string | *(none)* | Path to PEM private key file for mutual TLS |
+| `tls_cert` | string | *(none)* | Path to PEM server certificate file |
+| `tls_key` | string | *(none)* | Path to PEM server private-key file |
+| `tls_client_ca` | string | *(none)* | PEM CA bundle for mandatory client-certificate validation (mTLS) on non-loopback binds |
+| `tls_client_crl` | string | *(none)* | PEM/DER client-certificate revocation list, used with `tls_client_ca` |
+| `allow_unauthenticated_tls` | bool | `false` | Explicitly permit server-authentication-only TLS on a non-loopback bind; only use behind an independent access-control boundary |
+
+TLS on `127.0.0.1` and `[::1]` may omit `tls_client_ca` for local development. Any non-loopback TLS listener fails closed without mTLS unless `allow_unauthenticated_tls = true` is explicitly set.
 
 ## Example: Default Configuration
 

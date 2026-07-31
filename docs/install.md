@@ -114,6 +114,7 @@ log_level = "all"                    # "all" | "crypto" | "auth" | "admin" | "no
 bind = "127.0.0.1:5696"
 tls_cert = "tls.crt"                # PEM certificate
 tls_key = "tls.key"                  # PEM private key
+tls_client_ca = "clients-ca.crt"     # Required for a non-loopback bind (mTLS)
 ```
 
 All fields have sensible defaults. A missing config file is not an error — Craton HSM starts with built-in defaults.

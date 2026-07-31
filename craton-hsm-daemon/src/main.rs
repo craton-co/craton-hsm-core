@@ -130,6 +130,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Configure TLS — mandatory for production security
     if let (Some(cert), Some(key)) = (&full_config.daemon.tls_cert, &full_config.daemon.tls_key) {
+        if full_config.daemon.tls_client_ca.is_none()
+            && !full_config.daemon.permits_unauthenticated_tls()
+        {
+            tracing::error!(
+                "Refusing server-authentication-only TLS on non-loopback bind '{}'. \
+                 Configure [daemon] tls_client_ca for mTLS, or explicitly set \
+                 allow_unauthenticated_tls = true when an independent access-control \
+                 boundary protects this listener.",
+                full_config.daemon.bind
+            );
+            std::process::exit(1);
+        }
         // (#2-fix) Build the rustls ServerConfig directly via tls module, which
         // enforces TLS 1.3 minimum, mTLS with client CA, and CRL revocation
         // checking. Previously, a validated config was built but discarded, and

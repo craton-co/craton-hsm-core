@@ -15,6 +15,12 @@ pub struct DaemonConfig {
     /// client certificates (mutual TLS). When set, clients must present a
     /// certificate signed by this CA. Strongly recommended for production.
     pub tls_client_ca: Option<String>,
+    /// Permit TLS without client authentication on a non-loopback TCP bind.
+    /// This is disabled by default because a remotely reachable HSM must have
+    /// a transport-layer client authentication boundary. Set this only when
+    /// an independently enforced network access-control layer is in place.
+    #[serde(default)]
+    pub allow_unauthenticated_tls: bool,
     /// Path to a PEM/DER file containing Certificate Revocation Lists (CRLs)
     /// for client certificate validation. Only effective when tls_client_ca is set.
     pub tls_client_crl: Option<String>,
@@ -120,6 +126,7 @@ impl Default for DaemonConfig {
             tls_cert: None,
             tls_key: None,
             tls_client_ca: None,
+            allow_unauthenticated_tls: false,
             tls_client_crl: None,
             max_random_length: default_max_random_length(),
             max_digest_length: default_max_digest_length(),
@@ -177,6 +184,13 @@ impl DaemonConfig {
             .parse::<SocketAddr>()
             .map(|addr| addr.ip().is_loopback())
             .unwrap_or(false)
+    }
+
+    /// Returns whether server-authentication-only TLS is permitted for this
+    /// bind. Loopback use is safe for local development; any network-reachable
+    /// bind needs mTLS unless the operator explicitly acknowledges the risk.
+    pub fn permits_unauthenticated_tls(&self) -> bool {
+        self.is_loopback_bind() || self.allow_unauthenticated_tls
     }
 }
 
@@ -242,6 +256,25 @@ mod tests {
         "#;
         let cfg: FullConfig = toml::from_str(toml).expect("parse");
         assert!(cfg.daemon.bind_unix.is_none());
+    }
+
+    #[test]
+    fn unauthenticated_tls_is_rejected_for_non_loopback_by_default() {
+        let cfg = DaemonConfig {
+            bind: "0.0.0.0:5696".to_string(),
+            ..DaemonConfig::default()
+        };
+        assert!(!cfg.permits_unauthenticated_tls());
+    }
+
+    #[test]
+    fn unauthenticated_tls_requires_explicit_override_for_non_loopback() {
+        let cfg = DaemonConfig {
+            bind: "192.0.2.10:5696".to_string(),
+            allow_unauthenticated_tls: true,
+            ..DaemonConfig::default()
+        };
+        assert!(cfg.permits_unauthenticated_tls());
     }
 
     /// When `bind_unix` is explicitly set, `resolved_unix_socket_path` returns
