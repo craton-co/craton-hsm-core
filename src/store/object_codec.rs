@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use zeroize::Zeroizing;
 
 use crate::error::{HsmError, HsmResult};
+use crate::pkcs11_abi::types::CK_ULONG;
 use crate::store::key_material::RawKeyMaterial;
 use crate::store::object::{KeyLifecycleState, StoredObject};
 
@@ -20,14 +21,34 @@ const MAX_OBJECT_BYTES: usize = 1 << 20;
 const MAX_FIELD_BYTES: usize = 64 << 10;
 const MAX_ATTRIBUTES: usize = 64;
 
+// `CK_ULONG` is `std::ffi::c_ulong`: 32 bits on Windows (LLP64) but 64 bits
+// on Linux/macOS (LP64). Object handles in particular are Feistel-scrambled
+// over the full native width for opacity, so on a 64-bit target they
+// routinely exceed `u32::MAX`. The wire format is therefore a fixed 64-bit
+// little-endian value on every platform: infallible to widen on encode,
+// and only fallible to narrow on decode when CK_ULONG itself is 32 bits
+// (which never actually fails for values this codec itself produced).
+fn ulong_to_u64(value: CK_ULONG) -> u64 {
+    u64::from(value)
+}
+fn u64_to_ulong(value: u64) -> HsmResult<CK_ULONG> {
+    CK_ULONG::try_from(value).map_err(|_| HsmError::DataLenRange)
+}
+fn opt_ulong_to_u64(value: Option<CK_ULONG>) -> Option<u64> {
+    value.map(ulong_to_u64)
+}
+fn opt_u64_to_ulong(value: Option<u64>) -> HsmResult<Option<CK_ULONG>> {
+    value.map(u64_to_ulong).transpose()
+}
+
 pub(crate) fn encode(obj: &StoredObject) -> HsmResult<Zeroizing<Vec<u8>>> {
     let mut out = Zeroizing::new(Vec::with_capacity(512));
     out.extend_from_slice(MAGIC);
     put_u8(&mut out, VERSION);
-    put_u32(&mut out, obj.handle);
-    put_u32(&mut out, obj.slot_id);
-    put_u32(&mut out, obj.class);
-    put_opt_u32(&mut out, obj.key_type);
+    put_u64(&mut out, ulong_to_u64(obj.handle));
+    put_u64(&mut out, ulong_to_u64(obj.slot_id));
+    put_u64(&mut out, ulong_to_u64(obj.class));
+    put_opt_u64(&mut out, opt_ulong_to_u64(obj.key_type));
     put_bytes(&mut out, &obj.label)?;
     put_bytes(&mut out, &obj.id)?;
     for value in [
@@ -51,11 +72,11 @@ pub(crate) fn encode(obj: &StoredObject) -> HsmResult<Zeroizing<Vec<u8>>> {
     put_opt_key_material(&mut out, obj.key_material.as_ref())?;
     put_opt_bytes(&mut out, obj.public_key_data.as_deref())?;
     put_opt_bytes(&mut out, obj.modulus.as_deref())?;
-    put_opt_u32(&mut out, obj.modulus_bits);
+    put_opt_u64(&mut out, opt_ulong_to_u64(obj.modulus_bits));
     put_opt_bytes(&mut out, obj.public_exponent.as_deref())?;
     put_opt_bytes(&mut out, obj.ec_params.as_deref())?;
     put_opt_bytes(&mut out, obj.ec_point.as_deref())?;
-    put_opt_u32(&mut out, obj.value_len);
+    put_opt_u64(&mut out, opt_ulong_to_u64(obj.value_len));
     if obj.extra_attributes.len() > MAX_ATTRIBUTES {
         return Err(HsmError::DataLenRange);
     }
@@ -63,7 +84,7 @@ pub(crate) fn encode(obj: &StoredObject) -> HsmResult<Zeroizing<Vec<u8>>> {
     attributes.sort_unstable_by_key(|(key, _)| **key);
     put_u32(&mut out, attributes.len() as u32);
     for (key, value) in attributes {
-        put_u32(&mut out, *key);
+        put_u64(&mut out, ulong_to_u64(*key));
         put_bytes(&mut out, value)?;
     }
     put_opt_date(&mut out, obj.start_date);
@@ -93,10 +114,10 @@ pub(crate) fn decode(data: &[u8]) -> HsmResult<StoredObject> {
     if reader.take_exact(4)? != MAGIC || reader.take_u8()? != VERSION {
         return Err(HsmError::DataInvalid);
     }
-    let handle = reader.take_u32()?;
-    let slot_id = reader.take_u32()?;
-    let class = reader.take_u32()?;
-    let key_type = reader.take_opt_u32()?;
+    let handle = u64_to_ulong(reader.take_u64()?)?;
+    let slot_id = u64_to_ulong(reader.take_u64()?)?;
+    let class = u64_to_ulong(reader.take_u64()?)?;
+    let key_type = opt_u64_to_ulong(reader.take_opt_u64()?)?;
     let label = reader.take_vec()?;
     let id = reader.take_vec()?;
     let token_object = reader.take_bool()?;
@@ -116,18 +137,18 @@ pub(crate) fn decode(data: &[u8]) -> HsmResult<StoredObject> {
     let key_material = reader.take_opt_key_material()?;
     let public_key_data = reader.take_opt_vec()?;
     let modulus = reader.take_opt_vec()?;
-    let modulus_bits = reader.take_opt_u32()?;
+    let modulus_bits = opt_u64_to_ulong(reader.take_opt_u64()?)?;
     let public_exponent = reader.take_opt_vec()?;
     let ec_params = reader.take_opt_vec()?;
     let ec_point = reader.take_opt_vec()?;
-    let value_len = reader.take_opt_u32()?;
+    let value_len = opt_u64_to_ulong(reader.take_opt_u64()?)?;
     let attribute_count = reader.take_u32()? as usize;
     if attribute_count > MAX_ATTRIBUTES {
         return Err(HsmError::DataLenRange);
     }
     let mut extra_attributes = HashMap::with_capacity(attribute_count);
     for _ in 0..attribute_count {
-        let key = reader.take_u32()?;
+        let key = u64_to_ulong(reader.take_u64()?)?;
         let value = reader.take_vec()?;
         if extra_attributes.insert(key, value).is_some() {
             return Err(HsmError::DataInvalid);
@@ -196,11 +217,11 @@ fn put_u32(out: &mut Vec<u8>, value: u32) {
 fn put_u64(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_le_bytes());
 }
-fn put_opt_u32(out: &mut Vec<u8>, value: Option<u32>) {
+fn put_opt_u64(out: &mut Vec<u8>, value: Option<u64>) {
     match value {
         Some(v) => {
             put_u8(out, 1);
-            put_u32(out, v);
+            put_u64(out, v);
         }
         None => put_u8(out, 0),
     }
@@ -285,10 +306,10 @@ impl<'a> Reader<'a> {
                 .map_err(|_| HsmError::DataInvalid)?,
         ))
     }
-    fn take_opt_u32(&mut self) -> HsmResult<Option<u32>> {
+    fn take_opt_u64(&mut self) -> HsmResult<Option<u64>> {
         match self.take_u8()? {
             0 => Ok(None),
-            1 => self.take_u32().map(Some),
+            1 => self.take_u64().map(Some),
             _ => Err(HsmError::DataInvalid),
         }
     }
@@ -347,6 +368,18 @@ mod tests {
             &[0xA5; 32]
         );
         assert_eq!(decoded.extra_attributes.get(&42), Some(&vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn round_trip_preserves_max_width_handle() {
+        // Object handles are Feistel-scrambled over the full native CK_ULONG
+        // width for opacity, so on 64-bit targets they routinely exceed
+        // `u32::MAX`. Exercise the largest possible native value to guard
+        // against a codec that silently clamps to 32 bits on encode.
+        let object = StoredObject::new(CK_ULONG::MAX, CKO_SECRET_KEY);
+        let encoded = encode(&object).expect("encode");
+        let decoded = decode(&encoded).expect("decode");
+        assert_eq!(decoded.handle, CK_ULONG::MAX);
     }
 
     #[test]

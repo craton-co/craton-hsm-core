@@ -37,3 +37,4 @@ libc = "0.2"
 
 [build-dependencies]
 tonic-prost-build = "0.14"
+protoc-bin-vendored = "3"
