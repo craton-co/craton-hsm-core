@@ -75,6 +75,12 @@ fn cleanup(session: CK_SESSION_HANDLE) {
 
 /// Generate RSA key pair → pairwise test runs → sign/verify roundtrip succeeds.
 #[test]
+#[cfg_attr(
+    not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+    ignore = "needs RustCrypto RSA private-key operations, which release builds \
+              refuse (RUSTSEC-2023-0071); run in debug or with \
+              --features insecure-rustcrypto-rsa-private-ops"
+)]
 fn rsa_keygen_with_pairwise_test() {
     let session = init_and_login();
 

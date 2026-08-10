@@ -269,6 +269,12 @@ mod tests {
 
     #[cfg(feature = "rustcrypto-backend")]
     #[test]
+    #[cfg_attr(
+        not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+        ignore = "RustCrypto RSA private-key operations are refused in release builds \
+                  (RUSTSEC-2023-0071); run in debug or with \
+                  --features insecure-rustcrypto-rsa-private-ops"
+    )]
     fn test_rsa_pairwise() {
         use crate::crypto::rustcrypto_backend::RustCryptoBackend;
         let backend = RustCryptoBackend;

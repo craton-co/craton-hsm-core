@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Craton Software Company
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use std::hint::black_box;
 use std::sync::Arc;
 
 use craton_hsm::crypto::backend::CryptoBackend;
@@ -9,10 +10,48 @@ use craton_hsm::crypto::{digest, encrypt, keygen, sign};
 use craton_hsm::pkcs11_abi::constants::*;
 
 // ============================================================================
+// RSA private-key capability probe
+// ============================================================================
+
+/// Whether this build can perform RustCrypto RSA private-key operations.
+///
+/// Release builds refuse them because the `rsa` crate is subject to the Marvin
+/// timing attack (RUSTSEC-2023-0071); see `require_rustcrypto_rsa_private_ops`
+/// in `src/crypto/sign.rs`. `cargo bench` always builds in release, so without
+/// this probe the RSA setup panics and takes the whole suite down with it --
+/// including the AES, digest, PQC, and audit groups that do not involve RSA.
+///
+/// Probed once by generating a key and attempting one signature.
+fn rsa_private_ops_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        let Ok((priv_key, _, _)) = keygen::generate_rsa_key_pair(2048, false) else {
+            return false;
+        };
+        let ok = sign::rsa_pkcs1v15_sign(priv_key.as_bytes(), &[0u8; 32], Some(sign::HashAlg::Sha256))
+            .is_ok();
+        if !ok {
+            eprintln!(
+                "note: skipping RSA benchmarks -- this build refuses RustCrypto RSA \
+                 private-key operations (RUSTSEC-2023-0071).\n\
+                 note: measure RSA with the hardened backend:\n\
+                 note:   cargo bench --bench crypto_bench --no-default-features --features awslc-backend\n\
+                 note: or, for RustCrypto coverage only:\n\
+                 note:   cargo bench --bench crypto_bench --features insecure-rustcrypto-rsa-private-ops"
+            );
+        }
+        ok
+    })
+}
+
+// ============================================================================
 // RSA Benchmarks
 // ============================================================================
 
 fn bench_rsa_sign(c: &mut Criterion) {
+    if !rsa_private_ops_available() {
+        return;
+    }
     let mut group = c.benchmark_group("rsa_sign");
     for bits in [2048u32, 4096] {
         let (priv_key, _modulus, _pub_exp) = keygen::generate_rsa_key_pair(bits, false).unwrap();
@@ -34,6 +73,11 @@ fn bench_rsa_sign(c: &mut Criterion) {
 }
 
 fn bench_rsa_verify(c: &mut Criterion) {
+    // Verification itself is a public-key operation, but producing the
+    // signature to verify is not.
+    if !rsa_private_ops_available() {
+        return;
+    }
     let mut group = c.benchmark_group("rsa_verify");
     for bits in [2048u32, 4096] {
         let (priv_key, modulus, pub_exp) = keygen::generate_rsa_key_pair(bits, false).unwrap();
@@ -356,6 +400,9 @@ fn get_backends() -> Vec<(&'static str, Arc<dyn CryptoBackend>)> {
 }
 
 fn bench_backend_rsa_sign(c: &mut Criterion) {
+    if !rsa_private_ops_available() {
+        return;
+    }
     let mut group = c.benchmark_group("backend_rsa_sign_2048");
     for (name, backend) in get_backends() {
         let (priv_key, _modulus, _pub_exp) = backend.generate_rsa_key_pair(2048, false).unwrap();
@@ -378,6 +425,9 @@ fn bench_backend_rsa_sign(c: &mut Criterion) {
 }
 
 fn bench_backend_rsa_verify(c: &mut Criterion) {
+    if !rsa_private_ops_available() {
+        return;
+    }
     let mut group = c.benchmark_group("backend_rsa_verify_2048");
     for (name, backend) in get_backends() {
         let (priv_key, modulus, pub_exp) = backend.generate_rsa_key_pair(2048, false).unwrap();
@@ -546,6 +596,144 @@ fn bench_backend_keygen_ec_p256(c: &mut Criterion) {
 }
 
 // ============================================================================
+// Audit trail
+//
+// The audit trail is on the critical path of every PKCS#11 cryptographic call,
+// so its throughput is an upper bound on the module's. These benchmarks exist
+// because that bound was once ~760 operations/second — the worker opened,
+// wrote, and fsynced the log file once per event — and nothing measured it.
+// ============================================================================
+
+use craton_hsm::audit::log::{AuditLog, AuditOperation, AuditResult};
+
+/// A representative event: the shape emitted by `C_Digest`.
+fn sample_op() -> AuditOperation {
+    AuditOperation::Digest {
+        mechanism: 0x250,
+        fips_approved: true,
+    }
+}
+
+/// Create a process-unique audit log path under the Criterion target dir.
+fn bench_audit_path(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join("craton_hsm_audit_bench");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join(format!("{}_{}.jsonl", tag, std::process::id()))
+}
+
+/// Per-event CPU cost with no disk involved: chain hash plus the state lock.
+///
+/// This isolates the canonical payload encoding and SHA-256 from I/O. It is the
+/// number that moves when the chain encoding changes.
+fn bench_audit_record_in_memory(c: &mut Criterion) {
+    let mut group = c.benchmark_group("audit_record_in_memory");
+    // Batch the work: a single `record` call only enqueues, so measuring one
+    // in isolation measures the channel, not the worker. Enqueue a block and
+    // flush, so the cost attributed per iteration is the worker's real cost.
+    const BATCH: usize = 200;
+    group.throughput(criterion::Throughput::Elements(BATCH as u64));
+    group.bench_function("200_events", |b| {
+        b.iter_batched(
+            || {
+                let log = AuditLog::new();
+                // Warm the worker: `AuditLog::new` spawns a thread, and waiting
+                // for that thread's first scheduling costs more than the 200
+                // events being measured. Recording and flushing one event in
+                // setup keeps thread startup out of the timed region.
+                log.record(0, sample_op(), AuditResult::Success, None)
+                    .unwrap();
+                log.flush().unwrap();
+                log
+            },
+            |log| {
+                for i in 0..BATCH {
+                    log.record(i as u64, sample_op(), AuditResult::Success, None)
+                        .unwrap();
+                }
+                log.flush().unwrap();
+                log
+            },
+            criterion::BatchSize::SmallInput,
+        )
+    });
+    group.finish();
+}
+
+/// Sustained throughput of the asynchronous path with disk persistence.
+///
+/// This is the module's operation ceiling: every `C_Sign`, `C_Encrypt`, and
+/// `C_Digest` enqueues one event, and the single worker thread must keep up.
+/// The `flush()` is what makes this a throughput measurement rather than an
+/// enqueue measurement — without it, the events would simply pile up in the
+/// channel.
+///
+/// A regression here means the worker stopped coalescing `fsync`s.
+///
+/// # What this number is and is not
+///
+/// Each iteration gets a **fresh** log file so the benchmark is reproducible
+/// and does not grow without bound. That makes its absolute value pessimistic:
+/// `fsync` on a file that is still being extended costs considerably more than
+/// on an established one, and a production audit log is long-lived. Read this
+/// as a relative gate against previous runs of the same benchmark, not as the
+/// throughput a deployment will see.
+fn bench_audit_record_to_disk(c: &mut Criterion) {
+    let mut group = c.benchmark_group("audit_record_to_disk");
+    const BATCH: usize = 200;
+    group.throughput(criterion::Throughput::Elements(BATCH as u64));
+    group.sample_size(20); // fsync-bound; the default 100 samples is slow
+    group.bench_function("200_events", |b| {
+        b.iter_batched(
+            || {
+                let path = bench_audit_path("async");
+                let _ = std::fs::remove_file(&path);
+                let log = AuditLog::new_with_path(path).unwrap();
+                // Warm the worker *and* the file handle. The worker opens the
+                // log lazily on its first write, and on Windows that first open
+                // also hardens the file ACL — both one-time costs that would
+                // otherwise be charged to the batch being measured.
+                log.record_sync(0, sample_op(), AuditResult::Success, None)
+                    .unwrap();
+                log
+            },
+            |log| {
+                for i in 0..BATCH {
+                    log.record(i as u64, sample_op(), AuditResult::Success, None)
+                        .unwrap();
+                }
+                log.flush().unwrap();
+                log
+            },
+            criterion::BatchSize::PerIteration,
+        )
+    });
+    group.finish();
+}
+
+/// Latency of a single durable audit write.
+///
+/// `record_sync` is used for security-relevant operations (login, key
+/// destruction, token init) which must not be acknowledged before their
+/// forensic record is on stable storage. This measures the uncoalesced case —
+/// one caller, nothing queued behind it — so it is dominated by one `fsync`.
+fn bench_audit_record_sync(c: &mut Criterion) {
+    let mut group = c.benchmark_group("audit_record_sync");
+    group.sample_size(20); // one fsync per iteration
+    group.bench_function("single_event", |b| {
+        let path = bench_audit_path("sync");
+        let _ = std::fs::remove_file(&path);
+        let log = AuditLog::new_with_path(path).unwrap();
+        let mut i = 0u64;
+        b.iter(|| {
+            i += 1;
+            log.record_sync(i, sample_op(), AuditResult::Success, None)
+                .unwrap();
+        })
+    });
+    group.finish();
+}
+
+// ============================================================================
 // Criterion Groups
 // ============================================================================
 
@@ -572,6 +760,13 @@ criterion_group!(
 );
 
 criterion_group!(
+    audit_benches,
+    bench_audit_record_in_memory,
+    bench_audit_record_to_disk,
+    bench_audit_record_sync,
+);
+
+criterion_group!(
     backend_comparison,
     bench_backend_rsa_sign,
     bench_backend_rsa_verify,
@@ -592,5 +787,6 @@ criterion_main!(
     aes_benches,
     digest_benches,
     pqc_benches,
+    audit_benches,
     backend_comparison,
 );

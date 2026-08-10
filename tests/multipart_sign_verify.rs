@@ -374,6 +374,12 @@ fn multi_part_verify(
 }
 
 #[test]
+#[cfg_attr(
+    not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+    ignore = "needs RustCrypto RSA private-key operations, which release builds \
+              refuse (RUSTSEC-2023-0071); run in debug or with \
+              --features insecure-rustcrypto-rsa-private-ops"
+)]
 fn test_multipart_sign_verify() {
     let session = setup_session();
     let (rsa_pub, rsa_priv) = generate_rsa_key_pair(session);
@@ -633,6 +639,12 @@ fn test_multipart_sign_verify() {
 // a slice aliasing unrelated memory; the fix mirrors C_Verify's existing
 // cap, returning CKR_DATA_LEN_RANGE without invoking the crypto backend.
 #[test]
+#[cfg_attr(
+    not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+    ignore = "needs RustCrypto RSA private-key operations, which release builds \
+              refuse (RUSTSEC-2023-0071); run in debug or with \
+              --features insecure-rustcrypto-rsa-private-ops"
+)]
 fn test_verify_final_rejects_oversize_signature_len() {
     let session = setup_session();
     let (rsa_pub, rsa_priv) = generate_rsa_key_pair(session);

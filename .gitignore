@@ -8,6 +8,7 @@ craton_hsm_store
 craton-hsm-core.bfg-report
 postman
 craton_hsm_audit.jsonl
+craton_hsm_audit.jsonl.*
 
 # IDE / editor config
 .cursor/

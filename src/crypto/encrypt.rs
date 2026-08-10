@@ -133,6 +133,18 @@ fn gcm_nonce_prefix(key: &[u8]) -> HsmResult<[u8; 4]> {
 ///
 /// This provides best-effort IV-reuse detection. For CBC, IV reuse leaks
 /// common plaintext prefixes. For CTR, IV reuse is catastrophic (two-time pad).
+///
+/// # Why this keeps `std::sync::Mutex`
+///
+/// `parking_lot::Mutex` is faster uncontended and is used elsewhere in the
+/// crate, but it deliberately has no poisoning. Poisoning is load-bearing
+/// here: if a thread panics while holding this lock, the IV set may be missing
+/// entries it should contain, and a silently-recovered lock would then accept
+/// an IV that had in fact already been used with this key — a two-time pad for
+/// CTR. `check_iv_reuse` therefore treats a poisoned lock as a hard failure.
+/// Do not swap this for `parking_lot` without replacing that fail-closed
+/// behaviour with an explicit equivalent. The lock is also not hot: the
+/// enclosing `Sha256::digest(key)` dominates its cost.
 static CBC_CTR_IV_TRACKER: std::sync::LazyLock<
     dashmap::DashMap<[u8; 32], Mutex<HashSet<[u8; 16]>>>,
 > = std::sync::LazyLock::new(dashmap::DashMap::new);

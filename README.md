@@ -19,7 +19,7 @@ Craton HSM provides a software-based implementation of the PKCS#11 Cryptographic
 ### Key Features
 
 - **Full PKCS#11 C ABI** with 70+ exported functions
-- **Classical cryptography**: RSA (2048/3072/4096), ECDSA (P-256/P-384), EdDSA (Ed25519), AES-256 (GCM/CBC/CTR)
+- **Classical cryptography**: RSA (2048/3072/4096) *(private-key operations need the `awslc-backend` feature — see note below)*, ECDSA (P-256/P-384), EdDSA (Ed25519), AES-256 (GCM/CBC/CTR)
 - **Post-quantum cryptography**: ML-KEM-768, ML-DSA-44/65/87, SLH-DSA-SHA2-128s, hybrid X25519+ML-KEM-768 *(PQC crates are at RC versions — API may change before 1.0; see [Known Issues](CHANGELOG.md))*
 - **Multi-part operations**: streaming sign/verify (SHA-256/384/512), streaming encrypt/decrypt (AES-CBC/CTR)
 - **SP 800-90A HMAC_DRBG** with prediction resistance and continuous health tests — all key generation routes through DRBG
@@ -31,6 +31,16 @@ Craton HSM provides a software-based implementation of the PKCS#11 Cryptographic
 - **Encrypted persistent storage**: AES-256-GCM with PBKDF2-derived keys
 - **gRPC daemon** with mutual TLS for remote HSM access
 - **Admin CLI** for token management, PIN operations, and diagnostics
+
+> **RSA private-key operations require the `awslc-backend` feature.**
+> Release builds of the default RustCrypto backend refuse RSA signing,
+> decryption, and key-pair generation with `CKR_MECHANISM_INVALID`, because the
+> `rsa` crate is subject to the Marvin timing attack (RUSTSEC-2023-0071) — a
+> threat model that applies directly to an HSM performing private-key operations
+> for remote callers. RSA signature *verification* and every other algorithm are
+> unaffected. Build with `--no-default-features --features awslc-backend` to use
+> RSA. See
+> [docs/troubleshooting.md](docs/troubleshooting.md#rsa-operations-return-ckr_mechanism_invalid).
 
 ## Quick Start
 

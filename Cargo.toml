@@ -135,3 +135,28 @@ strip = "symbols"
 [profile.bench]
 lto = "thin"
 codegen-units = 4
+
+# Release codegen with the symbols a profiler needs.
+#
+# `strip = "symbols"` on the release profile is deliberate for shipped
+# artifacts, but it makes `perf`, VTune, and `cargo flamegraph` report hex
+# addresses instead of function names. This profile keeps every release
+# optimisation and adds full debug info plus frame pointers, so sampled stacks
+# unwind correctly through inlined Rust frames without `--call-graph dwarf`.
+#
+#   cargo build --profile profiling
+#   cargo bench  --profile profiling   # if profiling a benchmark binary
+#
+# See docs/performance-tuning.md for the full profiling workflow.
+[profile.profiling]
+inherits = "release"
+debug = "full"
+strip = "none"
+# Keep LTO and codegen-units=1 so the profile reflects shipped codegen; the
+# only difference from `release` is symbol retention.
+
+# Profile-guided optimisation uses the same settings as `release`; the
+# instrumentation and profile-use flags are supplied via RUSTFLAGS by
+# scripts/pgo.sh so that the two PGO stages cannot be mixed up with an
+# ordinary release build in the same target directory.
+

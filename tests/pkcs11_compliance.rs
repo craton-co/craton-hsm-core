@@ -19,6 +19,12 @@ fn ck_ulong_bytes(val: CK_ULONG) -> Vec<u8> {
 // integrated test that exercises the full lifecycle.
 
 #[test]
+#[cfg_attr(
+    not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+    ignore = "needs RustCrypto RSA private-key operations, which release builds \
+              refuse (RUSTSEC-2023-0071); run in debug or with \
+              --features insecure-rustcrypto-rsa-private-ops"
+)]
 fn test_full_pkcs11_lifecycle() {
     // 1. C_GetFunctionList should work even before init
     let mut func_list: *mut CK_FUNCTION_LIST = ptr::null_mut();

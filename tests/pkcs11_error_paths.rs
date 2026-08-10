@@ -1212,3 +1212,109 @@ fn test_token_reinit_clears_objects() {
     );
     C_FindObjectsFinal(session2);
 }
+
+// ============================================================================
+// Unavailable mechanism must not poison the module
+// ============================================================================
+
+/// An unavailable mechanism must be *refused*, not attempted and then failed.
+///
+/// Release builds provide no RustCrypto RSA private-key capability
+/// (RUSTSEC-2023-0071 / Marvin). `C_GenerateKeyPair` used to generate the key
+/// anyway and let the FIPS pairwise consistency test fail, which is treated as
+/// a catastrophic cryptographic failure and latches the module error state — so
+/// one RSA key-pair attempt disabled *every* subsequent operation, including EC
+/// and AES, for the life of the process.
+///
+/// This test pins the distinction: an unavailable mechanism reports
+/// `CKR_MECHANISM_INVALID` and leaves the module fully usable. It passes either
+/// way, because the capability is build-dependent — what it forbids is failing
+/// with a *different* error, or bricking the module.
+#[test]
+fn test_unavailable_rsa_keygen_does_not_enter_error_state() {
+    let session = setup_user_session();
+
+    let modulus_bits = ck_ulong_bytes(2048);
+    let bool_true: CK_BBOOL = CK_TRUE;
+    let mut pub_template = vec![
+        CK_ATTRIBUTE {
+            attr_type: CKA_MODULUS_BITS,
+            p_value: modulus_bits.as_ptr() as CK_VOID_PTR,
+            value_len: modulus_bits.len() as CK_ULONG,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_VERIFY,
+            p_value: &bool_true as *const _ as CK_VOID_PTR,
+            value_len: 1,
+        },
+    ];
+    let mut priv_template = vec![CK_ATTRIBUTE {
+        attr_type: CKA_SIGN,
+        p_value: &bool_true as *const _ as CK_VOID_PTR,
+        value_len: 1,
+    }];
+    let mut mechanism = CK_MECHANISM {
+        mechanism: CKM_RSA_PKCS_KEY_PAIR_GEN,
+        p_parameter: ptr::null_mut(),
+        parameter_len: 0,
+    };
+    let mut rsa_pub: CK_OBJECT_HANDLE = 0;
+    let mut rsa_priv: CK_OBJECT_HANDLE = 0;
+    let rsa_rv = C_GenerateKeyPair(
+        session,
+        &mut mechanism,
+        pub_template.as_mut_ptr(),
+        pub_template.len() as CK_ULONG,
+        priv_template.as_mut_ptr(),
+        priv_template.len() as CK_ULONG,
+        &mut rsa_pub,
+        &mut rsa_priv,
+    );
+
+    assert!(
+        rsa_rv == CKR_OK || rsa_rv == CKR_MECHANISM_INVALID,
+        "RSA key-pair generation must either succeed or be refused with \
+         CKR_MECHANISM_INVALID; got 0x{:08X}. Any other code means the module \
+         attempted an operation it cannot perform.",
+        rsa_rv,
+    );
+
+    // Whatever happened above, an unrelated algorithm must still work. This is
+    // the assertion that actually catches the error-state regression.
+    let value_len = ck_ulong_bytes(32);
+    let mut aes_template = vec![
+        CK_ATTRIBUTE {
+            attr_type: CKA_VALUE_LEN,
+            p_value: value_len.as_ptr() as CK_VOID_PTR,
+            value_len: value_len.len() as CK_ULONG,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_ENCRYPT,
+            p_value: &bool_true as *const _ as CK_VOID_PTR,
+            value_len: 1,
+        },
+    ];
+    let mut aes_mech = CK_MECHANISM {
+        mechanism: CKM_AES_KEY_GEN,
+        p_parameter: ptr::null_mut(),
+        parameter_len: 0,
+    };
+    let mut aes_key: CK_OBJECT_HANDLE = 0;
+    let aes_rv = C_GenerateKey(
+        session,
+        &mut aes_mech,
+        aes_template.as_mut_ptr(),
+        aes_template.len() as CK_ULONG,
+        &mut aes_key,
+    );
+    assert_eq!(
+        aes_rv, CKR_OK,
+        "AES key generation must still succeed after an RSA key-pair attempt \
+         (0x{:08X}). A failure here means the RSA attempt latched the module \
+         error state and disabled every other algorithm.",
+        aes_rv,
+    );
+
+    let _ = C_DestroyObject(session, aes_key);
+    let _ = C_CloseSession(session);
+}

@@ -244,6 +244,12 @@ fn test_backup_wrong_passphrase_rejected() {
 // ============================================================================
 
 #[test]
+#[cfg_attr(
+    not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+    ignore = "RustCrypto RSA private-key operations are refused in release builds \
+              (RUSTSEC-2023-0071); run in debug or with \
+              --features insecure-rustcrypto-rsa-private-ops"
+)]
 fn test_unprefixed_rsa_signing_rejected() {
     let (priv_der, _modulus, _pub_exp) = keygen::generate_rsa_key_pair(2048, false).unwrap();
     let message = b"Test message";

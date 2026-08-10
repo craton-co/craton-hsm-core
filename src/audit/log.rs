@@ -25,10 +25,15 @@
 //   2. Rewrite `compute_chain_hash()` to use HMAC keyed by
 //      `audit_chain_key` instead of plain `Sha256`. Use `initial_chain_hash`
 //      for the H_0 case.
-//   3. Bump `AuditEvent.format_version` from 0 to
-//      `AUDIT_LOG_FORMAT_VERSION` once (2) lands.
-//   4. Update `verify_chain` / recovery to use HMAC and reject legacy v0
-//      records (or detect-and-warn, depending on operational policy).
+//   3. Bump `AUDIT_LOG_FORMAT_VERSION` to 2 (version 1 is now taken by the
+//      canonical binary payload encoding -- see `encode_payload_v1`). The
+//      HMAC should be computed over those same canonical bytes, not over
+//      JSON: `encode_payload_v1` is already injective and allocation-free,
+//      which is exactly what a MAC input wants.
+//   4. Update `verify_chain` / recovery to use HMAC for v2 records. Note
+//      that `compute_chain_hash_with` already dispatches on each record's
+//      own `format_version`, so adding a v2 arm is additive and does not
+//      break verification of existing v0/v1 files.
 //   5. Update `HsmCore::try_new[_with_backend]` to pass the derived key
 //      to the new `AuditLog::new` signature.
 //   6. Add tests: valid chain, tampered record, wrong-key verification,
@@ -55,11 +60,25 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// On-disk record format version. Bumped whenever the on-disk schema or the
 /// chain construction changes in an incompatible way. Files lacking this field
-/// (legacy SHA-256 chain) deserialize as `0` and are rejected by the verifier.
+/// deserialize as `0` and are still verifiable under the legacy rules, so an
+/// audit trail written by an older build keeps verifying after an upgrade.
 ///
-/// - `0`: legacy plain SHA-256 hash chain (no key). REJECTED on load.
-/// - `1`: HMAC-SHA-256 chain keyed off an HKDF-SHA-256 subkey of the
-///        per-instance `state_hmac_key`. See `derive_audit_chain_key`.
+/// - `0`: legacy chain — `SHA-256(previous_hash || serde_json(payload))`.
+///        Accepted for verification of pre-existing logs; never written.
+/// - `1`: current chain — `SHA-256(previous_hash || canonical(payload))`,
+///        where `canonical` is the fixed-width binary encoding implemented by
+///        [`encode_payload_v1`]. The JSON payload encoding it replaces cost
+///        ~2.2 us per event to produce and inflated the hashed input from
+///        ~40 to ~148 bytes; the binary encoding roughly halves the audit
+///        worker's per-event CPU.
+/// - `2`: RESERVED for the in-flight HMAC-SHA-256 chain migration (see the
+///        module-level `security/hmac-audit-chain` notes). That migration
+///        should MAC over the same [`encode_payload_v1`] canonical bytes
+///        rather than over JSON.
+///
+/// Records are always written at [`AUDIT_LOG_FORMAT_VERSION`]; the verifier
+/// dispatches on each record's own `format_version` so mixed-version files
+/// (an upgrade appending to an existing log) verify end to end.
 pub const AUDIT_LOG_FORMAT_VERSION: u32 = 1;
 
 /// HKDF "info" string used to derive the audit chain subkey from
@@ -116,6 +135,10 @@ fn initial_chain_hash(audit_key: &[u8; 32]) -> [u8; 32] {
 
 #[derive(Debug, Clone)]
 pub struct AuditEvent {
+    /// Chain construction used for this record. See
+    /// [`AUDIT_LOG_FORMAT_VERSION`]. Records read back from a legacy file
+    /// carry `0` and are verified under the legacy JSON rules.
+    pub format_version: u32,
     pub timestamp: u64,
     pub session_handle: u64,
     pub operation: AuditOperation,
@@ -143,7 +166,7 @@ impl Serialize for AuditEvent {
     {
         use serde::ser::SerializeStruct;
         let mut state = serializer.serialize_struct("AuditEvent", 7)?;
-        state.serialize_field("format_version", &0u32)?;
+        state.serialize_field("format_version", &self.format_version)?;
         state.serialize_field("timestamp", &self.timestamp)?;
         state.serialize_field("session_handle", &self.session_handle)?;
         state.serialize_field("operation", &self.operation)?;
@@ -161,6 +184,7 @@ impl<'de> Deserialize<'de> for AuditEvent {
     {
         let disk = AuditEventDisk::deserialize(deserializer)?;
         Ok(AuditEvent {
+            format_version: disk.format_version,
             timestamp: disk.timestamp,
             session_handle: disk.session_handle,
             operation: disk.operation,
@@ -187,7 +211,7 @@ struct AuditEventPayload<'a> {
 impl AuditEvent {
     fn payload(&self) -> AuditEventPayload<'_> {
         AuditEventPayload {
-            format_version: 0,
+            format_version: self.format_version,
             timestamp: self.timestamp,
             session_handle: self.session_handle,
             operation: &self.operation,
@@ -372,25 +396,224 @@ impl Default for AuditLog {
     }
 }
 
-/// Compute the chain hash for an event:
-/// `SHA-256(previous_hash || serialize(payload))`
+/// Canonical binary encoding of an audit event payload (format version 1).
 ///
-/// The payload excludes `previous_hash` to avoid circularity.
-fn compute_chain_hash(
+/// This replaces `serde_json` as the input to the chain hash. JSON was never a
+/// requirement of the chain — only of the on-disk NDJSON line, which is an
+/// interop contract with SIEM consumers and is deliberately left unchanged —
+/// but it cost ~2.2 us per event to produce and inflated the hashed input from
+/// ~40 bytes to ~148, roughly doubling the SHA-256 work on top.
+///
+/// # Canonicalisation
+///
+/// The encoding must be *injective*: two distinct payloads must never produce
+/// the same bytes, or an attacker could swap one event for another without
+/// breaking the chain. Injectivity here comes from three properties:
+///
+/// * every integer is written little-endian at a fixed width, so field
+///   boundaries are unambiguous without separators;
+/// * every variable-length field (`key_id`) is length-prefixed with a `u32`
+///   before its bytes, so `("ab", "c")` cannot collide with `("a", "bc")`;
+/// * every enum is written as a fixed one-byte tag followed by that variant's
+///   fixed-width fields, so no two variants share an encoding.
+///
+/// `format_version` is the first field, which domain-separates this encoding
+/// from any future one and makes a downgrade rewrite (re-labelling a v1 record
+/// as v0) change the hash.
+///
+/// # Stability
+///
+/// The tag values below are part of the on-disk format. They must never be
+/// renumbered or reused; new operations append new tags. Renumbering would
+/// silently invalidate every existing audit chain.
+fn encode_payload_v1(event: &AuditEvent, out: &mut Vec<u8>) {
+    out.extend_from_slice(&event.format_version.to_le_bytes());
+    out.extend_from_slice(&event.timestamp.to_le_bytes());
+    out.extend_from_slice(&event.session_handle.to_le_bytes());
+
+    encode_operation_v1(&event.operation, out);
+
+    match &event.key_id {
+        None => out.push(0),
+        Some(id) => {
+            out.push(1);
+            // `sanitize_audit_field` caps key_id at 256 chars, so the cast is
+            // lossless; saturate rather than wrap if that ever changes.
+            let bytes = id.as_bytes();
+            let len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&bytes[..len as usize]);
+        }
+    }
+
+    match &event.result {
+        AuditResult::Success => out.push(0),
+        AuditResult::Failure(rv) => {
+            out.push(1);
+            out.extend_from_slice(&rv.to_le_bytes());
+        }
+    }
+}
+
+/// Encode an [`AuditOperation`] as a stable one-byte tag plus fixed-width
+/// fields. See [`encode_payload_v1`] for the stability contract on these tags.
+fn encode_operation_v1(op: &AuditOperation, out: &mut Vec<u8>) {
+    /// Write the `fips_approved` flag shared by the mechanism-bearing variants.
+    fn mech(out: &mut Vec<u8>, tag: u8, mechanism: u64, fips_approved: bool) {
+        out.push(tag);
+        out.extend_from_slice(&mechanism.to_le_bytes());
+        out.push(u8::from(fips_approved));
+    }
+
+    match op {
+        AuditOperation::Initialize => out.push(1),
+        AuditOperation::Finalize => out.push(2),
+        AuditOperation::OpenSession { slot_id } => {
+            out.push(3);
+            out.extend_from_slice(&slot_id.to_le_bytes());
+        }
+        AuditOperation::CloseSession => out.push(4),
+        AuditOperation::Login { user_type } => {
+            out.push(5);
+            out.extend_from_slice(&user_type.to_le_bytes());
+        }
+        AuditOperation::Logout => out.push(6),
+        AuditOperation::InitToken { slot_id } => {
+            out.push(7);
+            out.extend_from_slice(&slot_id.to_le_bytes());
+        }
+        AuditOperation::InitPIN { slot_id } => {
+            out.push(8);
+            out.extend_from_slice(&slot_id.to_le_bytes());
+        }
+        AuditOperation::SetPIN => out.push(9),
+        AuditOperation::GenerateKey {
+            mechanism,
+            key_length,
+            fips_approved,
+        } => {
+            out.push(10);
+            out.extend_from_slice(&mechanism.to_le_bytes());
+            out.extend_from_slice(&key_length.to_le_bytes());
+            out.push(u8::from(*fips_approved));
+        }
+        AuditOperation::GenerateKeyPair {
+            mechanism,
+            key_length,
+            fips_approved,
+        } => {
+            out.push(11);
+            out.extend_from_slice(&mechanism.to_le_bytes());
+            out.extend_from_slice(&key_length.to_le_bytes());
+            out.push(u8::from(*fips_approved));
+        }
+        AuditOperation::Sign {
+            mechanism,
+            fips_approved,
+        } => mech(out, 12, *mechanism, *fips_approved),
+        AuditOperation::Verify {
+            mechanism,
+            fips_approved,
+        } => mech(out, 13, *mechanism, *fips_approved),
+        AuditOperation::Encrypt {
+            mechanism,
+            fips_approved,
+        } => mech(out, 14, *mechanism, *fips_approved),
+        AuditOperation::Decrypt {
+            mechanism,
+            fips_approved,
+        } => mech(out, 15, *mechanism, *fips_approved),
+        AuditOperation::Digest {
+            mechanism,
+            fips_approved,
+        } => mech(out, 16, *mechanism, *fips_approved),
+        AuditOperation::CreateObject => out.push(17),
+        AuditOperation::DestroyObject => out.push(18),
+        AuditOperation::GenerateRandom { length } => {
+            out.push(19);
+            out.extend_from_slice(&length.to_le_bytes());
+        }
+        AuditOperation::WrapKey {
+            mechanism,
+            fips_approved,
+        } => mech(out, 20, *mechanism, *fips_approved),
+        AuditOperation::UnwrapKey {
+            mechanism,
+            fips_approved,
+        } => mech(out, 21, *mechanism, *fips_approved),
+        AuditOperation::DeriveKey {
+            mechanism,
+            fips_approved,
+        } => mech(out, 22, *mechanism, *fips_approved),
+        AuditOperation::FindObjects { result_count } => {
+            out.push(23);
+            out.extend_from_slice(&result_count.to_le_bytes());
+        }
+        AuditOperation::GetAttributeValue => out.push(24),
+        AuditOperation::Zeroize { key_length } => {
+            out.push(25);
+            out.extend_from_slice(&key_length.to_le_bytes());
+        }
+    }
+}
+
+/// Compute the chain hash for an event:
+/// `SHA-256(previous_hash || encode(payload))`
+///
+/// The payload excludes `previous_hash` to avoid circularity. `encode` is
+/// selected by the event's own `format_version` so that a file containing both
+/// legacy (`0`, JSON) and current (`1`, canonical binary) records — which is
+/// exactly what an in-place upgrade produces — verifies end to end.
+///
+/// `scratch` is a caller-owned buffer reused across events; it is cleared on
+/// entry. [`compute_chain_hash`] wraps this for callers that do not have one.
+fn compute_chain_hash_with(
     previous_hash: &[u8; 32],
     event: &AuditEvent,
+    scratch: &mut Vec<u8>,
 ) -> Result<[u8; 32], crate::error::HsmError> {
-    let payload_bytes = serde_json::to_vec(&event.payload()).map_err(|e| {
-        tracing::error!("Audit event payload serialization failed: {}", e);
-        crate::error::HsmError::GeneralError
-    })?;
+    scratch.clear();
+    match event.format_version {
+        // Legacy: the payload was hashed in its `serde_json` encoding.
+        0 => {
+            serde_json::to_writer(&mut *scratch, &event.payload()).map_err(|e| {
+                tracing::error!("Audit event payload serialization failed: {}", e);
+                crate::error::HsmError::GeneralError
+            })?;
+        }
+        1 => encode_payload_v1(event, scratch),
+        other => {
+            tracing::error!(
+                "Audit event carries unsupported format_version {} (this build \
+                 writes {} and verifies 0..={})",
+                other,
+                AUDIT_LOG_FORMAT_VERSION,
+                AUDIT_LOG_FORMAT_VERSION,
+            );
+            return Err(crate::error::HsmError::AuditChainBroken(format!(
+                "unsupported audit record format_version {}",
+                other
+            )));
+        }
+    }
+
     let mut hasher = Sha256::new();
     hasher.update(previous_hash);
-    hasher.update(&payload_bytes);
+    hasher.update(&*scratch);
     let hash = hasher.finalize();
     let mut result = [0u8; 32];
     result.copy_from_slice(&hash);
     Ok(result)
+}
+
+/// Allocating convenience wrapper around [`compute_chain_hash_with`] for
+/// callers outside the audit worker's hot path.
+fn compute_chain_hash(
+    previous_hash: &[u8; 32],
+    event: &AuditEvent,
+) -> Result<[u8; 32], crate::error::HsmError> {
+    let mut scratch = Vec::with_capacity(64);
+    compute_chain_hash_with(previous_hash, event, &mut scratch)
 }
 
 /// Validate and canonicalize the audit log path.
@@ -491,10 +714,308 @@ fn open_audit_file(path: &Path) -> Result<std::fs::File, crate::error::HsmError>
     Ok(file)
 }
 
+/// Completion channel for a `record_sync` caller waiting on a batched event.
+type DoneTx = std::sync::mpsc::SyncSender<Result<(), crate::error::HsmError>>;
+
+/// Background audit worker state.
+///
+/// Owns the open log file handle and the reusable staging buffers so that the
+/// steady-state cost of an audit event is a chain-hash computation, an append
+/// into an existing `String`, and a share of one batched `write` + `fsync` —
+/// with no per-event `open()`, allocation, or syscall beyond that.
+struct AuditWorker {
+    state: Arc<RwLock<AuditLogState>>,
+    log_path: Option<PathBuf>,
+    tamper_flag: Arc<AtomicBool>,
+    /// Worker-local chain head. Advanced only once a batch is durable, so a
+    /// failed write never leaves the worker chaining from a hash that was
+    /// never persisted.
+    last_hash: [u8; 32],
+    last_timestamp: u64,
+    /// Log file, opened once and reused across events. `None` until the first
+    /// write, and after a rotation or an I/O error forces a reopen.
+    file: Option<std::fs::File>,
+    /// Cached size of `file`, maintained incrementally so the rotation check
+    /// does not need a `metadata()` syscall per event.
+    file_size: u64,
+    /// Reusable NDJSON staging buffer for the current batch.
+    line_buf: Vec<u8>,
+    /// Reusable canonical-payload buffer for chain-hash computation, so the
+    /// steady-state event path performs no allocation.
+    hash_buf: Vec<u8>,
+    /// Events accumulated in the current batch, pending durability.
+    batch: Vec<AuditEvent>,
+    /// Chain hash of the last event staged in the current batch.
+    batch_head: [u8; 32],
+    /// `record_sync` waiters for the current batch.
+    waiters: Vec<DoneTx>,
+}
+
+impl AuditWorker {
+    fn run(&mut self, receiver: &std::sync::mpsc::Receiver<AuditCommand>) {
+        loop {
+            // Block for the first command of a batch.
+            let first = match receiver.recv() {
+                Ok(cmd) => cmd,
+                // Channel closed — sender dropped. Exit the worker.
+                Err(_) => break,
+            };
+
+            let mut flush_acks: Vec<std::sync::mpsc::Sender<()>> = Vec::new();
+            self.stage(first, &mut flush_acks);
+
+            // Opportunistically coalesce everything already queued behind it.
+            while self.batch.len() < AuditLog::MAX_BATCH {
+                match receiver.try_recv() {
+                    Ok(cmd) => self.stage(cmd, &mut flush_acks),
+                    Err(_) => break,
+                }
+            }
+
+            self.commit_batch();
+
+            // Flush acknowledgements are sent after the batch is durable so
+            // that `flush()` still means "everything queued before me is on
+            // stable storage".
+            for ack in flush_acks {
+                let _ = ack.send(());
+            }
+        }
+    }
+
+    /// Add one command to the pending batch.
+    ///
+    /// `Record` commands are chained and serialized here; `Flush` commands are
+    /// recorded as acknowledgements to send once the batch is durable.
+    fn stage(&mut self, cmd: AuditCommand, flush_acks: &mut Vec<std::sync::mpsc::Sender<()>>) {
+        match cmd {
+            AuditCommand::Record {
+                session_handle,
+                operation,
+                result,
+                key_id,
+                done,
+            } => match self.chain_event(session_handle, operation, result, key_id) {
+                Ok(()) => {
+                    if let Some(tx) = done {
+                        self.waiters.push(tx);
+                    }
+                }
+                Err(e) => {
+                    // Chaining failed before any I/O — reject just this event;
+                    // the rest of the batch is unaffected.
+                    if let Some(tx) = done {
+                        let _ = tx.send(Err(e));
+                    }
+                }
+            },
+            AuditCommand::Flush { done } => flush_acks.push(done),
+        }
+    }
+
+    /// Assign a monotonic timestamp, compute the chain link, and append the
+    /// event's NDJSON line to the staging buffer.
+    ///
+    /// `self.last_hash` is **not** advanced here: the durable chain head is
+    /// only moved forward by `commit_batch` once the bytes are on disk.
+    fn chain_event(
+        &mut self,
+        session_handle: u64,
+        operation: AuditOperation,
+        result: AuditResult,
+        key_id: Option<String>,
+    ) -> Result<(), crate::error::HsmError> {
+        if self.tamper_flag.load(Ordering::Acquire) {
+            return Err(crate::error::HsmError::AuditChainBroken(
+                "audit chain tamper previously detected".to_string(),
+            ));
+        }
+
+        let duration = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let wall_timestamp = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
+
+        // Enforce monotonicity across the whole batch, not just across
+        // committed events, so two events staged within the same nanosecond
+        // still receive strictly increasing timestamps.
+        let timestamp = if wall_timestamp <= self.last_timestamp {
+            match self.last_timestamp.checked_add(1) {
+                Some(next) => next,
+                None => {
+                    tracing::error!(
+                        "Audit timestamp space exhausted (u64::MAX reached). \
+                         Cannot guarantee monotonicity."
+                    );
+                    self.tamper_flag.store(true, Ordering::Release);
+                    return Err(crate::error::HsmError::AuditChainBroken(
+                        "timestamp space exhausted".to_string(),
+                    ));
+                }
+            }
+        } else {
+            wall_timestamp
+        };
+
+        // Chain onto the last event staged in this batch, falling back to the
+        // durable chain head for the first event of the batch.
+        let previous_hash = if self.batch.is_empty() {
+            self.last_hash
+        } else {
+            self.batch_head
+        };
+
+        let event = AuditEvent {
+            format_version: AUDIT_LOG_FORMAT_VERSION,
+            timestamp,
+            session_handle,
+            operation,
+            key_id,
+            result,
+            previous_hash,
+        };
+
+        let new_head = compute_chain_hash_with(&previous_hash, &event, &mut self.hash_buf)?;
+
+        // Serialize into the reusable buffer. A serialization failure must not
+        // leave a partial line behind, so truncate back to the mark.
+        if self.log_path.is_some() {
+            let mark = self.line_buf.len();
+            if let Err(e) = serde_json::to_writer(&mut self.line_buf, &event) {
+                self.line_buf.truncate(mark);
+                tracing::error!("Audit log serialization failed: {}", e);
+                return Err(crate::error::HsmError::GeneralError);
+            }
+            self.line_buf.push(b'\n');
+        }
+
+        self.last_timestamp = timestamp;
+        self.batch_head = new_head;
+        self.batch.push(event);
+        Ok(())
+    }
+
+    /// Write the staged batch with a single `write_all` + `sync_all`, then
+    /// publish it to shared state and release every waiter.
+    ///
+    /// On I/O failure nothing is committed: the durable chain head stays where
+    /// it was, the staged events are dropped, and every waiter receives the
+    /// error — so the on-disk and in-memory chains cannot diverge.
+    fn commit_batch(&mut self) {
+        if self.batch.is_empty() {
+            self.line_buf.clear();
+            return;
+        }
+
+        if self.log_path.is_some() {
+            if let Err(e) = self.write_staged() {
+                tracing::error!("Audit worker: disk I/O failed: {}", e);
+                // Force a reopen on the next batch — the handle may be in an
+                // indeterminate state after a partial write.
+                self.file = None;
+                self.batch.clear();
+                self.line_buf.clear();
+                self.batch_head = self.last_hash;
+                for tx in self.waiters.drain(..) {
+                    let _ = tx.send(Err(e.clone()));
+                }
+                return;
+            }
+        }
+
+        // The batch is durable: advance the chain head and publish.
+        self.last_hash = self.batch_head;
+
+        {
+            let mut s = self.state.write();
+            s.last_hash = self.last_hash;
+            s.last_timestamp = self.last_timestamp;
+            s.entries.append(&mut self.batch);
+
+            // Cap in-memory entries to prevent unbounded growth.
+            if s.entries.len() > MAX_IN_MEMORY_ENTRIES {
+                let excess = s.entries.len() - MAX_IN_MEMORY_ENTRIES;
+                s.entries.drain(..excess);
+            }
+        }
+
+        self.batch.clear();
+        self.line_buf.clear();
+        for tx in self.waiters.drain(..) {
+            let _ = tx.send(Ok(()));
+        }
+    }
+
+    /// Append the staged buffer to the log file and `fsync` it, rotating first
+    /// if the file has reached [`MAX_LOG_FILE_BYTES`].
+    fn write_staged(&mut self) -> Result<(), crate::error::HsmError> {
+        let path = match &self.log_path {
+            Some(p) => p.clone(),
+            None => return Ok(()),
+        };
+
+        if self.file.is_none() {
+            let f = open_audit_file(&path)?;
+            self.file_size = f.metadata().map(|m| m.len()).unwrap_or(0);
+            self.file = Some(f);
+        }
+
+        if self.file_size >= MAX_LOG_FILE_BYTES {
+            // Close before renaming — Windows refuses to rename an open file.
+            self.file = None;
+            AuditLog::rotate_log_files(&path)?;
+            let f = open_audit_file(&path)?;
+            self.file_size = f.metadata().map(|m| m.len()).unwrap_or(0);
+            self.file = Some(f);
+        }
+
+        let file = self
+            .file
+            .as_mut()
+            .expect("file handle is opened immediately above");
+        let bytes = self.line_buf.as_slice();
+        file.write_all(bytes).map_err(|e| {
+            tracing::error!("Audit log write failed: {}", e);
+            crate::error::HsmError::GeneralError
+        })?;
+        file.sync_all().map_err(|e| {
+            tracing::error!("Audit log fsync failed: {}", e);
+            crate::error::HsmError::GeneralError
+        })?;
+        self.file_size += bytes.len() as u64;
+        Ok(())
+    }
+}
+
 impl AuditLog {
+    /// Maximum number of `Record` commands coalesced into a single
+    /// write + `fsync` batch. Bounds the worst-case latency that a
+    /// `record_sync` caller at the tail of a burst can observe, and bounds
+    /// the size of the staging buffer.
+    const MAX_BATCH: usize = 1024;
+
     /// Spawn the background worker thread that processes audit commands.
     /// The worker owns the receiver end of the channel and maintains local
     /// copies of `last_hash` and `last_timestamp` for lock-free event building.
+    ///
+    /// # Durability model
+    ///
+    /// The worker performs **group commit**: it blocks for one command, then
+    /// drains up to [`AuditLog::MAX_BATCH`] further pending `Record` commands
+    /// without blocking, serializes them all into one staging buffer, issues a
+    /// single `write_all` + a single `sync_all`, and only then commits the
+    /// batch to shared state and releases every `record_sync` waiter in it.
+    ///
+    /// This preserves the `record_sync` contract exactly — such a caller is
+    /// still released only *after* its event is `fsync`-ed — while amortizing
+    /// the `fsync` over every event that was already queued behind it. It is
+    /// not a durability trade: no event is acknowledged before it is on
+    /// stable storage.
+    ///
+    /// The log file handle is opened once and kept open for the lifetime of
+    /// the worker (reopened only across rotation), rather than being opened
+    /// per event. On Windows that also removes one ACL-hardening syscall per
+    /// event.
     fn spawn_worker(
         state: Arc<RwLock<AuditLogState>>,
         log_path: Option<PathBuf>,
@@ -506,196 +1027,21 @@ impl AuditLog {
         std::thread::Builder::new()
             .name("audit-worker".to_string())
             .spawn(move || {
-                let mut last_hash = initial_hash;
-                let mut last_timestamp = initial_timestamp;
-
-                /// Process a single Record command. Returns `Ok(())` once the
-                /// event has been chained, written, and fsynced to disk (when
-                /// disk logging is configured) and committed to the in-memory
-                /// state. Returns `Err(...)` if any step fails — propagated to
-                /// `record_sync` callers via the optional completion channel.
-                #[allow(clippy::too_many_arguments)]
-                fn process_record(
-                    state: &Arc<RwLock<AuditLogState>>,
-                    log_path: &Option<PathBuf>,
-                    tamper_flag: &Arc<AtomicBool>,
-                    last_hash: &mut [u8; 32],
-                    last_timestamp: &mut u64,
-                    session_handle: u64,
-                    operation: AuditOperation,
-                    result: AuditResult,
-                    key_id: Option<String>,
-                ) -> Result<(), crate::error::HsmError> {
-                    if tamper_flag.load(Ordering::Acquire) {
-                        return Err(crate::error::HsmError::AuditChainBroken(
-                            "audit chain tamper previously detected".to_string(),
-                        ));
-                    }
-
-                    let duration = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default();
-                    let wall_timestamp = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
-
-                    // Enforce monotonicity
-                    let timestamp = if wall_timestamp <= *last_timestamp {
-                        match last_timestamp.checked_add(1) {
-                            Some(next) => next,
-                            None => {
-                                tracing::error!(
-                                    "Audit timestamp space exhausted (u64::MAX reached). \
-                                     Cannot guarantee monotonicity."
-                                );
-                                tamper_flag.store(true, Ordering::Release);
-                                return Err(crate::error::HsmError::AuditChainBroken(
-                                    "timestamp space exhausted".to_string(),
-                                ));
-                            }
-                        }
-                    } else {
-                        wall_timestamp
-                    };
-                    *last_timestamp = timestamp;
-
-                    let event = AuditEvent {
-                        timestamp,
-                        session_handle,
-                        operation,
-                        key_id,
-                        result,
-                        previous_hash: *last_hash,
-                    };
-
-                    // Compute chain hash: SHA-256(previous_hash || payload)
-                    let new_hash = match compute_chain_hash(last_hash, &event) {
-                        Ok(h) => h,
-                        Err(e) => {
-                            tracing::error!("Audit worker: chain hash computation failed");
-                            return Err(e);
-                        }
-                    };
-                    *last_hash = new_hash;
-
-                    // Persist to disk if configured
-                    if let Some(path) = log_path {
-                        let io_result = (|| -> Result<(), crate::error::HsmError> {
-                            let mut file = open_audit_file(path)?;
-                            let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
-
-                            if file_size >= MAX_LOG_FILE_BYTES {
-                                drop(file);
-                                AuditLog::rotate_log_files(path)?;
-                                file = open_audit_file(path)?;
-                            }
-
-                            let line = serde_json::to_string(&event).map_err(|e| {
-                                tracing::error!("Audit log serialization failed: {}", e);
-                                crate::error::HsmError::GeneralError
-                            })?;
-
-                            writeln!(file, "{}", line).map_err(|e| {
-                                tracing::error!("Audit log write failed: {}", e);
-                                crate::error::HsmError::GeneralError
-                            })?;
-                            file.sync_all().map_err(|e| {
-                                tracing::error!("Audit log fsync failed: {}", e);
-                                crate::error::HsmError::GeneralError
-                            })?;
-                            Ok(())
-                        })();
-
-                        if let Err(e) = io_result {
-                            tracing::error!("Audit worker: disk I/O failed: {}", e);
-                            // Do not commit the failed event to in-memory state:
-                            // the on-disk and in-memory chains would diverge
-                            // and break subsequent recovery. Propagate the error.
-                            return Err(e);
-                        }
-                    }
-
-                    // Push to shared state so readers (get_entries, verify_chain, etc.) see it.
-                    {
-                        let mut s = state.write();
-                        s.last_hash = new_hash;
-                        s.last_timestamp = *last_timestamp;
-                        s.entries.push(event);
-
-                        // Cap in-memory entries to prevent unbounded growth.
-                        if s.entries.len() > MAX_IN_MEMORY_ENTRIES {
-                            let excess = s.entries.len() - MAX_IN_MEMORY_ENTRIES;
-                            s.entries.drain(..excess);
-                        }
-                    }
-
-                    Ok(())
-                }
-
-                loop {
-                    match receiver.recv() {
-                        Ok(AuditCommand::Record {
-                            session_handle,
-                            operation,
-                            result,
-                            key_id,
-                            done,
-                        }) => {
-                            let outcome = process_record(
-                                &state,
-                                &log_path,
-                                &tamper_flag,
-                                &mut last_hash,
-                                &mut last_timestamp,
-                                session_handle,
-                                operation,
-                                result,
-                                key_id,
-                            );
-                            if let Some(tx) = done {
-                                // Notify the synchronous caller; if it has
-                                // already given up (timed out / dropped its
-                                // receiver) we silently move on.
-                                let _ = tx.send(outcome);
-                            }
-                        }
-                        Ok(AuditCommand::Flush { done }) => {
-                            // Drain any pending records before acknowledging.
-                            while let Ok(cmd) = receiver.try_recv() {
-                                match cmd {
-                                    AuditCommand::Record {
-                                        session_handle,
-                                        operation,
-                                        result,
-                                        key_id,
-                                        done: inner_done,
-                                    } => {
-                                        let outcome = process_record(
-                                            &state,
-                                            &log_path,
-                                            &tamper_flag,
-                                            &mut last_hash,
-                                            &mut last_timestamp,
-                                            session_handle,
-                                            operation,
-                                            result,
-                                            key_id,
-                                        );
-                                        if let Some(tx) = inner_done {
-                                            let _ = tx.send(outcome);
-                                        }
-                                    }
-                                    AuditCommand::Flush { done: inner_done } => {
-                                        let _ = inner_done.send(());
-                                    }
-                                }
-                            }
-                            let _ = done.send(());
-                        }
-                        Err(_) => {
-                            // Channel closed — sender dropped. Exit the worker.
-                            break;
-                        }
-                    }
-                }
+                let mut worker = AuditWorker {
+                    state,
+                    log_path,
+                    tamper_flag,
+                    last_hash: initial_hash,
+                    last_timestamp: initial_timestamp,
+                    file: None,
+                    file_size: 0,
+                    line_buf: Vec::new(),
+                    hash_buf: Vec::with_capacity(64),
+                    batch: Vec::new(),
+                    batch_head: initial_hash,
+                    waiters: Vec::new(),
+                };
+                worker.run(&receiver);
             })
             .expect("failed to spawn audit worker thread")
     }
@@ -822,6 +1168,7 @@ impl AuditLog {
 
         let reader = std::io::BufReader::new(file);
         let mut running_hash = [0u8; 32];
+        let mut scratch = Vec::with_capacity(64);
 
         for (line_num, line_result) in reader.lines().enumerate() {
             let line = match line_result {
@@ -861,8 +1208,9 @@ impl AuditLog {
                 ));
             }
 
-            // Recompute the chain hash: SHA-256(previous_hash || payload).
-            match compute_chain_hash(&running_hash, &event) {
+            // Recompute the chain hash: SHA-256(previous_hash || payload),
+            // using the encoding this record was written with.
+            match compute_chain_hash_with(&running_hash, &event, &mut scratch) {
                 Ok(h) => running_hash = h,
                 Err(_) => {
                     return ChainRecoveryResult::Broken(format!(
@@ -1282,11 +1630,12 @@ pub fn load_entries_from_file(path: &Path) -> Result<Vec<AuditEvent>, crate::err
 /// consumers that loaded entries via [`load_entries_from_file`].
 pub fn verify_chain_entries(entries: &[AuditEvent]) -> Result<usize, usize> {
     let mut expected_hash = [0u8; 32];
+    let mut scratch = Vec::with_capacity(64);
     for (i, entry) in entries.iter().enumerate() {
         if entry.previous_hash != expected_hash {
             return Err(i);
         }
-        match compute_chain_hash(&expected_hash, entry) {
+        match compute_chain_hash_with(&expected_hash, entry, &mut scratch) {
             Ok(h) => expected_hash = h,
             Err(_) => return Err(i),
         }
@@ -1439,5 +1788,262 @@ pub fn record_zeroization(key_size: usize) {
                 None,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod codec_tests {
+    use super::*;
+
+    /// Build an event that differs from the baseline only where a test varies it.
+    fn event(operation: AuditOperation, key_id: Option<&str>, result: AuditResult) -> AuditEvent {
+        AuditEvent {
+            format_version: AUDIT_LOG_FORMAT_VERSION,
+            timestamp: 1_700_000_000_000_000_000,
+            session_handle: 7,
+            operation,
+            key_id: key_id.map(str::to_string),
+            result,
+            previous_hash: [0xAB; 32],
+        }
+    }
+
+    fn encode(ev: &AuditEvent) -> Vec<u8> {
+        let mut buf = Vec::new();
+        encode_payload_v1(ev, &mut buf);
+        buf
+    }
+
+    /// Every operation variant must encode to a distinct byte string.
+    ///
+    /// This is the core injectivity property: if two operations collided, an
+    /// attacker with disk write access could substitute one audit record for
+    /// another without breaking the chain.
+    #[test]
+    fn every_operation_variant_encodes_distinctly() {
+        let variants = vec![
+            AuditOperation::Initialize,
+            AuditOperation::Finalize,
+            AuditOperation::OpenSession { slot_id: 1 },
+            AuditOperation::CloseSession,
+            AuditOperation::Login { user_type: 1 },
+            AuditOperation::Logout,
+            AuditOperation::InitToken { slot_id: 1 },
+            AuditOperation::InitPIN { slot_id: 1 },
+            AuditOperation::SetPIN,
+            AuditOperation::GenerateKey {
+                mechanism: 1,
+                key_length: 1,
+                fips_approved: true,
+            },
+            AuditOperation::GenerateKeyPair {
+                mechanism: 1,
+                key_length: 1,
+                fips_approved: true,
+            },
+            AuditOperation::Sign {
+                mechanism: 1,
+                fips_approved: true,
+            },
+            AuditOperation::Verify {
+                mechanism: 1,
+                fips_approved: true,
+            },
+            AuditOperation::Encrypt {
+                mechanism: 1,
+                fips_approved: true,
+            },
+            AuditOperation::Decrypt {
+                mechanism: 1,
+                fips_approved: true,
+            },
+            AuditOperation::Digest {
+                mechanism: 1,
+                fips_approved: true,
+            },
+            AuditOperation::CreateObject,
+            AuditOperation::DestroyObject,
+            AuditOperation::GenerateRandom { length: 1 },
+            AuditOperation::WrapKey {
+                mechanism: 1,
+                fips_approved: true,
+            },
+            AuditOperation::UnwrapKey {
+                mechanism: 1,
+                fips_approved: true,
+            },
+            AuditOperation::DeriveKey {
+                mechanism: 1,
+                fips_approved: true,
+            },
+            AuditOperation::FindObjects { result_count: 1 },
+            AuditOperation::GetAttributeValue,
+            AuditOperation::Zeroize { key_length: 1 },
+        ];
+
+        // Guards against a new variant being added without a tag: if the match
+        // in `encode_operation_v1` gains an arm, this list must gain an entry.
+        assert_eq!(
+            variants.len(),
+            25,
+            "add the new AuditOperation variant to this list and give it a tag",
+        );
+
+        let mut seen: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
+        for (i, op) in variants.into_iter().enumerate() {
+            let bytes = encode(&event(op, None, AuditResult::Success));
+            if let Some(prev) = seen.insert(bytes, i) {
+                panic!("operation variants {} and {} encode identically", prev, i);
+            }
+        }
+    }
+
+    /// Fields inside an operation must reach the encoding.
+    #[test]
+    fn operation_fields_affect_the_encoding() {
+        let a = encode(&event(
+            AuditOperation::Sign {
+                mechanism: 0x40,
+                fips_approved: true,
+            },
+            None,
+            AuditResult::Success,
+        ));
+        let mechanism_changed = encode(&event(
+            AuditOperation::Sign {
+                mechanism: 0x41,
+                fips_approved: true,
+            },
+            None,
+            AuditResult::Success,
+        ));
+        let flag_changed = encode(&event(
+            AuditOperation::Sign {
+                mechanism: 0x40,
+                fips_approved: false,
+            },
+            None,
+            AuditResult::Success,
+        ));
+
+        assert_ne!(a, mechanism_changed, "mechanism must be encoded");
+        assert_ne!(a, flag_changed, "fips_approved must be encoded");
+    }
+
+    /// `key_id` is length-prefixed, so a split cannot be moved between it and
+    /// the fields around it without changing the bytes.
+    #[test]
+    fn key_id_is_length_prefixed() {
+        let short = encode(&event(
+            AuditOperation::Logout,
+            Some("ab"),
+            AuditResult::Success,
+        ));
+        let long = encode(&event(
+            AuditOperation::Logout,
+            Some("abc"),
+            AuditResult::Success,
+        ));
+        let none = encode(&event(AuditOperation::Logout, None, AuditResult::Success));
+
+        assert_ne!(short, long, "key_id contents must be encoded");
+        assert_ne!(short, none, "presence of key_id must be encoded");
+        // The present/absent discriminator is a single byte before the length,
+        // so an absent key_id is strictly shorter than any present one.
+        assert!(none.len() < short.len());
+    }
+
+    /// Success and failure, and distinct failure codes, must not collide.
+    #[test]
+    fn result_variants_encode_distinctly() {
+        let ok = encode(&event(AuditOperation::Logout, None, AuditResult::Success));
+        let fail_a = encode(&event(
+            AuditOperation::Logout,
+            None,
+            AuditResult::Failure(0x30),
+        ));
+        let fail_b = encode(&event(
+            AuditOperation::Logout,
+            None,
+            AuditResult::Failure(0x31),
+        ));
+
+        assert_ne!(ok, fail_a, "success and failure must differ");
+        assert_ne!(fail_a, fail_b, "the failure code must be encoded");
+    }
+
+    /// The header fields must all reach the encoding, including
+    /// `format_version` — a downgrade rewrite must change the hash.
+    #[test]
+    fn header_fields_affect_the_encoding() {
+        let base = event(AuditOperation::Logout, None, AuditResult::Success);
+        let baseline = encode(&base);
+
+        let mut other = base.clone();
+        other.timestamp += 1;
+        assert_ne!(baseline, encode(&other), "timestamp must be encoded");
+
+        let mut other = base.clone();
+        other.session_handle += 1;
+        assert_ne!(baseline, encode(&other), "session_handle must be encoded");
+
+        let mut other = base.clone();
+        other.format_version = 0;
+        assert_ne!(
+            baseline,
+            encode(&other),
+            "format_version must be encoded so a downgrade rewrite is detected",
+        );
+    }
+
+    /// The chain hash must dispatch on the record's own version, so the same
+    /// event chained as v0 and as v1 produces different links. Otherwise the
+    /// version field would be advisory rather than binding.
+    #[test]
+    fn chain_hash_dispatches_on_format_version() {
+        let prev = [0u8; 32];
+        let mut v1 = event(AuditOperation::Logout, None, AuditResult::Success);
+        v1.format_version = 1;
+        let mut v0 = v1.clone();
+        v0.format_version = 0;
+
+        let h1 = compute_chain_hash(&prev, &v1).expect("v1 hashes");
+        let h0 = compute_chain_hash(&prev, &v0).expect("v0 hashes");
+        assert_ne!(h0, h1, "v0 and v1 encodings must produce different links");
+    }
+
+    /// An unknown future version must be rejected rather than silently hashed
+    /// under the current rules.
+    #[test]
+    fn unknown_format_version_is_rejected() {
+        let mut ev = event(AuditOperation::Logout, None, AuditResult::Success);
+        ev.format_version = 99;
+        assert!(
+            compute_chain_hash(&[0u8; 32], &ev).is_err(),
+            "an unrecognised format_version must not verify",
+        );
+    }
+
+    /// The scratch buffer is reused across events; a stale tail from a longer
+    /// previous event must not leak into a shorter one.
+    #[test]
+    fn scratch_buffer_reuse_does_not_leak_between_events() {
+        let long = event(
+            AuditOperation::Logout,
+            Some("a-considerably-longer-key-identifier"),
+            AuditResult::Success,
+        );
+        let short = event(AuditOperation::Logout, None, AuditResult::Success);
+        let prev = [0u8; 32];
+
+        let mut scratch = Vec::new();
+        let _ = compute_chain_hash_with(&prev, &long, &mut scratch).expect("long hashes");
+        let reused = compute_chain_hash_with(&prev, &short, &mut scratch).expect("short hashes");
+        let fresh = compute_chain_hash(&prev, &short).expect("short hashes standalone");
+
+        assert_eq!(
+            reused, fresh,
+            "a reused scratch buffer must produce the same hash as a fresh one",
+        );
     }
 }

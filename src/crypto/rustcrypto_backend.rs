@@ -406,6 +406,10 @@ impl CryptoBackend for RustCryptoBackend {
         super::keygen::generate_aes_key(key_len_bytes, fips_mode)
     }
 
+    fn supports_rsa_private_ops(&self) -> bool {
+        crate::crypto::sign::rsa_private_ops_permitted()
+    }
+
     fn generate_rsa_key_pair(
         &self,
         modulus_bits: u32,

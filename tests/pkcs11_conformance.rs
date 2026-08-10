@@ -843,6 +843,12 @@ fn test_sign_without_init() {
 // ============================================================================
 
 #[test]
+#[cfg_attr(
+    not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+    ignore = "needs RustCrypto RSA private-key operations, which release builds \
+              refuse (RUSTSEC-2023-0071); run in debug or with \
+              --features insecure-rustcrypto-rsa-private-ops"
+)]
 fn test_rsa_keygen_sign_verify_via_abi() {
     let session = setup_user_session();
 

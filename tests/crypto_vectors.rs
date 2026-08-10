@@ -76,6 +76,12 @@ fn test_aes_gcm_empty_plaintext() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+    ignore = "RustCrypto RSA private-key operations are refused in release builds \
+              (RUSTSEC-2023-0071); run in debug or with \
+              --features insecure-rustcrypto-rsa-private-ops"
+)]
 fn test_rsa_2048_sign_verify_sha256() {
     let (priv_der, modulus, pub_exp) = keygen::generate_rsa_key_pair(2048, false).unwrap();
     let message = b"Test message for RSA PKCS#1 v1.5 SHA-256";
@@ -98,6 +104,12 @@ fn test_rsa_2048_sign_verify_sha256() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+    ignore = "RustCrypto RSA private-key operations are refused in release builds \
+              (RUSTSEC-2023-0071); run in debug or with \
+              --features insecure-rustcrypto-rsa-private-ops"
+)]
 fn test_rsa_sign_verify_sha384() {
     let (priv_der, modulus, pub_exp) = keygen::generate_rsa_key_pair(2048, false).unwrap();
     let message = b"SHA-384 RSA test";
@@ -117,6 +129,12 @@ fn test_rsa_sign_verify_sha384() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+    ignore = "RustCrypto RSA private-key operations are refused in release builds \
+              (RUSTSEC-2023-0071); run in debug or with \
+              --features insecure-rustcrypto-rsa-private-ops"
+)]
 fn test_rsa_sign_verify_sha512() {
     let (priv_der, modulus, pub_exp) = keygen::generate_rsa_key_pair(2048, false).unwrap();
     let message = b"SHA-512 RSA test";
@@ -136,6 +154,12 @@ fn test_rsa_sign_verify_sha512() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+    ignore = "RustCrypto RSA private-key operations are refused in release builds \
+              (RUSTSEC-2023-0071); run in debug or with \
+              --features insecure-rustcrypto-rsa-private-ops"
+)]
 fn test_rsa_verify_wrong_message() {
     let (priv_der, modulus, pub_exp) = keygen::generate_rsa_key_pair(2048, false).unwrap();
 
@@ -158,6 +182,12 @@ fn test_rsa_verify_wrong_message() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+    ignore = "RustCrypto RSA private-key operations are refused in release builds \
+              (RUSTSEC-2023-0071); run in debug or with \
+              --features insecure-rustcrypto-rsa-private-ops"
+)]
 fn test_rsa_verify_wrong_key() {
     let (priv_der1, _, _) = keygen::generate_rsa_key_pair(2048, false).unwrap();
     let (_, modulus2, pub_exp2) = keygen::generate_rsa_key_pair(2048, false).unwrap();
