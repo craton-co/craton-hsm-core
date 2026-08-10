@@ -3041,6 +3041,25 @@ fn generate_rsa_keypair(
     pub_template: &[(CK_ATTRIBUTE_TYPE, Vec<u8>)],
     priv_template: &[(CK_ATTRIBUTE_TYPE, Vec<u8>)],
 ) -> Result<(CK_OBJECT_HANDLE, CK_OBJECT_HANDLE, u32), CK_RV> {
+    // Refuse the mechanism *before* generating anything when this build offers
+    // no RSA private-key capability.
+    //
+    // Release builds refuse RustCrypto RSA private-key operations because of
+    // RUSTSEC-2023-0071 (Marvin). Without this check the key pair is generated
+    // and then fails its pairwise consistency test, which is treated as a
+    // catastrophic cryptographic failure and latches the module error state --
+    // so a single RSA keygen attempt bricked every subsequent operation,
+    // including EC and AES. An unavailable mechanism is not a broken
+    // implementation: report it as such and leave the module usable.
+    if !hsm.crypto_backend.supports_rsa_private_ops() {
+        tracing::warn!(
+            "RSA key-pair generation refused: this build provides no RSA \
+             private-key capability (RUSTSEC-2023-0071). Rebuild with the \
+             aws-lc-rs backend to use RSA."
+        );
+        return Err(CKR_MECHANISM_INVALID);
+    }
+
     let modulus_bits = read_ulong_attr(pub_template, CKA_MODULUS_BITS).unwrap_or(2048) as u32;
 
     let (private_key_der, modulus, pub_exp) = hsm
@@ -3094,9 +3113,11 @@ fn generate_rsa_keypair(
         return Err(rv);
     }
 
-    hsm.object_store.insert_object(pub_obj).map_err(err_to_rv)?;
+    // Insert both halves under one store transaction: one fsync instead of
+    // two, and a crash can no longer persist the public key without its
+    // private half.
     hsm.object_store
-        .insert_object(priv_obj)
+        .insert_objects(vec![pub_obj, priv_obj])
         .map_err(err_to_rv)?;
     Ok((pub_handle, priv_handle, modulus_bits))
 }
@@ -3178,9 +3199,11 @@ fn generate_ec_keypair(
         return Err(rv);
     }
 
-    hsm.object_store.insert_object(pub_obj).map_err(err_to_rv)?;
+    // Insert both halves under one store transaction: one fsync instead of
+    // two, and a crash can no longer persist the public key without its
+    // private half.
     hsm.object_store
-        .insert_object(priv_obj)
+        .insert_objects(vec![pub_obj, priv_obj])
         .map_err(err_to_rv)?;
     Ok((pub_handle, priv_handle, key_bits))
 }
@@ -3233,9 +3256,11 @@ fn generate_ed25519_keypair(
         return Err(rv);
     }
 
-    hsm.object_store.insert_object(pub_obj).map_err(err_to_rv)?;
+    // Insert both halves under one store transaction: one fsync instead of
+    // two, and a crash can no longer persist the public key without its
+    // private half.
     hsm.object_store
-        .insert_object(priv_obj)
+        .insert_objects(vec![pub_obj, priv_obj])
         .map_err(err_to_rv)?;
     Ok((pub_handle, priv_handle, 256))
 }
@@ -3357,9 +3382,11 @@ fn generate_pqc_keypair(
         return Err(rv);
     }
 
-    hsm.object_store.insert_object(pub_obj).map_err(err_to_rv)?;
+    // Insert both halves under one store transaction: one fsync instead of
+    // two, and a crash can no longer persist the public key without its
+    // private half.
     hsm.object_store
-        .insert_object(priv_obj)
+        .insert_objects(vec![pub_obj, priv_obj])
         .map_err(err_to_rv)?;
     Ok((pub_handle, priv_handle, key_bits))
 }

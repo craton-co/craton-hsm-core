@@ -38,6 +38,12 @@ Each benchmark iteration includes the full `C_*Init` + `C_*` pair (e.g., `C_Sign
 | `pkcs11_keygen_rsa_2048` | RSA-2048 key pair generation | -- |
 | `pkcs11_keygen_ec_p256` | EC P-256 key pair generation | -- |
 | `pkcs11_keygen_aes_256` | AES-256 symmetric key generation | -- |
+| `pkcs11_find_objects_selective` | `C_FindObjects`, CKA_LABEL matching 1 of 257 | -- |
+| `pkcs11_find_objects_by_class` | `C_FindObjects`, CKA_CLASS matching all secret keys | -- |
+| `pkcs11_aes_gcm_encrypt_sizes` | AES-256-GCM encrypt | 256 B, 4 KB, 64 KB, 1 MB |
+| `pkcs11_sha256_digest_sizes` | SHA-256 digest | 256 B, 4 KB, 64 KB, 1 MB |
+| `pkcs11_concurrent_encrypt` | AES-256-GCM encrypt across 1/2/4/8 sessions | 4 KB |
+| `pkcs11_concurrent_sign` | ECDSA P-256 sign across 1/2/4/8 sessions | 32 B |
 
 ---
 
@@ -195,6 +201,170 @@ Craton HSM is not the fastest software HSM on every operation. SoftHSMv2's Botan
 
 ---
 
+---
+
+## Phase 4: Audit Trail Throughput
+
+The audit trail sits on the critical path of every PKCS#11 cryptographic call,
+so its throughput is an upper bound on the module's. Optimisation #6 above moved
+the work off the caller's thread, which fixed *latency* — but the worker itself
+still opened the log file, serialised one event, wrote it, and `fsync`-ed once
+per event. That capped the whole module at roughly **760 operations per second**
+no matter how fast the cryptography was, and nothing measured it.
+
+Three changes addressed it:
+
+10. **Persistent log file handle** (`src/audit/log.rs`): the worker opens the
+    audit file once and keeps it open, rather than calling `open()` +
+    `metadata()` per event. On Windows this also removes one ACL-hardening
+    syscall per event.
+
+11. **Group commit** (`src/audit/log.rs`): the worker blocks for one command,
+    then drains everything already queued behind it, serialises the whole batch
+    into one buffer, and issues a single `write` + a single `fsync`. This is not
+    a durability trade — a `record_sync` caller is still released only after its
+    own event is on stable storage; the `fsync` is simply shared with every
+    event that was already waiting.
+
+12. **Canonical binary chain encoding** (`src/audit/log.rs`): the chain hash
+    input changed from `serde_json` to a fixed-width, length-prefixed, injective
+    binary encoding (`AUDIT_LOG_FORMAT_VERSION = 1`). This shrinks the hashed
+    payload from ~148 bytes to ~40 and removes a per-event allocation. The
+    **on-disk NDJSON line is unchanged** — it is an interop contract with SIEM
+    consumers — and the verifier dispatches on each record's own
+    `format_version`, so logs written by earlier builds still verify and a file
+    containing both versions verifies end to end.
+
+### Audit Results
+
+Medians of six runs, alternating which binary is measured first and cooling
+between them. See "Measurement hygiene" below for why that matters.
+
+| Measurement | Before | After | Improvement |
+|-------------|--------|-------|-------------|
+| Sustained async throughput | 1319 us/event | 6.58 us/event | **200x** (758 → 152,000 events/s) |
+| `record_sync` durable write | 1482 us | 633 us | **57% faster** |
+| Per-event CPU (chain hash + locks) | 3.76 us | 1.22 us | **68% faster** |
+
+The first row is the one that matters: it removes a ceiling that sat below every
+cryptographic operation in the module.
+
+These figures come from a dedicated A/B harness that ran a "before" and an
+"after" binary alternately against the same workload, which is the only way to
+compare two builds credibly on this machine.
+
+The `audit_record_in_memory`, `audit_record_to_disk`, and `audit_record_sync`
+groups in `crypto_bench` guard against regressions going forward. Their absolute
+values are **not** comparable to the table above: each iteration uses a fresh log
+file for reproducibility, and `fsync` on a file that is still being extended
+costs considerably more than on the long-lived file a deployment actually has.
+Compare them against previous runs of the same benchmark, not against the table.
+
+---
+
+## Coverage Added
+
+The suites originally measured single-threaded, fixed-size operations only.
+Three gaps were closed, each because a whole class of regression was invisible
+without it.
+
+| Group | Operation | Why it exists |
+|-------|-----------|---------------|
+| `pkcs11_find_objects_selective` | `C_FindObjects` on a `CKA_LABEL` matching 1 of 257 objects | Object lookup was entirely unmeasured. This is the shape a consumer uses to resolve a named key before signing. |
+| `pkcs11_find_objects_by_class` | `C_FindObjects` on `CKA_CLASS` matching every secret key | Complements the selective case: the result set is large, so handle marshalling is included, not just the scan. |
+| `pkcs11_aes_gcm_encrypt_sizes` | AES-256-GCM, 256 B → 1 MB | Fixed-size benchmarks cannot separate a per-call regression from a per-byte one. |
+| `pkcs11_sha256_digest_sizes` | SHA-256, 256 B → 1 MB | As above. |
+| `pkcs11_concurrent_encrypt` | AES-256-GCM across 1, 2, 4, 8 sessions | Every other benchmark is single-threaded, so a new lock on a shared path is invisible to them. A flat curve here means contention. |
+| `pkcs11_concurrent_sign` | ECDSA P-256 across 1, 2, 4, 8 sessions | As above, exercising the key-object read locks and signing-key cache instead. |
+| `audit_record_*` | Audit trail, in-memory / to disk / synchronous | The module's throughput ceiling (see Phase 4). |
+
+### Object Lookup
+
+Measured against a token holding 257 labelled secret keys:
+
+| Search | Matches | Time |
+|--------|--------:|-----:|
+| `CKA_LABEL` matching exactly one object | 1 | 32.1 us |
+| `CKA_CLASS` matching every secret key | 257 | 31.9 us |
+
+The two are the **same cost**, which is the point. `ObjectStore::find_objects`
+deliberately scans every object and evaluates the full template against each,
+including objects that will be filtered out, so the work does not vary with what
+matches or with whether the caller is logged in — timing cannot reveal how many
+private objects a token holds. The cost is therefore driven by store population
+(~125 ns per object here), not by selectivity.
+
+These benchmarks are **not** a prompt to add an attribute index. A selective
+search served from an index would be far faster precisely because it stops
+visiting non-matching objects, which is the property being protected. See
+[performance-tuning.md](performance-tuning.md#4-optimisations-considered-and-rejected)
+for why that would leak object existence to an unauthenticated caller.
+
+### Payload Scaling
+
+The fixed-size groups cannot distinguish a per-call regression from a per-byte
+one. These curves can:
+
+| Size | AES-256-GCM encrypt | | SHA-256 digest | |
+|------|--------------------:|--:|---------------:|--:|
+|      | time | throughput | time | throughput |
+| 256 B | 6.38 us | 38 MiB/s | 3.49 us | 70 MiB/s |
+| 4 KB | 11.9 us | 329 MiB/s | 37.1 us | 105 MiB/s |
+| 64 KB | 189 us | 331 MiB/s | 564 us | 111 MiB/s |
+| 1 MB | 4.33 ms | 231 MiB/s | 8.77 ms | 114 MiB/s |
+
+At 256 B both are dominated by fixed per-call cost — session lookup, object
+fetch, audit enqueue, FFI marshalling — which is why throughput is an order of
+magnitude below the steady state. From 4 KB upward the per-byte cost dominates.
+A change that moves the small-payload column but not the large one is a per-call
+regression; the reverse is a primitive regression.
+
+The SHA-256 ceiling of ~110 MiB/s is this host, not the implementation: it has no
+SHA-NI. Expect several times that on a current server.
+
+### Concurrency
+
+`pkcs11_concurrent_sign` (ECDSA P-256, one session per thread) scales roughly
+3.5x from 1 to 4 threads on a 4-core host and falls back at 8, which is the
+expected shape for CPU-bound signing on 4 physical cores with SMT. No
+serialisation bottleneck is visible.
+
+Absolute numbers are not reported here because this reference machine — a
+thermally throttling 4-core laptop — cannot measure concurrency scaling with
+enough stability to be worth publishing; the confidence intervals span more than
+2x. Run these groups on a quiesced multi-core host. Their value is the *shape* of
+the curve: a flat or inverted line from 1 to 4 threads means a new shared lock,
+and that shows up regardless of absolute noise.
+
+---
+
+## Measurement Hygiene
+
+The numbers above were produced on a laptop-class CPU, and the first attempt at
+an A/B comparison produced a result that was entirely an artifact of the
+machine. It is worth recording how, because the same trap applies to anyone
+reproducing these figures.
+
+Running "before" and "after" binaries in that order, repeatedly, made the
+"after" binary look **10% slower** on EC key generation and 40% slower on RSA
+key generation — because it was always measured second, on a hotter package. The
+same comparison with the order alternated and an 8-second cooldown between runs
+showed both were within noise of each other. A separate measurement taken
+immediately after a long compile read 3x *faster* than the identical
+measurement on a warm machine.
+
+For a comparison to mean anything:
+
+- alternate which binary runs first, and take medians across several pairs;
+- insert a cooldown between runs;
+- fix the CPU governor to `performance` and disable turbo where possible;
+- never compare a number from one session against a number from another.
+
+This machine also lacks the SHA-NI instruction set (Intel added it to
+mainstream Core parts only with Ice Lake), which makes every SHA-256-bound
+figure several times worse than it would be on a current server. Absolute
+values here are not portable; ratios within a single session are.
+
 ## Post-Quantum Cryptography
 
 PQC algorithms use pure-Rust implementations (ml-kem, ml-dsa crates) — no backend variation.
@@ -213,6 +383,29 @@ PQC algorithms use pure-Rust implementations (ml-kem, ml-dsa crates) — no back
 ---
 
 ## Running Benchmarks
+
+### Prerequisites
+
+The PKCS#11 ABI suite loads the built shared library and calls `C_Initialize`,
+which runs the power-on self-test. An unsigned local build has no integrity
+signature, so the POST refuses to start unless the development bypass is set:
+
+```bash
+export CRATON_HSM_INTEGRITY_BYPASS=unsafe-dev-only
+```
+
+This is a development-only escape hatch — never set it in production. CI sets it
+globally for the same reason.
+
+**RSA groups are skipped on a default release build.** Release builds provide no
+RustCrypto RSA private-key capability (RUSTSEC-2023-0071 / Marvin), so RSA
+signing *and* key-pair generation are refused; key-pair generation runs a
+pairwise consistency test that signs. Both suites detect this, print a note, and
+run every other group. To measure RSA, use the hardened backend:
+
+```bash
+cargo bench --bench pkcs11_abi_bench --no-default-features --features awslc-backend
+```
 
 ### Craton HSM Only
 
@@ -282,8 +475,9 @@ start target/criterion/report/index.html     # Windows
 
 ## Known Limitations
 
-- **Single-threaded**: All benchmarks run single-threaded due to PKCS#11's global singleton state
+- **Mostly single-threaded**: all groups except `pkcs11_concurrent_*` run single-threaded. The concurrent groups open one session per thread against the same token; PKCS#11's global singleton state means they cannot be run against two libraries simultaneously
 - **Warm cache**: Keys are pre-generated in setup; measured operations benefit from warm CPU caches
 - **No AES-GCM comparison**: AES-GCM is not compared with SoftHSMv2 due to differing parameter conventions
 - **RSA keygen variance**: RSA key generation time depends on prime number luck; results show high variance
 - **Release mode only**: `cargo bench` uses `--release` automatically; debug-mode numbers are not meaningful
+- **Host-dependent**: the reference machine has no SHA-NI, so SHA-256-bound figures are several times worse than on a current server. See "Measurement Hygiene" above before comparing across machines or sessions

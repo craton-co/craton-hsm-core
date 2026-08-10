@@ -669,3 +669,291 @@ fn test_stored_object_label_matching() {
     assert!(obj.matches_template(&[(0x03, b"mykey".to_vec())])); // CKA_LABEL
     assert!(!obj.matches_template(&[(0x03, b"other".to_vec())]));
 }
+
+// ===========================================================================
+// Audit chain format versioning and group commit
+//
+// The chain hash input changed from a `serde_json` encoding of the event
+// payload to the canonical binary encoding described in `src/audit/log.rs`
+// (`AUDIT_LOG_FORMAT_VERSION` 0 -> 1). These tests pin the properties that
+// change had to preserve: existing logs keep verifying, upgraded logs verify
+// end to end, and tampering is still detected.
+// ===========================================================================
+
+/// Build a process-unique temp path for a test audit log.
+fn audit_temp_path(tag: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "craton_hsm_audit_{}_{}_{}.log",
+        tag,
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    ));
+    let _ = std::fs::remove_file(&path);
+    path
+}
+
+#[test]
+fn test_audit_records_are_written_at_current_format_version() {
+    let path = audit_temp_path("format_version");
+    let log = AuditLog::new_with_path(path.clone()).expect("audit log should construct");
+
+    log.record_sync(
+        1,
+        AuditOperation::Login { user_type: 1 },
+        AuditResult::Success,
+        None,
+    )
+    .expect("record_sync should succeed");
+
+    let contents = std::fs::read_to_string(&path).expect("log file should be readable");
+    assert!(
+        contents.contains("\"format_version\":1"),
+        "new records must carry the current format version, got: {:?}",
+        contents,
+    );
+
+    drop(log);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn test_audit_chain_verifies_after_reopen() {
+    let path = audit_temp_path("reopen");
+
+    {
+        let log = AuditLog::new_with_path(path.clone()).expect("audit log should construct");
+        for i in 0..8 {
+            log.record_sync(
+                i,
+                AuditOperation::Sign {
+                    mechanism: 0x40,
+                    fips_approved: true,
+                },
+                AuditResult::Success,
+                Some(format!("key={}", i)),
+            )
+            .expect("record_sync should succeed");
+        }
+    }
+
+    // Reopening recovers and verifies the on-disk chain. A verification failure
+    // sets the tamper flag permanently, so this asserts the recorded chain and
+    // the recomputed chain agree under the new encoding.
+    let reopened = AuditLog::new_with_path(path.clone()).expect("audit log should reopen");
+    assert!(
+        !reopened.is_tamper_detected(),
+        "a chain written by this build must verify when reopened",
+    );
+
+    // Appending after recovery must keep the chain intact.
+    reopened
+        .record_sync(99, AuditOperation::Logout, AuditResult::Success, None)
+        .expect("append after recovery should succeed");
+    drop(reopened);
+
+    let third = AuditLog::new_with_path(path.clone()).expect("audit log should reopen again");
+    assert!(
+        !third.is_tamper_detected(),
+        "appending to a recovered chain must not break it",
+    );
+
+    drop(third);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn test_audit_chain_verifies_legacy_v0_records() {
+    // A log written by a build that predates the canonical binary encoding
+    // carries `format_version: 0` and was chained over the JSON payload.
+    // Verification dispatches on each record's own version, so such a file
+    // must still verify rather than being reported as tampered.
+    //
+    // The fixture below is generated rather than hard-coded: it recomputes the
+    // legacy chain the same way the old implementation did, so the test pins
+    // the *compatibility rule*, not a byte string that would silently rot.
+    use sha2::{Digest, Sha256};
+
+    let path = audit_temp_path("legacy_v0");
+
+    #[derive(serde::Serialize)]
+    struct LegacyPayload<'a> {
+        format_version: u32,
+        timestamp: u64,
+        session_handle: u64,
+        operation: &'a serde_json::Value,
+        key_id: &'a Option<String>,
+        result: &'a serde_json::Value,
+    }
+
+    let mut prev = [0u8; 32];
+    let mut lines = String::new();
+    for i in 1u64..=4 {
+        let operation = serde_json::json!({ "OpenSession": { "slot_id": i } });
+        let result = serde_json::json!("Success");
+        let key_id: Option<String> = None;
+
+        let payload = LegacyPayload {
+            format_version: 0,
+            timestamp: 1_000_000 + i,
+            session_handle: i,
+            operation: &operation,
+            key_id: &key_id,
+            result: &result,
+        };
+        let payload_bytes = serde_json::to_vec(&payload).expect("payload serializes");
+        let mut hasher = Sha256::new();
+        hasher.update(prev);
+        hasher.update(&payload_bytes);
+        let next: [u8; 32] = hasher.finalize().into();
+
+        let record = serde_json::json!({
+            "format_version": 0,
+            "timestamp": 1_000_000 + i,
+            "session_handle": i,
+            "operation": operation,
+            "key_id": key_id,
+            "result": result,
+            "previous_hash": prev.to_vec(),
+        });
+        lines.push_str(&serde_json::to_string(&record).expect("record serializes"));
+        lines.push('\n');
+        prev = next;
+    }
+    std::fs::write(&path, lines).expect("fixture should be writable");
+
+    let log = AuditLog::new_with_path(path.clone()).expect("audit log should open legacy file");
+    assert!(
+        !log.is_tamper_detected(),
+        "a legacy format_version=0 chain must still verify after the encoding change",
+    );
+
+    // An upgraded deployment appends v1 records to a v0 file. The mixed-version
+    // file must verify end to end on the next reopen.
+    log.record_sync(5, AuditOperation::Logout, AuditResult::Success, None)
+        .expect("appending a v1 record to a v0 file should succeed");
+    drop(log);
+
+    let mixed = AuditLog::new_with_path(path.clone()).expect("mixed-version file should open");
+    assert!(
+        !mixed.is_tamper_detected(),
+        "a file mixing v0 and v1 records must verify end to end",
+    );
+
+    drop(mixed);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn test_audit_chain_detects_tampering_on_disk() {
+    let path = audit_temp_path("tamper");
+
+    {
+        let log = AuditLog::new_with_path(path.clone()).expect("audit log should construct");
+        for i in 0..4 {
+            log.record_sync(
+                i,
+                AuditOperation::Login { user_type: 1 },
+                AuditResult::Success,
+                None,
+            )
+            .expect("record_sync should succeed");
+        }
+    }
+
+    // Flip a field in the second record. The chain hash covers the payload, so
+    // the third record's previous_hash no longer matches.
+    let contents = std::fs::read_to_string(&path).expect("log should be readable");
+    let mut lines: Vec<String> = contents.lines().map(str::to_string).collect();
+    assert!(lines.len() >= 4, "expected 4 records, got {}", lines.len());
+    lines[1] = lines[1].replace("\"user_type\":1", "\"user_type\":0");
+    assert!(
+        lines[1].contains("\"user_type\":0"),
+        "tamper fixture must actually modify the record",
+    );
+    std::fs::write(&path, lines.join("\n") + "\n").expect("log should be writable");
+
+    let reopened = AuditLog::new_with_path(path.clone()).expect("audit log should open");
+    assert!(
+        reopened.is_tamper_detected(),
+        "modifying a record's payload must break chain verification",
+    );
+
+    // Once tamper is detected the log must refuse further records.
+    let err = reopened.record(0, AuditOperation::Logout, AuditResult::Success, None);
+    assert!(
+        err.is_err(),
+        "record() must refuse to append after tamper detection",
+    );
+
+    drop(reopened);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn test_audit_group_commit_preserves_order_and_chain() {
+    // The worker coalesces queued events into one write + fsync. Ordering,
+    // timestamp monotonicity, and chain integrity must all survive batching.
+    let path = audit_temp_path("group_commit");
+    let log = AuditLog::new_with_path(path.clone()).expect("audit log should construct");
+
+    const N: u64 = 500;
+    for i in 0..N {
+        log.record(
+            i,
+            AuditOperation::Digest {
+                mechanism: 0x250,
+                fips_approved: true,
+            },
+            AuditResult::Success,
+            None,
+        )
+        .expect("record should enqueue");
+    }
+    log.flush().expect("flush should drain the worker");
+
+    let entries = log.get_entries();
+    assert_eq!(
+        entries.len() as u64,
+        N,
+        "every enqueued event must be committed",
+    );
+    for (i, entry) in entries.iter().enumerate() {
+        assert_eq!(
+            entry.session_handle, i as u64,
+            "batched events must be committed in enqueue order",
+        );
+    }
+    for pair in entries.windows(2) {
+        assert!(
+            pair[1].timestamp > pair[0].timestamp,
+            "timestamps must stay strictly monotonic across a batch",
+        );
+    }
+    assert_eq!(
+        log.verify_chain(),
+        Ok(entries.len()),
+        "the in-memory chain must verify after group commit",
+    );
+
+    drop(log);
+
+    // The on-disk chain must verify too, and hold exactly the same events.
+    let reopened = AuditLog::new_with_path(path.clone()).expect("audit log should reopen");
+    assert!(
+        !reopened.is_tamper_detected(),
+        "the group-committed on-disk chain must verify",
+    );
+    let on_disk =
+        craton_hsm::audit::log::load_entries_from_file(&path).expect("on-disk entries should load");
+    assert_eq!(
+        on_disk.len() as u64,
+        N,
+        "every event must reach disk, not just memory",
+    );
+
+    drop(reopened);
+    let _ = std::fs::remove_file(&path);
+}

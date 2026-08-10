@@ -78,6 +78,17 @@ The cryptographic module boundary encompasses all code that handles key material
 
 ## Self-Test Coverage (POST) — 17 tests (integrity + 16 KATs) ✅
 
+**RSA KAT and the RUSTSEC-2023-0071 gate.** Release builds of the RustCrypto
+backend refuse RSA *private-key* operations because the `rsa` crate is subject to
+the Marvin timing attack, so RSA signature **generation** is not a security
+function those builds provide. The POST's RSA KAT therefore branches: where
+private-key operations are available it runs the sign/verify roundtrip, and where
+they are not it runs a verify-only known-answer test against a fixed vector,
+including a negative case so a verifier that accepts everything cannot pass. This
+keeps a KAT for every approved function the module actually provides. Before this
+branch existed the KAT signed unconditionally, so the POST — and therefore
+`C_Initialize` — failed on every release build.
+
 All P0 POST KATs have been implemented. Security audit (v0.9.1) upgraded AES-CBC/CTR from circular roundtrip tests to genuine known-answer tests with hardcoded expected ciphertexts, and added RSA PKCS#1 v1.5 KAT.
 
 | Test | Algorithm | Vector Source | Type | Status |
@@ -93,7 +104,7 @@ All P0 POST KATs have been implemented. Security audit (v0.9.1) upgraded AES-CBC
 | AES-GCM KAT | AES-256-GCM | Fixed key | Roundtrip + known-answer decrypt | ✅ |
 | AES-CBC KAT | AES-256-CBC | Fixed key/IV | Known Answer (hardcoded ciphertext) | ✅ v0.9.1 upgraded |
 | AES-CTR KAT | AES-256-CTR | Fixed key/IV | Known Answer (hardcoded ciphertext) | ✅ v0.9.1 upgraded |
-| RSA 2048 KAT | RSA 2048 PKCS#1 v1.5 | Generated key | Sign/Verify roundtrip | ✅ v0.9.1 added |
+| RSA 2048 KAT | RSA 2048 PKCS#1 v1.5 | Generated key, or fixed vector | Sign/Verify roundtrip, or Verify-only (positive + negative) | ✅ v0.9.1 added; capability-aware since the RUSTSEC-2023-0071 gate |
 | ECDSA roundtrip | ECDSA P-256 | Generated key | Sign/Verify | ✅ |
 | ML-DSA roundtrip | ML-DSA-44 | Generated key | Sign/Verify | ✅ |
 | ML-KEM roundtrip | ML-KEM-768 | Generated key | Encap/Decap | ✅ Phase 6 |

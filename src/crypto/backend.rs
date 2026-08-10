@@ -324,6 +324,23 @@ pub trait CryptoBackend: Send + Sync {
 
     fn generate_aes_key(&self, key_len_bytes: usize, fips_mode: bool) -> HsmResult<RawKeyMaterial>;
 
+    /// Whether this backend can perform RSA **private-key** operations
+    /// (signing, decryption, and therefore key-pair generation, which must run
+    /// a pairwise consistency test that signs).
+    ///
+    /// The RustCrypto backend answers `false` in release builds because the
+    /// `rsa` crate is subject to the Marvin timing attack (RUSTSEC-2023-0071).
+    /// Callers must consult this *before* generating a key pair: attempting
+    /// generation and letting the pairwise consistency test fail is treated as
+    /// a catastrophic cryptographic failure and latches the module error state,
+    /// which would disable every other algorithm too.
+    ///
+    /// Defaults to `true`, so a backend that has no such restriction does not
+    /// need to implement it.
+    fn supports_rsa_private_ops(&self) -> bool {
+        true
+    }
+
     /// Returns (private_key_der, public_modulus, public_exponent)
     fn generate_rsa_key_pair(
         &self,

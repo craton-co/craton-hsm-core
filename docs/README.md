@@ -31,6 +31,7 @@
 - [Audit Scope](audit-scope.md) — algorithm inventory, POST coverage, test suites
 - [Security Review Checklist](security-review-checklist.md) — pre-audit self-assessment
 - [Benchmarks](benchmarks.md) — performance measurements and SoftHSMv2 comparison
+- [Performance Tuning](performance-tuning.md) — build flags, PGO, profiling workflow, deployment tuning, and the optimisations rejected for security reasons
 - [Tested Platforms](tested-platforms.md) — platform support matrix, CI pipeline
 
 ## Operations & Release

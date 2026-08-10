@@ -392,6 +392,43 @@ impl HsmServiceImpl {
     }
 }
 
+/// Run a synchronous HSM operation without stalling the async reactor.
+///
+/// Every RPC handler in this file is internally synchronous, and several of
+/// them are synchronous for a *long* time:
+///
+/// * `login` / `init_pin` / `set_pin` derive a key with 600,000 PBKDF2-HMAC-
+///   SHA256 iterations — deliberately expensive, on the order of hundreds of
+///   milliseconds of pure CPU.
+/// * `generate_key_pair` runs RSA key generation, hundreds of milliseconds.
+/// * `sign` / `verify` / `decrypt` run multi-millisecond public-key arithmetic.
+/// * Object creation commits to redb, which `fsync`s.
+///
+/// Running that directly inside `async fn` occupies a Tokio worker thread for
+/// the whole operation, so a handful of concurrent logins could stall every
+/// other connection served by the same workers — including health checks and
+/// TLS handshakes.
+///
+/// [`tokio::task::block_in_place`] tells the multi-threaded runtime to move the
+/// remaining tasks off this worker and treat it as a blocking thread for the
+/// duration, which keeps the reactor responsive. It is preferred over
+/// `spawn_blocking` here because the handler bodies borrow `&self` and hold
+/// non-`Send` `parking_lot` guards across the work; `block_in_place` runs the
+/// closure on the current thread and so imposes no `Send`/`'static` bound.
+///
+/// `block_in_place` panics on a current-thread runtime, and tonic's own unit
+/// tests use one, so this falls back to calling the closure directly whenever
+/// the multi-threaded runtime is not what is actually running us. The daemon
+/// itself uses `#[tokio::main]`, which is multi-threaded.
+fn blocking<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+
 /// (#12) Safely convert a u64 (from protobuf) to CK_ULONG without silent truncation.
 fn to_ck_ulong(value: u64, field_name: &str) -> Result<CK_ULONG, Status> {
     value.try_into().map_err(|_| {
@@ -468,1891 +505,1964 @@ impl HsmService for HsmServiceImpl {
         &self,
         request: Request<OpenSessionRequest>,
     ) -> Result<Response<OpenSessionResponse>, Status> {
-        let client_id = client_id_from_request(&request);
-        let req = request.into_inner();
-        let slot_id = to_ck_ulong(req.slot_id, "slot_id")?;
-        let flags = if req.read_write {
-            CKF_SERIAL_SESSION | CKF_RW_SESSION
-        } else {
-            CKF_SERIAL_SESSION
-        };
+        blocking(|| {
+            let client_id = client_id_from_request(&request);
+            let req = request.into_inner();
+            let slot_id = to_ck_ulong(req.slot_id, "slot_id")?;
+            let flags = if req.read_write {
+                CKF_SERIAL_SESSION | CKF_RW_SESSION
+            } else {
+                CKF_SERIAL_SESSION
+            };
 
-        let token = self
-            .hsm
-            .slot_manager()
-            .get_token(slot_id)
-            .map_err(hsm_err_to_status)?;
-        let handle = self
-            .hsm
-            .session_manager()
-            .open_session(slot_id, flags as CK_ULONG, &token)
-            .map_err(hsm_err_to_status)?;
+            let token = self
+                .hsm
+                .slot_manager()
+                .get_token(slot_id)
+                .map_err(hsm_err_to_status)?;
+            let handle = self
+                .hsm
+                .session_manager()
+                .open_session(slot_id, flags as CK_ULONG, &token)
+                .map_err(hsm_err_to_status)?;
 
-        // (#18) Audit session open
-        self.audit(
-            handle as u64,
-            AuditOperation::OpenSession {
-                slot_id: slot_id as u64,
-            },
-            AuditResult::Success,
-            None,
-            &client_id,
-        )?;
+            // (#18) Audit session open
+            self.audit(
+                handle as u64,
+                AuditOperation::OpenSession {
+                    slot_id: slot_id as u64,
+                },
+                AuditResult::Success,
+                None,
+                &client_id,
+            )?;
 
-        Ok(Response::new(OpenSessionResponse {
-            session_handle: handle as u64,
-        }))
+            Ok(Response::new(OpenSessionResponse {
+                session_handle: handle as u64,
+            }))
+        })
     }
 
     async fn close_session(
         &self,
         request: Request<CloseSessionRequest>,
     ) -> Result<Response<CloseSessionResponse>, Status> {
-        let client_id = client_id_from_request(&request);
-        let req = request.into_inner();
-        let session_handle = to_ck_ulong(req.session_handle, "session_handle")?;
-        // (#2) Derive slot_id from session, not hardcoded 0
-        let slot_id = require_session(&self.hsm, req.session_handle)?;
-        let token = self
-            .hsm
-            .slot_manager()
-            .get_token(slot_id)
-            .map_err(hsm_err_to_status)?;
-        self.hsm
-            .session_manager()
-            .close_session(session_handle, &token)
-            .map_err(hsm_err_to_status)?;
+        blocking(|| {
+            let client_id = client_id_from_request(&request);
+            let req = request.into_inner();
+            let session_handle = to_ck_ulong(req.session_handle, "session_handle")?;
+            // (#2) Derive slot_id from session, not hardcoded 0
+            let slot_id = require_session(&self.hsm, req.session_handle)?;
+            let token = self
+                .hsm
+                .slot_manager()
+                .get_token(slot_id)
+                .map_err(hsm_err_to_status)?;
+            self.hsm
+                .session_manager()
+                .close_session(session_handle, &token)
+                .map_err(hsm_err_to_status)?;
 
-        // (#18) Audit session close
-        self.audit(
-            req.session_handle,
-            AuditOperation::CloseSession,
-            AuditResult::Success,
-            None,
-            &client_id,
-        )?;
+            // (#18) Audit session close
+            self.audit(
+                req.session_handle,
+                AuditOperation::CloseSession,
+                AuditResult::Success,
+                None,
+                &client_id,
+            )?;
 
-        Ok(Response::new(CloseSessionResponse {}))
+            Ok(Response::new(CloseSessionResponse {}))
+        })
     }
 
     async fn login(
         &self,
         request: Request<LoginRequest>,
     ) -> Result<Response<LoginResponse>, Status> {
-        let client_id = client_id_from_request(&request);
-        let mut req = request.into_inner();
+        blocking(|| {
+            let client_id = client_id_from_request(&request);
+            let mut req = request.into_inner();
 
-        // (#11-fix) Validate user_type against PKCS#11 constants before passing to core.
-        let user_type_ck = to_ck_ulong(req.user_type, "user_type")?;
-        if user_type_ck != CKU_USER
-            && user_type_ck != CKU_SO
-            && user_type_ck != CKU_CONTEXT_SPECIFIC
-        {
-            return Err(Status::invalid_argument(format!(
-                "Invalid user_type {}. Expected CKU_USER (1), CKU_SO (0), or CKU_CONTEXT_SPECIFIC (2)",
-                req.user_type
-            )));
-        }
-
-        // (#3) Validate the session handle — login requires a valid session per PKCS#11
-        let slot_id = require_session(&self.hsm, req.session_handle)?;
-
-        // (#5) Check brute-force throttle on (slot_id, client_id) — keying on
-        // slot alone would let any source lock out every other source.
-        let throttle_key = ThrottleKey::new(slot_id, client_id.clone());
-        self.check_login_throttle(&throttle_key)?;
-
-        // (#2) Use slot from session, not hardcoded 0
-        let token = self
-            .hsm
-            .slot_manager()
-            .get_token(slot_id)
-            .map_err(hsm_err_to_status)?;
-
-        // (#2) PIN is now `bytes` in proto — use directly, then zeroize
-        let result = token.login(user_type_ck, &req.pin);
-
-        // Zeroize PIN material immediately after use, regardless of outcome
-        req.pin.zeroize();
-
-        match result {
-            Ok(()) => {
-                // (#5) Clear failed attempts on success
-                self.clear_login_attempts(&throttle_key);
-
-                // (#18) Audit successful login
-                self.audit(
-                    req.session_handle,
-                    AuditOperation::Login {
-                        user_type: req.user_type,
-                    },
-                    AuditResult::Success,
-                    None,
-                    &client_id,
-                )?;
-
-                Ok(Response::new(LoginResponse {}))
+            // (#11-fix) Validate user_type against PKCS#11 constants before passing to core.
+            let user_type_ck = to_ck_ulong(req.user_type, "user_type")?;
+            if user_type_ck != CKU_USER
+                && user_type_ck != CKU_SO
+                && user_type_ck != CKU_CONTEXT_SPECIFIC
+            {
+                return Err(Status::invalid_argument(format!(
+                    "Invalid user_type {}. Expected CKU_USER (1), CKU_SO (0), or CKU_CONTEXT_SPECIFIC (2)",
+                    req.user_type
+                )));
             }
-            Err(e) => {
-                // (#5) Record failed attempt against (slot_id, client_id)
-                self.record_login_failure(&throttle_key);
 
-                // (#18) Audit failed login — convert to status (which also logs server-side)
-                let status = hsm_err_to_status(e);
+            // (#3) Validate the session handle — login requires a valid session per PKCS#11
+            let slot_id = require_session(&self.hsm, req.session_handle)?;
 
-                // (#30) Log audit failure but return the original login error to the
-                // client — otherwise an audit failure would mask the real error and
-                // leak internal state (audit failures return a different error code).
-                if let Err(audit_err) = self.audit(
-                    req.session_handle,
-                    AuditOperation::Login {
-                        user_type: req.user_type,
-                    },
-                    AuditResult::Failure(0),
-                    None,
-                    &client_id,
-                ) {
-                    tracing::error!("Audit write failed for login failure: {:?}", audit_err);
+            // (#5) Check brute-force throttle on (slot_id, client_id) — keying on
+            // slot alone would let any source lock out every other source.
+            let throttle_key = ThrottleKey::new(slot_id, client_id.clone());
+            self.check_login_throttle(&throttle_key)?;
+
+            // (#2) Use slot from session, not hardcoded 0
+            let token = self
+                .hsm
+                .slot_manager()
+                .get_token(slot_id)
+                .map_err(hsm_err_to_status)?;
+
+            // (#2) PIN is now `bytes` in proto — use directly, then zeroize
+            let result = token.login(user_type_ck, &req.pin);
+
+            // Zeroize PIN material immediately after use, regardless of outcome
+            req.pin.zeroize();
+
+            match result {
+                Ok(()) => {
+                    // (#5) Clear failed attempts on success
+                    self.clear_login_attempts(&throttle_key);
+
+                    // (#18) Audit successful login
+                    self.audit(
+                        req.session_handle,
+                        AuditOperation::Login {
+                            user_type: req.user_type,
+                        },
+                        AuditResult::Success,
+                        None,
+                        &client_id,
+                    )?;
+
+                    Ok(Response::new(LoginResponse {}))
                 }
+                Err(e) => {
+                    // (#5) Record failed attempt against (slot_id, client_id)
+                    self.record_login_failure(&throttle_key);
 
-                Err(status)
+                    // (#18) Audit failed login — convert to status (which also logs server-side)
+                    let status = hsm_err_to_status(e);
+
+                    // (#30) Log audit failure but return the original login error to the
+                    // client — otherwise an audit failure would mask the real error and
+                    // leak internal state (audit failures return a different error code).
+                    if let Err(audit_err) = self.audit(
+                        req.session_handle,
+                        AuditOperation::Login {
+                            user_type: req.user_type,
+                        },
+                        AuditResult::Failure(0),
+                        None,
+                        &client_id,
+                    ) {
+                        tracing::error!("Audit write failed for login failure: {:?}", audit_err);
+                    }
+
+                    Err(status)
+                }
             }
-        }
+        })
     }
 
     async fn logout(
         &self,
         request: Request<LogoutRequest>,
     ) -> Result<Response<LogoutResponse>, Status> {
-        let client_id = client_id_from_request(&request);
-        let req = request.into_inner();
+        blocking(|| {
+            let client_id = client_id_from_request(&request);
+            let req = request.into_inner();
 
-        // (#3) Validate the session handle — logout requires a valid session per PKCS#11
-        let slot_id = require_session(&self.hsm, req.session_handle)?;
+            // (#3) Validate the session handle — logout requires a valid session per PKCS#11
+            let slot_id = require_session(&self.hsm, req.session_handle)?;
 
-        // (#2) Use slot from session, not hardcoded 0
-        let token = self
-            .hsm
-            .slot_manager()
-            .get_token(slot_id)
-            .map_err(hsm_err_to_status)?;
+            // (#2) Use slot from session, not hardcoded 0
+            let token = self
+                .hsm
+                .slot_manager()
+                .get_token(slot_id)
+                .map_err(hsm_err_to_status)?;
 
-        token.logout().map_err(hsm_err_to_status)?;
+            token.logout().map_err(hsm_err_to_status)?;
 
-        // (#18) Audit logout
-        self.audit(
-            req.session_handle,
-            AuditOperation::Logout,
-            AuditResult::Success,
-            None,
-            &client_id,
-        )?;
+            // (#18) Audit logout
+            self.audit(
+                req.session_handle,
+                AuditOperation::Logout,
+                AuditResult::Success,
+                None,
+                &client_id,
+            )?;
 
-        Ok(Response::new(LogoutResponse {}))
+            Ok(Response::new(LogoutResponse {}))
+        })
     }
 
     async fn get_token_info(
         &self,
         request: Request<GetTokenInfoRequest>,
     ) -> Result<Response<GetTokenInfoResponse>, Status> {
-        let req = request.into_inner();
-        let slot_id = to_ck_ulong(req.slot_id, "slot_id")?;
+        blocking(|| {
+            let req = request.into_inner();
+            let slot_id = to_ck_ulong(req.slot_id, "slot_id")?;
 
-        // (#26) Require a valid session to prevent unauthenticated slot enumeration.
-        // Callers must supply a session_handle to prove they have an open session
-        // on this slot. This prevents reconnaissance of token state (login_state,
-        // session counts, initialized status) by unauthenticated callers.
-        if req.session_handle != 0 {
-            let session_slot = require_session(&self.hsm, req.session_handle)?;
-            if session_slot != slot_id {
-                return Err(Status::permission_denied(
-                    "Session does not belong to the requested slot",
+            // (#26) Require a valid session to prevent unauthenticated slot enumeration.
+            // Callers must supply a session_handle to prove they have an open session
+            // on this slot. This prevents reconnaissance of token state (login_state,
+            // session counts, initialized status) by unauthenticated callers.
+            if req.session_handle != 0 {
+                let session_slot = require_session(&self.hsm, req.session_handle)?;
+                if session_slot != slot_id {
+                    return Err(Status::permission_denied(
+                        "Session does not belong to the requested slot",
+                    ));
+                }
+            } else {
+                return Err(Status::invalid_argument(
+                    "session_handle is required — open a session first",
                 ));
             }
-        } else {
-            return Err(Status::invalid_argument(
-                "session_handle is required — open a session first",
-            ));
-        }
 
-        let token = self
-            .hsm
-            .slot_manager()
-            .get_token(slot_id)
-            .map_err(hsm_err_to_status)?;
+            let token = self
+                .hsm
+                .slot_manager()
+                .get_token(slot_id)
+                .map_err(hsm_err_to_status)?;
 
-        // Only expose non-sensitive fields to unauthenticated callers
-        let is_logged_in = !matches!(token.login_state(), LoginState::Public);
+            // Only expose non-sensitive fields to unauthenticated callers
+            let is_logged_in = !matches!(token.login_state(), LoginState::Public);
 
-        let mut response = GetTokenInfoResponse {
-            label: String::new(),
-            initialized: token.is_initialized(),
-            user_pin_initialized: token.is_user_pin_initialized(),
-            // (#5) Redact login state for unauthenticated callers
-            login_state: if is_logged_in {
-                format!("{:?}", token.login_state())
-            } else {
-                "Restricted".to_string()
-            },
-            // (#5) Redact session counts for unauthenticated callers
-            session_count: 0,
-            max_sessions: token.max_sessions(),
-            rw_session_count: 0,
-            max_rw_sessions: token.max_rw_sessions(),
-        };
+            let mut response = GetTokenInfoResponse {
+                label: String::new(),
+                initialized: token.is_initialized(),
+                user_pin_initialized: token.is_user_pin_initialized(),
+                // (#5) Redact login state for unauthenticated callers
+                login_state: if is_logged_in {
+                    format!("{:?}", token.login_state())
+                } else {
+                    "Restricted".to_string()
+                },
+                // (#5) Redact session counts for unauthenticated callers
+                session_count: 0,
+                max_sessions: token.max_sessions(),
+                rw_session_count: 0,
+                max_rw_sessions: token.max_rw_sessions(),
+            };
 
-        if is_logged_in {
-            response.session_count = token.session_count();
-            response.rw_session_count = token.rw_session_count();
-        }
+            if is_logged_in {
+                response.session_count = token.session_count();
+                response.rw_session_count = token.rw_session_count();
+            }
 
-        Ok(Response::new(response))
+            Ok(Response::new(response))
+        })
     }
 
     async fn init_token(
         &self,
         request: Request<InitTokenRequest>,
     ) -> Result<Response<InitTokenResponse>, Status> {
-        let client_id = client_id_from_request(&request);
-        let mut req = request.into_inner();
-        let slot_id = to_ck_ulong(req.slot_id, "slot_id")?;
+        blocking(|| {
+            let client_id = client_id_from_request(&request);
+            let mut req = request.into_inner();
+            let slot_id = to_ck_ulong(req.slot_id, "slot_id")?;
 
-        // (#21) Check brute-force throttle keyed on (slot_id, client_id)
-        // before attempting InitToken. A successful SO PIN brute-force
-        // reinitializes the token, destroying all keys, so the per-client
-        // key is essential to prevent cross-client lockout.
-        let throttle_key = ThrottleKey::new(slot_id, client_id.clone());
-        self.check_init_token_throttle(&throttle_key)?;
+            // (#21) Check brute-force throttle keyed on (slot_id, client_id)
+            // before attempting InitToken. A successful SO PIN brute-force
+            // reinitializes the token, destroying all keys, so the per-client
+            // key is essential to prevent cross-client lockout.
+            let throttle_key = ThrottleKey::new(slot_id, client_id.clone());
+            self.check_init_token_throttle(&throttle_key)?;
 
-        let token = self
-            .hsm
-            .slot_manager()
-            .get_token(slot_id)
-            .map_err(hsm_err_to_status)?;
+            let token = self
+                .hsm
+                .slot_manager()
+                .get_token(slot_id)
+                .map_err(hsm_err_to_status)?;
 
-        let mut label_bytes = [b' '; 32];
-        let copy_len = req.label.len().min(32);
-        label_bytes[..copy_len].copy_from_slice(&req.label.as_bytes()[..copy_len]);
+            let mut label_bytes = [b' '; 32];
+            let copy_len = req.label.len().min(32);
+            label_bytes[..copy_len].copy_from_slice(&req.label.as_bytes()[..copy_len]);
 
-        // (#2) SO PIN is now `bytes` in proto — use directly, then zeroize
-        let result = token.init_token(&req.so_pin, &label_bytes);
+            // (#2) SO PIN is now `bytes` in proto — use directly, then zeroize
+            let result = token.init_token(&req.so_pin, &label_bytes);
 
-        // Zeroize SO PIN material immediately after use
-        req.so_pin.zeroize();
+            // Zeroize SO PIN material immediately after use
+            req.so_pin.zeroize();
 
-        match result {
-            Ok(()) => {
-                // (#21) Clear failed attempts on success
-                self.clear_init_token_attempts(&throttle_key);
+            match result {
+                Ok(()) => {
+                    // (#21) Clear failed attempts on success
+                    self.clear_init_token_attempts(&throttle_key);
 
-                // (#18) Audit token initialization
-                self.audit(
-                    0, // No session for InitToken
-                    AuditOperation::InitToken {
-                        slot_id: slot_id as u64,
-                    },
-                    AuditResult::Success,
-                    None,
-                    &client_id,
-                )?;
-                tracing::warn!(
-                    slot_id,
-                    client_id = client_id.as_str(),
-                    "Token initialized via gRPC"
-                );
-                Ok(Response::new(InitTokenResponse {}))
-            }
-            Err(e) => {
-                // (#21) Record failed attempt against (slot_id, client_id)
-                self.record_init_token_failure(&throttle_key);
-
-                // (#18) Audit failed init attempt
-                let status = hsm_err_to_status(e);
-                // (#30) Log audit failure but return the original error
-                if let Err(audit_err) = self.audit(
-                    0,
-                    AuditOperation::InitToken {
-                        slot_id: slot_id as u64,
-                    },
-                    AuditResult::Failure(0),
-                    None,
-                    &client_id,
-                ) {
-                    tracing::error!("Audit write failed for InitToken failure: {:?}", audit_err);
+                    // (#18) Audit token initialization
+                    self.audit(
+                        0, // No session for InitToken
+                        AuditOperation::InitToken {
+                            slot_id: slot_id as u64,
+                        },
+                        AuditResult::Success,
+                        None,
+                        &client_id,
+                    )?;
+                    tracing::warn!(
+                        slot_id,
+                        client_id = client_id.as_str(),
+                        "Token initialized via gRPC"
+                    );
+                    Ok(Response::new(InitTokenResponse {}))
                 }
-                Err(status)
+                Err(e) => {
+                    // (#21) Record failed attempt against (slot_id, client_id)
+                    self.record_init_token_failure(&throttle_key);
+
+                    // (#18) Audit failed init attempt
+                    let status = hsm_err_to_status(e);
+                    // (#30) Log audit failure but return the original error
+                    if let Err(audit_err) = self.audit(
+                        0,
+                        AuditOperation::InitToken {
+                            slot_id: slot_id as u64,
+                        },
+                        AuditResult::Failure(0),
+                        None,
+                        &client_id,
+                    ) {
+                        tracing::error!(
+                            "Audit write failed for InitToken failure: {:?}",
+                            audit_err
+                        );
+                    }
+                    Err(status)
+                }
             }
-        }
+        })
     }
 
     async fn generate_key(
         &self,
         request: Request<GenerateKeyRequest>,
     ) -> Result<Response<GenerateKeyResponse>, Status> {
-        let client_id = client_id_from_request(&request);
-        let req = request.into_inner();
+        blocking(|| {
+            let client_id = client_id_from_request(&request);
+            let req = request.into_inner();
 
-        let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
+            let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
 
-        let mech = req
-            .mechanism
-            .ok_or_else(|| Status::invalid_argument("mechanism required"))?;
-        let mech_type = to_ck_ulong(mech.mechanism_type, "mechanism_type")?;
+            let mech = req
+                .mechanism
+                .ok_or_else(|| Status::invalid_argument("mechanism required"))?;
+            let mech_type = to_ck_ulong(mech.mechanism_type, "mechanism_type")?;
 
-        if !craton_hsm::crypto::mechanisms::is_keygen_mechanism(mech_type) {
-            return Err(Status::invalid_argument(
-                "Unsupported key generation mechanism",
-            ));
-        }
-
-        // Validate algorithm policy
-        craton_hsm::crypto::mechanisms::validate_mechanism_for_policy(
-            mech_type,
-            self.hsm.algorithm_config(),
-            false,
-        )
-        .map_err(|_| Status::permission_denied("Mechanism blocked by algorithm policy"))?;
-
-        let fips_mode = self.hsm.algorithm_config().fips_approved_only;
-        let fips_approved = craton_hsm::crypto::mechanisms::is_fips_approved(mech_type);
-
-        // Parse template for CKA_VALUE_LEN (key size in bytes)
-        let template = proto_attrs_to_template(&req.template)?;
-        let key_len = template
-            .iter()
-            .find(|(t, _)| *t == CKA_VALUE_LEN)
-            .and_then(|(_, v)| craton_hsm::store::attributes::read_ck_ulong(v))
-            .ok_or_else(|| {
-                Status::invalid_argument("CKA_VALUE_LEN required in template for key generation")
-            })? as usize;
-
-        // Generate key material based on mechanism
-        let key_material = match mech_type {
-            CKM_AES_KEY_GEN => craton_hsm::crypto::keygen::generate_aes_key(key_len, fips_mode)
-                .map_err(hsm_err_to_status)?,
-            _ => return Err(Status::invalid_argument("Unsupported keygen mechanism")),
-        };
-
-        // Build StoredObject
-        let handle = self
-            .hsm
-            .object_store()
-            .next_handle()
-            .map_err(hsm_err_to_status)?;
-        let mut obj = craton_hsm::store::object::StoredObject::new(handle, CKO_SECRET_KEY);
-        obj.slot_id = slot_id;
-        obj.key_type = Some(CKK_AES);
-        obj.value_len = Some(key_len as CK_ULONG);
-        obj.key_material = Some(key_material);
-        obj.can_encrypt = true;
-        obj.can_decrypt = true;
-        obj.sensitive = true;
-        obj.extractable = false;
-
-        // Apply template attributes (label, token, private, etc.)
-        for (attr_type, value) in &template {
-            if *attr_type == CKA_VALUE_LEN {
-                continue; // already handled
+            if !craton_hsm::crypto::mechanisms::is_keygen_mechanism(mech_type) {
+                return Err(Status::invalid_argument(
+                    "Unsupported key generation mechanism",
+                ));
             }
-            craton_hsm::store::attributes::apply_attribute(&mut obj, *attr_type, value)
+
+            // Validate algorithm policy
+            craton_hsm::crypto::mechanisms::validate_mechanism_for_policy(
+                mech_type,
+                self.hsm.algorithm_config(),
+                false,
+            )
+            .map_err(|_| Status::permission_denied("Mechanism blocked by algorithm policy"))?;
+
+            let fips_mode = self.hsm.algorithm_config().fips_approved_only;
+            let fips_approved = craton_hsm::crypto::mechanisms::is_fips_approved(mech_type);
+
+            // Parse template for CKA_VALUE_LEN (key size in bytes)
+            let template = proto_attrs_to_template(&req.template)?;
+            let key_len = template
+                .iter()
+                .find(|(t, _)| *t == CKA_VALUE_LEN)
+                .and_then(|(_, v)| craton_hsm::store::attributes::read_ck_ulong(v))
+                .ok_or_else(|| {
+                    Status::invalid_argument(
+                        "CKA_VALUE_LEN required in template for key generation",
+                    )
+                })? as usize;
+
+            // Generate key material based on mechanism
+            let key_material = match mech_type {
+                CKM_AES_KEY_GEN => craton_hsm::crypto::keygen::generate_aes_key(key_len, fips_mode)
+                    .map_err(hsm_err_to_status)?,
+                _ => return Err(Status::invalid_argument("Unsupported keygen mechanism")),
+            };
+
+            // Build StoredObject
+            let handle = self
+                .hsm
+                .object_store()
+                .next_handle()
                 .map_err(hsm_err_to_status)?;
-        }
+            let mut obj = craton_hsm::store::object::StoredObject::new(handle, CKO_SECRET_KEY);
+            obj.slot_id = slot_id;
+            obj.key_type = Some(CKK_AES);
+            obj.value_len = Some(key_len as CK_ULONG);
+            obj.key_material = Some(key_material);
+            obj.can_encrypt = true;
+            obj.can_decrypt = true;
+            obj.sensitive = true;
+            obj.extractable = false;
 
-        let key_handle = self
-            .hsm
-            .object_store()
-            .insert_object(obj)
-            .map_err(hsm_err_to_status)?;
+            // Apply template attributes (label, token, private, etc.)
+            for (attr_type, value) in &template {
+                if *attr_type == CKA_VALUE_LEN {
+                    continue; // already handled
+                }
+                craton_hsm::store::attributes::apply_attribute(&mut obj, *attr_type, value)
+                    .map_err(hsm_err_to_status)?;
+            }
 
-        self.audit(
-            req.session_handle,
-            AuditOperation::GenerateKey {
-                mechanism: mech_type as u64,
-                key_length: key_len as u32,
-                fips_approved,
-            },
-            AuditResult::Success,
-            Some(format!("handle={}", key_handle)),
-            &client_id,
-        )?;
+            let key_handle = self
+                .hsm
+                .object_store()
+                .insert_object(obj)
+                .map_err(hsm_err_to_status)?;
 
-        Ok(Response::new(GenerateKeyResponse {
-            key_handle: key_handle as u64,
-        }))
+            self.audit(
+                req.session_handle,
+                AuditOperation::GenerateKey {
+                    mechanism: mech_type as u64,
+                    key_length: key_len as u32,
+                    fips_approved,
+                },
+                AuditResult::Success,
+                Some(format!("handle={}", key_handle)),
+                &client_id,
+            )?;
+
+            Ok(Response::new(GenerateKeyResponse {
+                key_handle: key_handle as u64,
+            }))
+        })
     }
 
     async fn generate_key_pair(
         &self,
         request: Request<GenerateKeyPairRequest>,
     ) -> Result<Response<GenerateKeyPairResponse>, Status> {
-        let client_id = client_id_from_request(&request);
-        let req = request.into_inner();
+        blocking(|| {
+            let client_id = client_id_from_request(&request);
+            let req = request.into_inner();
 
-        let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
+            let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
 
-        let mech = req
-            .mechanism
-            .ok_or_else(|| Status::invalid_argument("mechanism required"))?;
-        let mech_type = to_ck_ulong(mech.mechanism_type, "mechanism_type")?;
+            let mech = req
+                .mechanism
+                .ok_or_else(|| Status::invalid_argument("mechanism required"))?;
+            let mech_type = to_ck_ulong(mech.mechanism_type, "mechanism_type")?;
 
-        if !craton_hsm::crypto::mechanisms::is_keypair_gen_mechanism(mech_type) {
-            return Err(Status::invalid_argument(
-                "Unsupported key pair generation mechanism",
-            ));
-        }
-
-        craton_hsm::crypto::mechanisms::validate_mechanism_for_policy(
-            mech_type,
-            self.hsm.algorithm_config(),
-            false,
-        )
-        .map_err(|_| Status::permission_denied("Mechanism blocked by algorithm policy"))?;
-
-        let fips_mode = self.hsm.algorithm_config().fips_approved_only;
-        let fips_approved = craton_hsm::crypto::mechanisms::is_fips_approved(mech_type);
-        let pub_template = proto_attrs_to_template(&req.public_template)?;
-        let priv_template = proto_attrs_to_template(&req.private_template)?;
-
-        // Allocate handles upfront
-        let pub_handle = self
-            .hsm
-            .object_store()
-            .next_handle()
-            .map_err(hsm_err_to_status)?;
-        let priv_handle = self
-            .hsm
-            .object_store()
-            .next_handle()
-            .map_err(hsm_err_to_status)?;
-
-        let mut pub_obj;
-        let mut priv_obj;
-        let key_length: u32;
-
-        match mech_type {
-            CKM_RSA_PKCS_KEY_PAIR_GEN => {
-                // Parse CKA_MODULUS_BITS from public template
-                let modulus_bits = pub_template
-                    .iter()
-                    .find(|(t, _)| *t == CKA_MODULUS_BITS)
-                    .and_then(|(_, v)| craton_hsm::store::attributes::read_ck_ulong(v))
-                    .ok_or_else(|| {
-                        Status::invalid_argument("CKA_MODULUS_BITS required in public template")
-                    })? as u32;
-
-                key_length = modulus_bits;
-
-                let (private_key_der, modulus, pub_exponent) =
-                    craton_hsm::crypto::keygen::generate_rsa_key_pair(modulus_bits, fips_mode)
-                        .map_err(hsm_err_to_status)?;
-
-                pub_obj = craton_hsm::store::object::StoredObject::new(pub_handle, CKO_PUBLIC_KEY);
-                pub_obj.slot_id = slot_id;
-                pub_obj.key_type = Some(CKK_RSA);
-                pub_obj.modulus = Some(modulus.clone());
-                pub_obj.modulus_bits = Some(modulus_bits as CK_ULONG);
-                pub_obj.public_exponent = Some(pub_exponent.clone());
-                pub_obj.can_verify = true;
-                pub_obj.can_encrypt = true;
-
-                priv_obj =
-                    craton_hsm::store::object::StoredObject::new(priv_handle, CKO_PRIVATE_KEY);
-                priv_obj.slot_id = slot_id;
-                priv_obj.key_type = Some(CKK_RSA);
-                priv_obj.modulus = Some(modulus);
-                priv_obj.modulus_bits = Some(modulus_bits as CK_ULONG);
-                priv_obj.public_exponent = Some(pub_exponent);
-                priv_obj.key_material = Some(private_key_der);
-                priv_obj.can_sign = true;
-                priv_obj.can_decrypt = true;
-                priv_obj.sensitive = true;
-                priv_obj.extractable = false;
-                priv_obj.private = true;
-            }
-            CKM_EC_KEY_PAIR_GEN => {
-                // Parse CKA_EC_PARAMS from public template to determine curve
-                let ec_params_bytes = pub_template
-                    .iter()
-                    .find(|(t, _)| *t == CKA_EC_PARAMS)
-                    .map(|(_, v)| v.clone())
-                    .ok_or_else(|| {
-                        Status::invalid_argument("CKA_EC_PARAMS required in public template")
-                    })?;
-
-                let (private_key_material, public_point) = if is_p384_ec_params(&ec_params_bytes) {
-                    key_length = 384;
-                    craton_hsm::crypto::keygen::generate_ec_p384_key_pair()
-                        .map_err(hsm_err_to_status)?
-                } else {
-                    key_length = 256;
-                    craton_hsm::crypto::keygen::generate_ec_p256_key_pair()
-                        .map_err(hsm_err_to_status)?
-                };
-
-                pub_obj = craton_hsm::store::object::StoredObject::new(pub_handle, CKO_PUBLIC_KEY);
-                pub_obj.slot_id = slot_id;
-                pub_obj.key_type = Some(CKK_EC);
-                pub_obj.ec_params = Some(ec_params_bytes.clone());
-                pub_obj.ec_point = Some(public_point.clone());
-                pub_obj.can_verify = true;
-
-                priv_obj =
-                    craton_hsm::store::object::StoredObject::new(priv_handle, CKO_PRIVATE_KEY);
-                priv_obj.slot_id = slot_id;
-                priv_obj.key_type = Some(CKK_EC);
-                priv_obj.ec_params = Some(ec_params_bytes);
-                priv_obj.ec_point = Some(public_point);
-                priv_obj.key_material = Some(private_key_material);
-                priv_obj.can_sign = true;
-                priv_obj.sensitive = true;
-                priv_obj.extractable = false;
-                priv_obj.private = true;
-            }
-            CKM_EDDSA => {
-                key_length = 255; // Ed25519
-
-                let (private_key_material, public_key_bytes) =
-                    craton_hsm::crypto::keygen::generate_ed25519_key_pair()
-                        .map_err(hsm_err_to_status)?;
-
-                pub_obj = craton_hsm::store::object::StoredObject::new(pub_handle, CKO_PUBLIC_KEY);
-                pub_obj.slot_id = slot_id;
-                pub_obj.key_type = Some(CKK_EC_EDWARDS);
-                pub_obj.ec_point = Some(public_key_bytes.clone());
-                pub_obj.can_verify = true;
-
-                priv_obj =
-                    craton_hsm::store::object::StoredObject::new(priv_handle, CKO_PRIVATE_KEY);
-                priv_obj.slot_id = slot_id;
-                priv_obj.key_type = Some(CKK_EC_EDWARDS);
-                priv_obj.ec_point = Some(public_key_bytes);
-                priv_obj.key_material = Some(private_key_material);
-                priv_obj.can_sign = true;
-                priv_obj.sensitive = true;
-                priv_obj.extractable = false;
-                priv_obj.private = true;
-            }
-            _ => {
+            if !craton_hsm::crypto::mechanisms::is_keypair_gen_mechanism(mech_type) {
                 return Err(Status::invalid_argument(
                     "Unsupported key pair generation mechanism",
                 ));
             }
-        }
 
-        // Apply template attributes to public key
-        for (attr_type, value) in &pub_template {
-            if *attr_type == CKA_MODULUS_BITS || *attr_type == CKA_EC_PARAMS {
-                continue; // already handled
+            craton_hsm::crypto::mechanisms::validate_mechanism_for_policy(
+                mech_type,
+                self.hsm.algorithm_config(),
+                false,
+            )
+            .map_err(|_| Status::permission_denied("Mechanism blocked by algorithm policy"))?;
+
+            let fips_mode = self.hsm.algorithm_config().fips_approved_only;
+            let fips_approved = craton_hsm::crypto::mechanisms::is_fips_approved(mech_type);
+            let pub_template = proto_attrs_to_template(&req.public_template)?;
+            let priv_template = proto_attrs_to_template(&req.private_template)?;
+
+            // Allocate handles upfront
+            let pub_handle = self
+                .hsm
+                .object_store()
+                .next_handle()
+                .map_err(hsm_err_to_status)?;
+            let priv_handle = self
+                .hsm
+                .object_store()
+                .next_handle()
+                .map_err(hsm_err_to_status)?;
+
+            let mut pub_obj;
+            let mut priv_obj;
+            let key_length: u32;
+
+            match mech_type {
+                CKM_RSA_PKCS_KEY_PAIR_GEN => {
+                    // Parse CKA_MODULUS_BITS from public template
+                    let modulus_bits = pub_template
+                        .iter()
+                        .find(|(t, _)| *t == CKA_MODULUS_BITS)
+                        .and_then(|(_, v)| craton_hsm::store::attributes::read_ck_ulong(v))
+                        .ok_or_else(|| {
+                            Status::invalid_argument("CKA_MODULUS_BITS required in public template")
+                        })? as u32;
+
+                    key_length = modulus_bits;
+
+                    let (private_key_der, modulus, pub_exponent) =
+                        craton_hsm::crypto::keygen::generate_rsa_key_pair(modulus_bits, fips_mode)
+                            .map_err(hsm_err_to_status)?;
+
+                    pub_obj =
+                        craton_hsm::store::object::StoredObject::new(pub_handle, CKO_PUBLIC_KEY);
+                    pub_obj.slot_id = slot_id;
+                    pub_obj.key_type = Some(CKK_RSA);
+                    pub_obj.modulus = Some(modulus.clone());
+                    pub_obj.modulus_bits = Some(modulus_bits as CK_ULONG);
+                    pub_obj.public_exponent = Some(pub_exponent.clone());
+                    pub_obj.can_verify = true;
+                    pub_obj.can_encrypt = true;
+
+                    priv_obj =
+                        craton_hsm::store::object::StoredObject::new(priv_handle, CKO_PRIVATE_KEY);
+                    priv_obj.slot_id = slot_id;
+                    priv_obj.key_type = Some(CKK_RSA);
+                    priv_obj.modulus = Some(modulus);
+                    priv_obj.modulus_bits = Some(modulus_bits as CK_ULONG);
+                    priv_obj.public_exponent = Some(pub_exponent);
+                    priv_obj.key_material = Some(private_key_der);
+                    priv_obj.can_sign = true;
+                    priv_obj.can_decrypt = true;
+                    priv_obj.sensitive = true;
+                    priv_obj.extractable = false;
+                    priv_obj.private = true;
+                }
+                CKM_EC_KEY_PAIR_GEN => {
+                    // Parse CKA_EC_PARAMS from public template to determine curve
+                    let ec_params_bytes = pub_template
+                        .iter()
+                        .find(|(t, _)| *t == CKA_EC_PARAMS)
+                        .map(|(_, v)| v.clone())
+                        .ok_or_else(|| {
+                            Status::invalid_argument("CKA_EC_PARAMS required in public template")
+                        })?;
+
+                    let (private_key_material, public_point) =
+                        if is_p384_ec_params(&ec_params_bytes) {
+                            key_length = 384;
+                            craton_hsm::crypto::keygen::generate_ec_p384_key_pair()
+                                .map_err(hsm_err_to_status)?
+                        } else {
+                            key_length = 256;
+                            craton_hsm::crypto::keygen::generate_ec_p256_key_pair()
+                                .map_err(hsm_err_to_status)?
+                        };
+
+                    pub_obj =
+                        craton_hsm::store::object::StoredObject::new(pub_handle, CKO_PUBLIC_KEY);
+                    pub_obj.slot_id = slot_id;
+                    pub_obj.key_type = Some(CKK_EC);
+                    pub_obj.ec_params = Some(ec_params_bytes.clone());
+                    pub_obj.ec_point = Some(public_point.clone());
+                    pub_obj.can_verify = true;
+
+                    priv_obj =
+                        craton_hsm::store::object::StoredObject::new(priv_handle, CKO_PRIVATE_KEY);
+                    priv_obj.slot_id = slot_id;
+                    priv_obj.key_type = Some(CKK_EC);
+                    priv_obj.ec_params = Some(ec_params_bytes);
+                    priv_obj.ec_point = Some(public_point);
+                    priv_obj.key_material = Some(private_key_material);
+                    priv_obj.can_sign = true;
+                    priv_obj.sensitive = true;
+                    priv_obj.extractable = false;
+                    priv_obj.private = true;
+                }
+                CKM_EDDSA => {
+                    key_length = 255; // Ed25519
+
+                    let (private_key_material, public_key_bytes) =
+                        craton_hsm::crypto::keygen::generate_ed25519_key_pair()
+                            .map_err(hsm_err_to_status)?;
+
+                    pub_obj =
+                        craton_hsm::store::object::StoredObject::new(pub_handle, CKO_PUBLIC_KEY);
+                    pub_obj.slot_id = slot_id;
+                    pub_obj.key_type = Some(CKK_EC_EDWARDS);
+                    pub_obj.ec_point = Some(public_key_bytes.clone());
+                    pub_obj.can_verify = true;
+
+                    priv_obj =
+                        craton_hsm::store::object::StoredObject::new(priv_handle, CKO_PRIVATE_KEY);
+                    priv_obj.slot_id = slot_id;
+                    priv_obj.key_type = Some(CKK_EC_EDWARDS);
+                    priv_obj.ec_point = Some(public_key_bytes);
+                    priv_obj.key_material = Some(private_key_material);
+                    priv_obj.can_sign = true;
+                    priv_obj.sensitive = true;
+                    priv_obj.extractable = false;
+                    priv_obj.private = true;
+                }
+                _ => {
+                    return Err(Status::invalid_argument(
+                        "Unsupported key pair generation mechanism",
+                    ));
+                }
             }
-            craton_hsm::store::attributes::apply_attribute(&mut pub_obj, *attr_type, value)
+
+            // Apply template attributes to public key
+            for (attr_type, value) in &pub_template {
+                if *attr_type == CKA_MODULUS_BITS || *attr_type == CKA_EC_PARAMS {
+                    continue; // already handled
+                }
+                craton_hsm::store::attributes::apply_attribute(&mut pub_obj, *attr_type, value)
+                    .map_err(hsm_err_to_status)?;
+            }
+
+            // Apply template attributes to private key
+            for (attr_type, value) in &priv_template {
+                craton_hsm::store::attributes::apply_attribute(&mut priv_obj, *attr_type, value)
+                    .map_err(hsm_err_to_status)?;
+            }
+
+            let pub_h = self
+                .hsm
+                .object_store()
+                .insert_object(pub_obj)
                 .map_err(hsm_err_to_status)?;
-        }
-
-        // Apply template attributes to private key
-        for (attr_type, value) in &priv_template {
-            craton_hsm::store::attributes::apply_attribute(&mut priv_obj, *attr_type, value)
+            let priv_h = self
+                .hsm
+                .object_store()
+                .insert_object(priv_obj)
                 .map_err(hsm_err_to_status)?;
-        }
 
-        let pub_h = self
-            .hsm
-            .object_store()
-            .insert_object(pub_obj)
-            .map_err(hsm_err_to_status)?;
-        let priv_h = self
-            .hsm
-            .object_store()
-            .insert_object(priv_obj)
-            .map_err(hsm_err_to_status)?;
+            self.audit(
+                req.session_handle,
+                AuditOperation::GenerateKeyPair {
+                    mechanism: mech_type as u64,
+                    key_length: key_length,
+                    fips_approved,
+                },
+                AuditResult::Success,
+                Some(format!("pub={}, priv={}", pub_h, priv_h)),
+                &client_id,
+            )?;
 
-        self.audit(
-            req.session_handle,
-            AuditOperation::GenerateKeyPair {
-                mechanism: mech_type as u64,
-                key_length: key_length,
-                fips_approved,
-            },
-            AuditResult::Success,
-            Some(format!("pub={}, priv={}", pub_h, priv_h)),
-            &client_id,
-        )?;
-
-        Ok(Response::new(GenerateKeyPairResponse {
-            public_key_handle: pub_h as u64,
-            private_key_handle: priv_h as u64,
-        }))
+            Ok(Response::new(GenerateKeyPairResponse {
+                public_key_handle: pub_h as u64,
+                private_key_handle: priv_h as u64,
+            }))
+        })
     }
 
     async fn destroy_object(
         &self,
         request: Request<DestroyObjectRequest>,
     ) -> Result<Response<DestroyObjectResponse>, Status> {
-        let client_id = client_id_from_request(&request);
-        let req = request.into_inner();
-        let object_handle = to_ck_ulong(req.object_handle, "object_handle")?;
+        blocking(|| {
+            let client_id = client_id_from_request(&request);
+            let req = request.into_inner();
+            let object_handle = to_ck_ulong(req.object_handle, "object_handle")?;
 
-        // Require a valid, authenticated session
-        let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
+            // Require a valid, authenticated session
+            let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
 
-        // Enforce slot isolation: verify object belongs to this session's slot
-        {
-            let obj_lock = self
-                .hsm
-                .object_store()
-                .get_object(object_handle)
-                .map_err(hsm_err_to_status)?;
-            let obj = obj_lock.read();
-            if obj.slot_id != slot_id {
-                return Err(Status::not_found("Object not found"));
+            // Enforce slot isolation: verify object belongs to this session's slot
+            {
+                let obj_lock = self
+                    .hsm
+                    .object_store()
+                    .get_object(object_handle)
+                    .map_err(hsm_err_to_status)?;
+                let obj = obj_lock.read();
+                if obj.slot_id != slot_id {
+                    return Err(Status::not_found("Object not found"));
+                }
             }
-        }
 
-        self.hsm
-            .object_store()
-            .destroy_object(object_handle)
-            .map_err(hsm_err_to_status)?;
+            self.hsm
+                .object_store()
+                .destroy_object(object_handle)
+                .map_err(hsm_err_to_status)?;
 
-        // (#18) Audit object destruction
-        self.audit(
-            req.session_handle,
-            AuditOperation::DestroyObject,
-            AuditResult::Success,
-            Some(format!("handle={}", req.object_handle)),
-            &client_id,
-        )?;
+            // (#18) Audit object destruction
+            self.audit(
+                req.session_handle,
+                AuditOperation::DestroyObject,
+                AuditResult::Success,
+                Some(format!("handle={}", req.object_handle)),
+                &client_id,
+            )?;
 
-        Ok(Response::new(DestroyObjectResponse {}))
+            Ok(Response::new(DestroyObjectResponse {}))
+        })
     }
 
     async fn find_objects(
         &self,
         request: Request<FindObjectsRequest>,
     ) -> Result<Response<FindObjectsResponse>, Status> {
-        let client_id = client_id_from_request(&request);
-        let req = request.into_inner();
+        blocking(|| {
+            let client_id = client_id_from_request(&request);
+            let req = request.into_inner();
 
-        // (#9) Require a valid, authenticated session for FindObjects.
-        // Previously only required a session (not login), which could leak
-        // private object handles to unauthenticated callers via TOCTOU races.
-        // Per PKCS#11, FindObjects with CKA_PRIVATE=true filtering depends on
-        // login state — requiring authentication eliminates the race entirely.
-        let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
+            // (#9) Require a valid, authenticated session for FindObjects.
+            // Previously only required a session (not login), which could leak
+            // private object handles to unauthenticated callers via TOCTOU races.
+            // Per PKCS#11, FindObjects with CKA_PRIVATE=true filtering depends on
+            // login state — requiring authentication eliminates the race entirely.
+            let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
 
-        let template = proto_attrs_to_template(&req.template)?;
-        let token = self
-            .hsm
-            .slot_manager()
-            .get_token(slot_id)
-            .map_err(hsm_err_to_status)?;
+            let template = proto_attrs_to_template(&req.template)?;
+            let token = self
+                .hsm
+                .slot_manager()
+                .get_token(slot_id)
+                .map_err(hsm_err_to_status)?;
 
-        // Since we require authentication above, is_logged_in is always true here.
-        // We keep the check for defense-in-depth in case the requirement is relaxed.
-        let is_logged_in = !matches!(token.login_state(), LoginState::Public);
+            // Since we require authentication above, is_logged_in is always true here.
+            // We keep the check for defense-in-depth in case the requirement is relaxed.
+            let is_logged_in = !matches!(token.login_state(), LoginState::Public);
 
-        // Scope to the session's slot to prevent cross-slot object access
-        let handles =
-            self.hsm
-                .object_store()
-                .find_objects_for_slot(&template, is_logged_in, Some(slot_id));
-        let max = if req.max_count > 0 {
-            req.max_count as usize
-        } else {
-            handles.len()
-        };
+            // Scope to the session's slot to prevent cross-slot object access
+            let handles = self.hsm.object_store().find_objects_for_slot(
+                &template,
+                is_logged_in,
+                Some(slot_id),
+            );
+            let max = if req.max_count > 0 {
+                req.max_count as usize
+            } else {
+                handles.len()
+            };
 
-        let result_handles: Vec<u64> = handles.into_iter().take(max).map(|h| h as u64).collect();
+            let result_handles: Vec<u64> =
+                handles.into_iter().take(max).map(|h| h as u64).collect();
 
-        // (#7-fix) Audit FindObjects for FIPS 140-3 compliance
-        self.audit(
-            req.session_handle,
-            AuditOperation::FindObjects {
-                result_count: result_handles.len() as u32,
-            },
-            AuditResult::Success,
-            None,
-            &client_id,
-        )?;
+            // (#7-fix) Audit FindObjects for FIPS 140-3 compliance
+            self.audit(
+                req.session_handle,
+                AuditOperation::FindObjects {
+                    result_count: result_handles.len() as u32,
+                },
+                AuditResult::Success,
+                None,
+                &client_id,
+            )?;
 
-        Ok(Response::new(FindObjectsResponse {
-            object_handles: result_handles,
-        }))
+            Ok(Response::new(FindObjectsResponse {
+                object_handles: result_handles,
+            }))
+        })
     }
 
     async fn get_attribute_value(
         &self,
         request: Request<GetAttributeValueRequest>,
     ) -> Result<Response<GetAttributeValueResponse>, Status> {
-        let client_id = client_id_from_request(&request);
-        let req = request.into_inner();
-        let object_handle = to_ck_ulong(req.object_handle, "object_handle")?;
+        blocking(|| {
+            let client_id = client_id_from_request(&request);
+            let req = request.into_inner();
+            let object_handle = to_ck_ulong(req.object_handle, "object_handle")?;
 
-        // (#8) Require a valid session
-        let slot_id = require_session(&self.hsm, req.session_handle)?;
+            // (#8) Require a valid session
+            let slot_id = require_session(&self.hsm, req.session_handle)?;
 
-        let obj_lock = self
-            .hsm
-            .object_store()
-            .get_object(object_handle)
-            .map_err(hsm_err_to_status)?;
+            let obj_lock = self
+                .hsm
+                .object_store()
+                .get_object(object_handle)
+                .map_err(hsm_err_to_status)?;
 
-        let obj = obj_lock.read();
+            let obj = obj_lock.read();
 
-        // Enforce slot isolation: reject access to objects from a different slot
-        if obj.slot_id != slot_id {
-            return Err(Status::not_found("Object not found"));
-        }
+            // Enforce slot isolation: reject access to objects from a different slot
+            if obj.slot_id != slot_id {
+                return Err(Status::not_found("Object not found"));
+            }
 
-        // (#8) Check if object is private; if so, require login.
-        // Per PKCS#11, private object attributes are only visible to logged-in sessions.
-        let is_private =
-            craton_hsm::store::attributes::read_attribute(&obj, CKA_PRIVATE as CK_ULONG, true)
-                .ok()
-                .flatten()
-                .map(|v| !v.is_empty() && v[0] != 0)
-                .unwrap_or(false);
+            // (#8) Check if object is private; if so, require login.
+            // Per PKCS#11, private object attributes are only visible to logged-in sessions.
+            let is_private =
+                craton_hsm::store::attributes::read_attribute(&obj, CKA_PRIVATE as CK_ULONG, true)
+                    .ok()
+                    .flatten()
+                    .map(|v| !v.is_empty() && v[0] != 0)
+                    .unwrap_or(false);
 
-        if is_private {
-            require_logged_in(&self.hsm, slot_id)?;
-        }
+            if is_private {
+                require_logged_in(&self.hsm, slot_id)?;
+            }
 
-        let mut attrs = Vec::new();
+            let mut attrs = Vec::new();
 
-        for attr_type in &req.attribute_types {
-            let attr_ck = to_ck_ulong(*attr_type, "attribute_type")?;
-            match craton_hsm::store::attributes::read_attribute(&obj, attr_ck, true) {
-                Ok(Some(value)) => {
-                    attrs.push(Attribute {
-                        attr_type: *attr_type,
-                        value,
-                    });
-                }
-                Ok(None) => {
-                    attrs.push(Attribute {
-                        attr_type: *attr_type,
-                        value: Vec::new(),
-                    });
-                }
-                Err(_) => {
-                    // Sensitive attribute — return empty
-                    attrs.push(Attribute {
-                        attr_type: *attr_type,
-                        value: Vec::new(),
-                    });
+            for attr_type in &req.attribute_types {
+                let attr_ck = to_ck_ulong(*attr_type, "attribute_type")?;
+                match craton_hsm::store::attributes::read_attribute(&obj, attr_ck, true) {
+                    Ok(Some(value)) => {
+                        attrs.push(Attribute {
+                            attr_type: *attr_type,
+                            value,
+                        });
+                    }
+                    Ok(None) => {
+                        attrs.push(Attribute {
+                            attr_type: *attr_type,
+                            value: Vec::new(),
+                        });
+                    }
+                    Err(_) => {
+                        // Sensitive attribute — return empty
+                        attrs.push(Attribute {
+                            attr_type: *attr_type,
+                            value: Vec::new(),
+                        });
+                    }
                 }
             }
-        }
 
-        // (#7-fix) Audit attribute reads for FIPS 140-3 compliance
-        self.audit(
-            req.session_handle,
-            AuditOperation::GetAttributeValue,
-            AuditResult::Success,
-            Some(format!("handle={}", req.object_handle)),
-            &client_id,
-        )?;
+            // (#7-fix) Audit attribute reads for FIPS 140-3 compliance
+            self.audit(
+                req.session_handle,
+                AuditOperation::GetAttributeValue,
+                AuditResult::Success,
+                Some(format!("handle={}", req.object_handle)),
+                &client_id,
+            )?;
 
-        Ok(Response::new(GetAttributeValueResponse {
-            attributes: attrs,
-        }))
+            Ok(Response::new(GetAttributeValueResponse {
+                attributes: attrs,
+            }))
+        })
     }
 
     async fn sign(&self, request: Request<SignRequest>) -> Result<Response<SignResponse>, Status> {
-        let client_id = client_id_from_request(&request);
-        let req = request.into_inner();
-        let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
+        blocking(|| {
+            let client_id = client_id_from_request(&request);
+            let req = request.into_inner();
+            let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
 
-        let mech = req
-            .mechanism
-            .ok_or_else(|| Status::invalid_argument("mechanism required"))?;
-        let mech_type = to_ck_ulong(mech.mechanism_type, "mechanism_type")?;
+            let mech = req
+                .mechanism
+                .ok_or_else(|| Status::invalid_argument("mechanism required"))?;
+            let mech_type = to_ck_ulong(mech.mechanism_type, "mechanism_type")?;
 
-        if !craton_hsm::crypto::mechanisms::is_sign_mechanism(mech_type) {
-            return Err(Status::invalid_argument("Unsupported signing mechanism"));
-        }
+            if !craton_hsm::crypto::mechanisms::is_sign_mechanism(mech_type) {
+                return Err(Status::invalid_argument("Unsupported signing mechanism"));
+            }
 
-        craton_hsm::crypto::mechanisms::validate_mechanism_for_policy(
-            mech_type,
-            self.hsm.algorithm_config(),
-            true, // signing context
-        )
-        .map_err(|_| Status::permission_denied("Mechanism blocked by algorithm policy"))?;
+            craton_hsm::crypto::mechanisms::validate_mechanism_for_policy(
+                mech_type,
+                self.hsm.algorithm_config(),
+                true, // signing context
+            )
+            .map_err(|_| Status::permission_denied("Mechanism blocked by algorithm policy"))?;
 
-        let fips_approved = craton_hsm::crypto::mechanisms::is_fips_approved(mech_type);
+            let fips_approved = craton_hsm::crypto::mechanisms::is_fips_approved(mech_type);
 
-        let key_handle = to_ck_ulong(req.key_handle, "key_handle")?;
-        let key_obj = self
-            .hsm
-            .object_store()
-            .get_object(key_handle)
-            .map_err(hsm_err_to_status)?;
-        let key = key_obj.read();
+            let key_handle = to_ck_ulong(req.key_handle, "key_handle")?;
+            let key_obj = self
+                .hsm
+                .object_store()
+                .get_object(key_handle)
+                .map_err(hsm_err_to_status)?;
+            let key = key_obj.read();
 
-        if key.slot_id != slot_id {
-            return Err(Status::not_found("Key not found"));
-        }
-        if !key.can_sign {
-            return Err(Status::permission_denied("Key cannot be used for signing"));
-        }
+            if key.slot_id != slot_id {
+                return Err(Status::not_found("Key not found"));
+            }
+            if !key.can_sign {
+                return Err(Status::permission_denied("Key cannot be used for signing"));
+            }
 
-        let key_material = key
-            .key_material
-            .as_ref()
-            .ok_or_else(|| Status::internal("Key has no material"))?;
-        let key_bytes = key_material.as_bytes();
+            let key_material = key
+                .key_material
+                .as_ref()
+                .ok_or_else(|| Status::internal("Key has no material"))?;
+            let key_bytes = key_material.as_bytes();
 
-        let signature = match key.key_type {
-            Some(CKK_RSA) => {
-                if craton_hsm::crypto::sign::is_pss_mechanism(mech_type) {
-                    let hash_alg = craton_hsm::crypto::sign::pss_mechanism_to_hash(mech_type)
-                        .map_err(hsm_err_to_status)?;
-                    craton_hsm::crypto::sign::rsa_pss_sign(key_bytes, &req.data, hash_alg)
-                        .map_err(hsm_err_to_status)?
-                } else {
-                    let hash_alg = craton_hsm::crypto::sign::mechanism_to_hash(mech_type);
-                    craton_hsm::crypto::sign::rsa_pkcs1v15_sign(key_bytes, &req.data, hash_alg)
+            let signature = match key.key_type {
+                Some(CKK_RSA) => {
+                    if craton_hsm::crypto::sign::is_pss_mechanism(mech_type) {
+                        let hash_alg = craton_hsm::crypto::sign::pss_mechanism_to_hash(mech_type)
+                            .map_err(hsm_err_to_status)?;
+                        craton_hsm::crypto::sign::rsa_pss_sign(key_bytes, &req.data, hash_alg)
+                            .map_err(hsm_err_to_status)?
+                    } else {
+                        let hash_alg = craton_hsm::crypto::sign::mechanism_to_hash(mech_type);
+                        craton_hsm::crypto::sign::rsa_pkcs1v15_sign(key_bytes, &req.data, hash_alg)
+                            .map_err(hsm_err_to_status)?
+                    }
+                }
+                Some(CKK_EC) => {
+                    let ec_params = key.ec_params.as_deref().unwrap_or(&[]);
+                    if is_p384_ec_params(ec_params) {
+                        craton_hsm::crypto::sign::ecdsa_p384_sign(key_bytes, &req.data)
+                            .map_err(hsm_err_to_status)?
+                    } else {
+                        craton_hsm::crypto::sign::ecdsa_p256_sign(key_bytes, &req.data)
+                            .map_err(hsm_err_to_status)?
+                    }
+                }
+                Some(CKK_EC_EDWARDS) => {
+                    craton_hsm::crypto::sign::ed25519_sign(key_bytes, &req.data)
                         .map_err(hsm_err_to_status)?
                 }
-            }
-            Some(CKK_EC) => {
-                let ec_params = key.ec_params.as_deref().unwrap_or(&[]);
-                if is_p384_ec_params(ec_params) {
-                    craton_hsm::crypto::sign::ecdsa_p384_sign(key_bytes, &req.data)
-                        .map_err(hsm_err_to_status)?
-                } else {
-                    craton_hsm::crypto::sign::ecdsa_p256_sign(key_bytes, &req.data)
-                        .map_err(hsm_err_to_status)?
+                _ => {
+                    return Err(Status::invalid_argument(
+                        "Key type does not support signing",
+                    ));
                 }
-            }
-            Some(CKK_EC_EDWARDS) => craton_hsm::crypto::sign::ed25519_sign(key_bytes, &req.data)
-                .map_err(hsm_err_to_status)?,
-            _ => {
-                return Err(Status::invalid_argument(
-                    "Key type does not support signing",
-                ));
-            }
-        };
+            };
 
-        // Release the read lock before audit (audit may also take locks)
-        drop(key);
+            // Release the read lock before audit (audit may also take locks)
+            drop(key);
 
-        self.audit(
-            req.session_handle,
-            AuditOperation::Sign {
-                mechanism: mech_type as u64,
-                fips_approved,
-            },
-            AuditResult::Success,
-            Some(format!("key={}", req.key_handle)),
-            &client_id,
-        )?;
+            self.audit(
+                req.session_handle,
+                AuditOperation::Sign {
+                    mechanism: mech_type as u64,
+                    fips_approved,
+                },
+                AuditResult::Success,
+                Some(format!("key={}", req.key_handle)),
+                &client_id,
+            )?;
 
-        Ok(Response::new(SignResponse { signature }))
+            Ok(Response::new(SignResponse { signature }))
+        })
     }
 
     async fn verify(
         &self,
         request: Request<VerifyRequest>,
     ) -> Result<Response<VerifyResponse>, Status> {
-        let client_id = client_id_from_request(&request);
-        let req = request.into_inner();
-        let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
+        blocking(|| {
+            let client_id = client_id_from_request(&request);
+            let req = request.into_inner();
+            let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
 
-        let mech = req
-            .mechanism
-            .ok_or_else(|| Status::invalid_argument("mechanism required"))?;
-        let mech_type = to_ck_ulong(mech.mechanism_type, "mechanism_type")?;
+            let mech = req
+                .mechanism
+                .ok_or_else(|| Status::invalid_argument("mechanism required"))?;
+            let mech_type = to_ck_ulong(mech.mechanism_type, "mechanism_type")?;
 
-        if !craton_hsm::crypto::mechanisms::is_sign_mechanism(mech_type) {
-            return Err(Status::invalid_argument(
-                "Unsupported verification mechanism",
-            ));
-        }
-
-        craton_hsm::crypto::mechanisms::validate_mechanism_for_policy(
-            mech_type,
-            self.hsm.algorithm_config(),
-            true,
-        )
-        .map_err(|_| Status::permission_denied("Mechanism blocked by algorithm policy"))?;
-
-        let fips_approved = craton_hsm::crypto::mechanisms::is_fips_approved(mech_type);
-
-        let key_handle = to_ck_ulong(req.key_handle, "key_handle")?;
-        let key_obj = self
-            .hsm
-            .object_store()
-            .get_object(key_handle)
-            .map_err(hsm_err_to_status)?;
-        let key = key_obj.read();
-
-        if key.slot_id != slot_id {
-            return Err(Status::not_found("Key not found"));
-        }
-        if !key.can_verify {
-            return Err(Status::permission_denied(
-                "Key cannot be used for verification",
-            ));
-        }
-
-        let valid = match key.key_type {
-            Some(CKK_RSA) => {
-                let modulus = key
-                    .modulus
-                    .as_ref()
-                    .ok_or_else(|| Status::internal("RSA key missing modulus"))?;
-                let pub_exp = key
-                    .public_exponent
-                    .as_ref()
-                    .ok_or_else(|| Status::internal("RSA key missing public exponent"))?;
-
-                if craton_hsm::crypto::sign::is_pss_mechanism(mech_type) {
-                    let hash_alg = craton_hsm::crypto::sign::pss_mechanism_to_hash(mech_type)
-                        .map_err(hsm_err_to_status)?;
-                    craton_hsm::crypto::sign::rsa_pss_verify(
-                        modulus,
-                        pub_exp,
-                        &req.data,
-                        &req.signature,
-                        hash_alg,
-                    )
-                    .map_err(hsm_err_to_status)?
-                } else {
-                    let hash_alg = craton_hsm::crypto::sign::mechanism_to_hash(mech_type);
-                    craton_hsm::crypto::sign::rsa_pkcs1v15_verify(
-                        modulus,
-                        pub_exp,
-                        &req.data,
-                        &req.signature,
-                        hash_alg,
-                    )
-                    .map_err(hsm_err_to_status)?
-                }
-            }
-            Some(CKK_EC) => {
-                let ec_point = key
-                    .ec_point
-                    .as_ref()
-                    .ok_or_else(|| Status::internal("EC key missing public point"))?;
-                let ec_params = key.ec_params.as_deref().unwrap_or(&[]);
-                if is_p384_ec_params(ec_params) {
-                    craton_hsm::crypto::sign::ecdsa_p384_verify(ec_point, &req.data, &req.signature)
-                        .map_err(hsm_err_to_status)?
-                } else {
-                    craton_hsm::crypto::sign::ecdsa_p256_verify(ec_point, &req.data, &req.signature)
-                        .map_err(hsm_err_to_status)?
-                }
-            }
-            Some(CKK_EC_EDWARDS) => {
-                let pub_key = key
-                    .ec_point
-                    .as_ref()
-                    .ok_or_else(|| Status::internal("Ed25519 key missing public key"))?;
-                craton_hsm::crypto::sign::ed25519_verify(pub_key, &req.data, &req.signature)
-                    .map_err(hsm_err_to_status)?
-            }
-            _ => {
+            if !craton_hsm::crypto::mechanisms::is_sign_mechanism(mech_type) {
                 return Err(Status::invalid_argument(
-                    "Key type does not support verification",
+                    "Unsupported verification mechanism",
                 ));
             }
-        };
 
-        drop(key);
+            craton_hsm::crypto::mechanisms::validate_mechanism_for_policy(
+                mech_type,
+                self.hsm.algorithm_config(),
+                true,
+            )
+            .map_err(|_| Status::permission_denied("Mechanism blocked by algorithm policy"))?;
 
-        self.audit(
-            req.session_handle,
-            AuditOperation::Verify {
-                mechanism: mech_type as u64,
-                fips_approved,
-            },
-            AuditResult::Success,
-            Some(format!("key={}", req.key_handle)),
-            &client_id,
-        )?;
+            let fips_approved = craton_hsm::crypto::mechanisms::is_fips_approved(mech_type);
 
-        Ok(Response::new(VerifyResponse { valid }))
+            let key_handle = to_ck_ulong(req.key_handle, "key_handle")?;
+            let key_obj = self
+                .hsm
+                .object_store()
+                .get_object(key_handle)
+                .map_err(hsm_err_to_status)?;
+            let key = key_obj.read();
+
+            if key.slot_id != slot_id {
+                return Err(Status::not_found("Key not found"));
+            }
+            if !key.can_verify {
+                return Err(Status::permission_denied(
+                    "Key cannot be used for verification",
+                ));
+            }
+
+            let valid = match key.key_type {
+                Some(CKK_RSA) => {
+                    let modulus = key
+                        .modulus
+                        .as_ref()
+                        .ok_or_else(|| Status::internal("RSA key missing modulus"))?;
+                    let pub_exp = key
+                        .public_exponent
+                        .as_ref()
+                        .ok_or_else(|| Status::internal("RSA key missing public exponent"))?;
+
+                    if craton_hsm::crypto::sign::is_pss_mechanism(mech_type) {
+                        let hash_alg = craton_hsm::crypto::sign::pss_mechanism_to_hash(mech_type)
+                            .map_err(hsm_err_to_status)?;
+                        craton_hsm::crypto::sign::rsa_pss_verify(
+                            modulus,
+                            pub_exp,
+                            &req.data,
+                            &req.signature,
+                            hash_alg,
+                        )
+                        .map_err(hsm_err_to_status)?
+                    } else {
+                        let hash_alg = craton_hsm::crypto::sign::mechanism_to_hash(mech_type);
+                        craton_hsm::crypto::sign::rsa_pkcs1v15_verify(
+                            modulus,
+                            pub_exp,
+                            &req.data,
+                            &req.signature,
+                            hash_alg,
+                        )
+                        .map_err(hsm_err_to_status)?
+                    }
+                }
+                Some(CKK_EC) => {
+                    let ec_point = key
+                        .ec_point
+                        .as_ref()
+                        .ok_or_else(|| Status::internal("EC key missing public point"))?;
+                    let ec_params = key.ec_params.as_deref().unwrap_or(&[]);
+                    if is_p384_ec_params(ec_params) {
+                        craton_hsm::crypto::sign::ecdsa_p384_verify(
+                            ec_point,
+                            &req.data,
+                            &req.signature,
+                        )
+                        .map_err(hsm_err_to_status)?
+                    } else {
+                        craton_hsm::crypto::sign::ecdsa_p256_verify(
+                            ec_point,
+                            &req.data,
+                            &req.signature,
+                        )
+                        .map_err(hsm_err_to_status)?
+                    }
+                }
+                Some(CKK_EC_EDWARDS) => {
+                    let pub_key = key
+                        .ec_point
+                        .as_ref()
+                        .ok_or_else(|| Status::internal("Ed25519 key missing public key"))?;
+                    craton_hsm::crypto::sign::ed25519_verify(pub_key, &req.data, &req.signature)
+                        .map_err(hsm_err_to_status)?
+                }
+                _ => {
+                    return Err(Status::invalid_argument(
+                        "Key type does not support verification",
+                    ));
+                }
+            };
+
+            drop(key);
+
+            self.audit(
+                req.session_handle,
+                AuditOperation::Verify {
+                    mechanism: mech_type as u64,
+                    fips_approved,
+                },
+                AuditResult::Success,
+                Some(format!("key={}", req.key_handle)),
+                &client_id,
+            )?;
+
+            Ok(Response::new(VerifyResponse { valid }))
+        })
     }
 
     async fn encrypt(
         &self,
         request: Request<EncryptRequest>,
     ) -> Result<Response<EncryptResponse>, Status> {
-        let client_id = client_id_from_request(&request);
-        let req = request.into_inner();
-        let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
+        blocking(|| {
+            let client_id = client_id_from_request(&request);
+            let req = request.into_inner();
+            let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
 
-        let mech = req
-            .mechanism
-            .ok_or_else(|| Status::invalid_argument("mechanism required"))?;
-        let mech_type = to_ck_ulong(mech.mechanism_type, "mechanism_type")?;
+            let mech = req
+                .mechanism
+                .ok_or_else(|| Status::invalid_argument("mechanism required"))?;
+            let mech_type = to_ck_ulong(mech.mechanism_type, "mechanism_type")?;
 
-        if !craton_hsm::crypto::mechanisms::is_encrypt_mechanism(mech_type) {
-            return Err(Status::invalid_argument("Unsupported encryption mechanism"));
-        }
-
-        craton_hsm::crypto::mechanisms::validate_mechanism_for_policy(
-            mech_type,
-            self.hsm.algorithm_config(),
-            false,
-        )
-        .map_err(|_| Status::permission_denied("Mechanism blocked by algorithm policy"))?;
-
-        let fips_approved = craton_hsm::crypto::mechanisms::is_fips_approved(mech_type);
-
-        let key_handle = to_ck_ulong(req.key_handle, "key_handle")?;
-        let key_obj = self
-            .hsm
-            .object_store()
-            .get_object(key_handle)
-            .map_err(hsm_err_to_status)?;
-        let key = key_obj.read();
-
-        if key.slot_id != slot_id {
-            return Err(Status::not_found("Key not found"));
-        }
-        if !key.can_encrypt {
-            return Err(Status::permission_denied(
-                "Key cannot be used for encryption",
-            ));
-        }
-
-        let encrypted_data = match mech_type {
-            CKM_AES_GCM => {
-                let key_bytes = key
-                    .key_material
-                    .as_ref()
-                    .ok_or_else(|| Status::internal("Key has no material"))?
-                    .as_bytes();
-                craton_hsm::crypto::encrypt::aes_256_gcm_encrypt(key_bytes, &req.data)
-                    .map_err(hsm_err_to_status)?
-            }
-            CKM_AES_CBC | CKM_AES_CBC_PAD => {
-                let iv = &mech.parameter;
-                if iv.len() != 16 {
-                    return Err(Status::invalid_argument(
-                        "AES-CBC requires 16-byte IV in mechanism parameter",
-                    ));
-                }
-                let key_bytes = key
-                    .key_material
-                    .as_ref()
-                    .ok_or_else(|| Status::internal("Key has no material"))?
-                    .as_bytes();
-                craton_hsm::crypto::encrypt::aes_cbc_encrypt(key_bytes, iv, &req.data)
-                    .map_err(hsm_err_to_status)?
-            }
-            CKM_AES_CTR => {
-                let iv = &mech.parameter;
-                if iv.len() != 16 {
-                    return Err(Status::invalid_argument(
-                        "AES-CTR requires 16-byte IV in mechanism parameter",
-                    ));
-                }
-                let key_bytes = key
-                    .key_material
-                    .as_ref()
-                    .ok_or_else(|| Status::internal("Key has no material"))?
-                    .as_bytes();
-                craton_hsm::crypto::encrypt::aes_ctr_encrypt(key_bytes, iv, &req.data)
-                    .map_err(hsm_err_to_status)?
-            }
-            CKM_RSA_PKCS_OAEP => {
-                let modulus = key
-                    .modulus
-                    .as_ref()
-                    .ok_or_else(|| Status::internal("RSA key missing modulus"))?;
-                let pub_exp = key
-                    .public_exponent
-                    .as_ref()
-                    .ok_or_else(|| Status::internal("RSA key missing public exponent"))?;
-                craton_hsm::crypto::sign::rsa_oaep_encrypt(
-                    modulus,
-                    pub_exp,
-                    &req.data,
-                    craton_hsm::crypto::sign::OaepHash::Sha256,
-                )
-                .map_err(hsm_err_to_status)?
-            }
-            _ => {
+            if !craton_hsm::crypto::mechanisms::is_encrypt_mechanism(mech_type) {
                 return Err(Status::invalid_argument("Unsupported encryption mechanism"));
             }
-        };
 
-        drop(key);
+            craton_hsm::crypto::mechanisms::validate_mechanism_for_policy(
+                mech_type,
+                self.hsm.algorithm_config(),
+                false,
+            )
+            .map_err(|_| Status::permission_denied("Mechanism blocked by algorithm policy"))?;
 
-        self.audit(
-            req.session_handle,
-            AuditOperation::Encrypt {
-                mechanism: mech_type as u64,
-                fips_approved,
-            },
-            AuditResult::Success,
-            Some(format!("key={}", req.key_handle)),
-            &client_id,
-        )?;
+            let fips_approved = craton_hsm::crypto::mechanisms::is_fips_approved(mech_type);
 
-        Ok(Response::new(EncryptResponse { encrypted_data }))
+            let key_handle = to_ck_ulong(req.key_handle, "key_handle")?;
+            let key_obj = self
+                .hsm
+                .object_store()
+                .get_object(key_handle)
+                .map_err(hsm_err_to_status)?;
+            let key = key_obj.read();
+
+            if key.slot_id != slot_id {
+                return Err(Status::not_found("Key not found"));
+            }
+            if !key.can_encrypt {
+                return Err(Status::permission_denied(
+                    "Key cannot be used for encryption",
+                ));
+            }
+
+            let encrypted_data = match mech_type {
+                CKM_AES_GCM => {
+                    let key_bytes = key
+                        .key_material
+                        .as_ref()
+                        .ok_or_else(|| Status::internal("Key has no material"))?
+                        .as_bytes();
+                    craton_hsm::crypto::encrypt::aes_256_gcm_encrypt(key_bytes, &req.data)
+                        .map_err(hsm_err_to_status)?
+                }
+                CKM_AES_CBC | CKM_AES_CBC_PAD => {
+                    let iv = &mech.parameter;
+                    if iv.len() != 16 {
+                        return Err(Status::invalid_argument(
+                            "AES-CBC requires 16-byte IV in mechanism parameter",
+                        ));
+                    }
+                    let key_bytes = key
+                        .key_material
+                        .as_ref()
+                        .ok_or_else(|| Status::internal("Key has no material"))?
+                        .as_bytes();
+                    craton_hsm::crypto::encrypt::aes_cbc_encrypt(key_bytes, iv, &req.data)
+                        .map_err(hsm_err_to_status)?
+                }
+                CKM_AES_CTR => {
+                    let iv = &mech.parameter;
+                    if iv.len() != 16 {
+                        return Err(Status::invalid_argument(
+                            "AES-CTR requires 16-byte IV in mechanism parameter",
+                        ));
+                    }
+                    let key_bytes = key
+                        .key_material
+                        .as_ref()
+                        .ok_or_else(|| Status::internal("Key has no material"))?
+                        .as_bytes();
+                    craton_hsm::crypto::encrypt::aes_ctr_encrypt(key_bytes, iv, &req.data)
+                        .map_err(hsm_err_to_status)?
+                }
+                CKM_RSA_PKCS_OAEP => {
+                    let modulus = key
+                        .modulus
+                        .as_ref()
+                        .ok_or_else(|| Status::internal("RSA key missing modulus"))?;
+                    let pub_exp = key
+                        .public_exponent
+                        .as_ref()
+                        .ok_or_else(|| Status::internal("RSA key missing public exponent"))?;
+                    craton_hsm::crypto::sign::rsa_oaep_encrypt(
+                        modulus,
+                        pub_exp,
+                        &req.data,
+                        craton_hsm::crypto::sign::OaepHash::Sha256,
+                    )
+                    .map_err(hsm_err_to_status)?
+                }
+                _ => {
+                    return Err(Status::invalid_argument("Unsupported encryption mechanism"));
+                }
+            };
+
+            drop(key);
+
+            self.audit(
+                req.session_handle,
+                AuditOperation::Encrypt {
+                    mechanism: mech_type as u64,
+                    fips_approved,
+                },
+                AuditResult::Success,
+                Some(format!("key={}", req.key_handle)),
+                &client_id,
+            )?;
+
+            Ok(Response::new(EncryptResponse { encrypted_data }))
+        })
     }
 
     async fn decrypt(
         &self,
         request: Request<DecryptRequest>,
     ) -> Result<Response<DecryptResponse>, Status> {
-        let client_id = client_id_from_request(&request);
-        let req = request.into_inner();
-        let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
+        blocking(|| {
+            let client_id = client_id_from_request(&request);
+            let req = request.into_inner();
+            let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
 
-        let mech = req
-            .mechanism
-            .ok_or_else(|| Status::invalid_argument("mechanism required"))?;
-        let mech_type = to_ck_ulong(mech.mechanism_type, "mechanism_type")?;
+            let mech = req
+                .mechanism
+                .ok_or_else(|| Status::invalid_argument("mechanism required"))?;
+            let mech_type = to_ck_ulong(mech.mechanism_type, "mechanism_type")?;
 
-        if !craton_hsm::crypto::mechanisms::is_encrypt_mechanism(mech_type) {
-            return Err(Status::invalid_argument("Unsupported decryption mechanism"));
-        }
-
-        craton_hsm::crypto::mechanisms::validate_mechanism_for_policy(
-            mech_type,
-            self.hsm.algorithm_config(),
-            false,
-        )
-        .map_err(|_| Status::permission_denied("Mechanism blocked by algorithm policy"))?;
-
-        let fips_approved = craton_hsm::crypto::mechanisms::is_fips_approved(mech_type);
-
-        let key_handle = to_ck_ulong(req.key_handle, "key_handle")?;
-        let key_obj = self
-            .hsm
-            .object_store()
-            .get_object(key_handle)
-            .map_err(hsm_err_to_status)?;
-        let key = key_obj.read();
-
-        if key.slot_id != slot_id {
-            return Err(Status::not_found("Key not found"));
-        }
-        if !key.can_decrypt {
-            return Err(Status::permission_denied(
-                "Key cannot be used for decryption",
-            ));
-        }
-
-        let data = match mech_type {
-            CKM_AES_GCM => {
-                let key_bytes = key
-                    .key_material
-                    .as_ref()
-                    .ok_or_else(|| Status::internal("Key has no material"))?
-                    .as_bytes();
-                craton_hsm::crypto::encrypt::aes_256_gcm_decrypt(key_bytes, &req.encrypted_data)
-                    .map_err(hsm_err_to_status)?
-            }
-            CKM_AES_CBC | CKM_AES_CBC_PAD => {
-                let iv = &mech.parameter;
-                if iv.len() != 16 {
-                    return Err(Status::invalid_argument(
-                        "AES-CBC requires 16-byte IV in mechanism parameter",
-                    ));
-                }
-                let key_bytes = key
-                    .key_material
-                    .as_ref()
-                    .ok_or_else(|| Status::internal("Key has no material"))?
-                    .as_bytes();
-                craton_hsm::crypto::encrypt::aes_cbc_decrypt(key_bytes, iv, &req.encrypted_data)
-                    .map_err(hsm_err_to_status)?
-            }
-            CKM_AES_CTR => {
-                let iv = &mech.parameter;
-                if iv.len() != 16 {
-                    return Err(Status::invalid_argument(
-                        "AES-CTR requires 16-byte IV in mechanism parameter",
-                    ));
-                }
-                let key_bytes = key
-                    .key_material
-                    .as_ref()
-                    .ok_or_else(|| Status::internal("Key has no material"))?
-                    .as_bytes();
-                craton_hsm::crypto::encrypt::aes_ctr_decrypt(key_bytes, iv, &req.encrypted_data)
-                    .map_err(hsm_err_to_status)?
-            }
-            CKM_RSA_PKCS_OAEP => {
-                let key_bytes = key
-                    .key_material
-                    .as_ref()
-                    .ok_or_else(|| Status::internal("Key has no material"))?
-                    .as_bytes();
-                craton_hsm::crypto::sign::rsa_oaep_decrypt(
-                    key_bytes,
-                    &req.encrypted_data,
-                    craton_hsm::crypto::sign::OaepHash::Sha256,
-                )
-                .map_err(hsm_err_to_status)?
-            }
-            _ => {
+            if !craton_hsm::crypto::mechanisms::is_encrypt_mechanism(mech_type) {
                 return Err(Status::invalid_argument("Unsupported decryption mechanism"));
             }
-        };
 
-        drop(key);
+            craton_hsm::crypto::mechanisms::validate_mechanism_for_policy(
+                mech_type,
+                self.hsm.algorithm_config(),
+                false,
+            )
+            .map_err(|_| Status::permission_denied("Mechanism blocked by algorithm policy"))?;
 
-        self.audit(
-            req.session_handle,
-            AuditOperation::Decrypt {
-                mechanism: mech_type as u64,
-                fips_approved,
-            },
-            AuditResult::Success,
-            Some(format!("key={}", req.key_handle)),
-            &client_id,
-        )?;
+            let fips_approved = craton_hsm::crypto::mechanisms::is_fips_approved(mech_type);
 
-        Ok(Response::new(DecryptResponse { data }))
+            let key_handle = to_ck_ulong(req.key_handle, "key_handle")?;
+            let key_obj = self
+                .hsm
+                .object_store()
+                .get_object(key_handle)
+                .map_err(hsm_err_to_status)?;
+            let key = key_obj.read();
+
+            if key.slot_id != slot_id {
+                return Err(Status::not_found("Key not found"));
+            }
+            if !key.can_decrypt {
+                return Err(Status::permission_denied(
+                    "Key cannot be used for decryption",
+                ));
+            }
+
+            let data = match mech_type {
+                CKM_AES_GCM => {
+                    let key_bytes = key
+                        .key_material
+                        .as_ref()
+                        .ok_or_else(|| Status::internal("Key has no material"))?
+                        .as_bytes();
+                    craton_hsm::crypto::encrypt::aes_256_gcm_decrypt(key_bytes, &req.encrypted_data)
+                        .map_err(hsm_err_to_status)?
+                }
+                CKM_AES_CBC | CKM_AES_CBC_PAD => {
+                    let iv = &mech.parameter;
+                    if iv.len() != 16 {
+                        return Err(Status::invalid_argument(
+                            "AES-CBC requires 16-byte IV in mechanism parameter",
+                        ));
+                    }
+                    let key_bytes = key
+                        .key_material
+                        .as_ref()
+                        .ok_or_else(|| Status::internal("Key has no material"))?
+                        .as_bytes();
+                    craton_hsm::crypto::encrypt::aes_cbc_decrypt(key_bytes, iv, &req.encrypted_data)
+                        .map_err(hsm_err_to_status)?
+                }
+                CKM_AES_CTR => {
+                    let iv = &mech.parameter;
+                    if iv.len() != 16 {
+                        return Err(Status::invalid_argument(
+                            "AES-CTR requires 16-byte IV in mechanism parameter",
+                        ));
+                    }
+                    let key_bytes = key
+                        .key_material
+                        .as_ref()
+                        .ok_or_else(|| Status::internal("Key has no material"))?
+                        .as_bytes();
+                    craton_hsm::crypto::encrypt::aes_ctr_decrypt(key_bytes, iv, &req.encrypted_data)
+                        .map_err(hsm_err_to_status)?
+                }
+                CKM_RSA_PKCS_OAEP => {
+                    let key_bytes = key
+                        .key_material
+                        .as_ref()
+                        .ok_or_else(|| Status::internal("Key has no material"))?
+                        .as_bytes();
+                    craton_hsm::crypto::sign::rsa_oaep_decrypt(
+                        key_bytes,
+                        &req.encrypted_data,
+                        craton_hsm::crypto::sign::OaepHash::Sha256,
+                    )
+                    .map_err(hsm_err_to_status)?
+                }
+                _ => {
+                    return Err(Status::invalid_argument("Unsupported decryption mechanism"));
+                }
+            };
+
+            drop(key);
+
+            self.audit(
+                req.session_handle,
+                AuditOperation::Decrypt {
+                    mechanism: mech_type as u64,
+                    fips_approved,
+                },
+                AuditResult::Success,
+                Some(format!("key={}", req.key_handle)),
+                &client_id,
+            )?;
+
+            Ok(Response::new(DecryptResponse { data }))
+        })
     }
 
     async fn digest(
         &self,
         request: Request<DigestRequest>,
     ) -> Result<Response<DigestResponse>, Status> {
-        let req = request.into_inner();
+        blocking(|| {
+            let req = request.into_inner();
 
-        // (#29) Require authentication for digest to prevent CPU exhaustion by
-        // unauthenticated callers. While PKCS#11 only requires a session for C_Digest,
-        // the daemon enforces login to limit the attack surface for DoS via large
-        // hash payloads (up to max_digest_length).
-        require_authenticated_session(&self.hsm, req.session_handle)?;
+            // (#29) Require authentication for digest to prevent CPU exhaustion by
+            // unauthenticated callers. While PKCS#11 only requires a session for C_Digest,
+            // the daemon enforces login to limit the attack surface for DoS via large
+            // hash payloads (up to max_digest_length).
+            require_authenticated_session(&self.hsm, req.session_handle)?;
 
-        // (#13) Bound digest data size to prevent CPU exhaustion
-        if req.data.len() > self.max_digest_length as usize {
-            return Err(Status::invalid_argument(format!(
-                "Digest data size {} bytes exceeds maximum {} bytes",
-                req.data.len(),
-                self.max_digest_length
-            )));
-        }
+            // (#13) Bound digest data size to prevent CPU exhaustion
+            if req.data.len() > self.max_digest_length as usize {
+                return Err(Status::invalid_argument(format!(
+                    "Digest data size {} bytes exceeds maximum {} bytes",
+                    req.data.len(),
+                    self.max_digest_length
+                )));
+            }
 
-        let mech = req
-            .mechanism
-            .ok_or_else(|| Status::invalid_argument("mechanism required"))?;
+            let mech = req
+                .mechanism
+                .ok_or_else(|| Status::invalid_argument("mechanism required"))?;
 
-        let mech_type = to_ck_ulong(mech.mechanism_type, "mechanism_type")?;
-        let result = craton_hsm::crypto::digest::compute_digest(mech_type, &req.data)
-            .map_err(hsm_err_to_status)?;
+            let mech_type = to_ck_ulong(mech.mechanism_type, "mechanism_type")?;
+            let result = craton_hsm::crypto::digest::compute_digest(mech_type, &req.data)
+                .map_err(hsm_err_to_status)?;
 
-        Ok(Response::new(DigestResponse { digest: result }))
+            Ok(Response::new(DigestResponse { digest: result }))
+        })
     }
 
     async fn generate_random(
         &self,
         request: Request<GenerateRandomRequest>,
     ) -> Result<Response<GenerateRandomResponse>, Status> {
-        let client_id = client_id_from_request(&request);
-        let req = request.into_inner();
+        blocking(|| {
+            let client_id = client_id_from_request(&request);
+            let req = request.into_inner();
 
-        // (#3-fix) Require authentication to prevent DRBG exhaustion by
-        // unauthenticated callers, consistent with digest() (#29).
-        require_authenticated_session(&self.hsm, req.session_handle)?;
+            // (#3-fix) Require authentication to prevent DRBG exhaustion by
+            // unauthenticated callers, consistent with digest() (#29).
+            require_authenticated_session(&self.hsm, req.session_handle)?;
 
-        // (#19) Validate length fits in u32 before comparison to prevent truncation
-        let length: u32 = req.length.try_into().map_err(|_| {
-            Status::invalid_argument(format!(
-                "Requested length {} exceeds maximum representable size",
-                req.length
-            ))
-        })?;
+            // (#19) Validate length fits in u32 before comparison to prevent truncation
+            let length: u32 = req.length.try_into().map_err(|_| {
+                Status::invalid_argument(format!(
+                    "Requested length {} exceeds maximum representable size",
+                    req.length
+                ))
+            })?;
 
-        // Bound the allocation to prevent DoS
-        if length > self.max_random_length {
-            return Err(Status::invalid_argument(format!(
-                "Requested {} bytes exceeds maximum {} bytes",
-                length, self.max_random_length
-            )));
-        }
+            // Bound the allocation to prevent DoS
+            if length > self.max_random_length {
+                return Err(Status::invalid_argument(format!(
+                    "Requested {} bytes exceeds maximum {} bytes",
+                    length, self.max_random_length
+                )));
+            }
 
-        let mut buf = vec![0u8; length as usize];
+            let mut buf = vec![0u8; length as usize];
 
-        // (#25) Use the FIPS-compliant HMAC_DRBG — refuse to serve random data
-        // if the DRBG mutex is poisoned. A poisoned mutex means a thread panicked
-        // mid-DRBG operation, leaving internal state potentially corrupted.
-        // For an HSM, using a corrupted DRBG could produce predictable output.
-        // parking_lot::Mutex::lock() does not poison — it always returns a guard.
-        let mut drbg = self.hsm.drbg().lock();
-        drbg.generate(&mut buf)
-            .map_err(|_| Status::internal("DRBG generation failed — health test failure"))?;
-        drop(drbg);
+            // (#25) Use the FIPS-compliant HMAC_DRBG — refuse to serve random data
+            // if the DRBG mutex is poisoned. A poisoned mutex means a thread panicked
+            // mid-DRBG operation, leaving internal state potentially corrupted.
+            // For an HSM, using a corrupted DRBG could produce predictable output.
+            // parking_lot::Mutex::lock() does not poison — it always returns a guard.
+            let mut drbg = self.hsm.drbg().lock();
+            drbg.generate(&mut buf)
+                .map_err(|_| Status::internal("DRBG generation failed — health test failure"))?;
+            drop(drbg);
 
-        self.audit(
-            req.session_handle,
-            AuditOperation::GenerateRandom { length },
-            AuditResult::Success,
-            None,
-            &client_id,
-        )?;
+            self.audit(
+                req.session_handle,
+                AuditOperation::GenerateRandom { length },
+                AuditResult::Success,
+                None,
+                &client_id,
+            )?;
 
-        Ok(Response::new(GenerateRandomResponse { random_data: buf }))
+            Ok(Response::new(GenerateRandomResponse { random_data: buf }))
+        })
     }
 
     async fn wrap_key(
         &self,
         request: Request<WrapKeyRequest>,
     ) -> Result<Response<WrapKeyResponse>, Status> {
-        let client_id = client_id_from_request(&request);
-        let req = request.into_inner();
-        let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
+        blocking(|| {
+            let client_id = client_id_from_request(&request);
+            let req = request.into_inner();
+            let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
 
-        let mech = req
-            .mechanism
-            .ok_or_else(|| Status::invalid_argument("mechanism required"))?;
-        let mech_type = to_ck_ulong(mech.mechanism_type, "mechanism_type")?;
+            let mech = req
+                .mechanism
+                .ok_or_else(|| Status::invalid_argument("mechanism required"))?;
+            let mech_type = to_ck_ulong(mech.mechanism_type, "mechanism_type")?;
 
-        if !craton_hsm::crypto::mechanisms::is_wrap_mechanism(mech_type) {
-            return Err(Status::invalid_argument("Unsupported wrapping mechanism"));
-        }
-
-        craton_hsm::crypto::mechanisms::validate_mechanism_for_policy(
-            mech_type,
-            self.hsm.algorithm_config(),
-            false,
-        )
-        .map_err(|_| Status::permission_denied("Mechanism blocked by algorithm policy"))?;
-
-        let fips_mode = self.hsm.algorithm_config().fips_approved_only;
-        let fips_approved = craton_hsm::crypto::mechanisms::is_fips_approved(mech_type);
-
-        let wrapping_handle = to_ck_ulong(req.wrapping_key_handle, "wrapping_key_handle")?;
-        let key_handle = to_ck_ulong(req.key_handle, "key_handle")?;
-
-        // Get wrapping key
-        let wrap_obj = self
-            .hsm
-            .object_store()
-            .get_object(wrapping_handle)
-            .map_err(hsm_err_to_status)?;
-        let wrap_key = wrap_obj.read();
-        if wrap_key.slot_id != slot_id {
-            return Err(Status::not_found("Wrapping key not found"));
-        }
-        if !wrap_key.can_wrap {
-            return Err(Status::permission_denied("Key cannot be used for wrapping"));
-        }
-
-        // Get key to wrap
-        let target_obj = self
-            .hsm
-            .object_store()
-            .get_object(key_handle)
-            .map_err(hsm_err_to_status)?;
-        let target_key = target_obj.read();
-        if target_key.slot_id != slot_id {
-            return Err(Status::not_found("Key not found"));
-        }
-        if !target_key.extractable {
-            return Err(Status::permission_denied(
-                "Key is not extractable — cannot wrap",
-            ));
-        }
-
-        let wrapping_material = wrap_key
-            .key_material
-            .as_ref()
-            .ok_or_else(|| Status::internal("Wrapping key has no material"))?
-            .as_bytes();
-        let key_material = target_key
-            .key_material
-            .as_ref()
-            .ok_or_else(|| Status::internal("Key has no material"))?
-            .as_bytes();
-
-        let wrapped_key = match mech_type {
-            CKM_AES_KEY_WRAP | CKM_AES_KEY_WRAP_KWP => {
-                craton_hsm::crypto::wrap::aes_key_wrap(wrapping_material, key_material, fips_mode)
-                    .map_err(hsm_err_to_status)?
+            if !craton_hsm::crypto::mechanisms::is_wrap_mechanism(mech_type) {
+                return Err(Status::invalid_argument("Unsupported wrapping mechanism"));
             }
-            _ => return Err(Status::invalid_argument("Unsupported wrapping mechanism")),
-        };
 
-        drop(wrap_key);
-        drop(target_key);
+            craton_hsm::crypto::mechanisms::validate_mechanism_for_policy(
+                mech_type,
+                self.hsm.algorithm_config(),
+                false,
+            )
+            .map_err(|_| Status::permission_denied("Mechanism blocked by algorithm policy"))?;
 
-        self.audit(
-            req.session_handle,
-            AuditOperation::WrapKey {
-                mechanism: mech_type as u64,
-                fips_approved,
-            },
-            AuditResult::Success,
-            Some(format!(
-                "wrapping_key={}, wrapped_key={}",
-                req.wrapping_key_handle, req.key_handle
-            )),
-            &client_id,
-        )?;
+            let fips_mode = self.hsm.algorithm_config().fips_approved_only;
+            let fips_approved = craton_hsm::crypto::mechanisms::is_fips_approved(mech_type);
 
-        Ok(Response::new(WrapKeyResponse { wrapped_key }))
+            let wrapping_handle = to_ck_ulong(req.wrapping_key_handle, "wrapping_key_handle")?;
+            let key_handle = to_ck_ulong(req.key_handle, "key_handle")?;
+
+            // Get wrapping key
+            let wrap_obj = self
+                .hsm
+                .object_store()
+                .get_object(wrapping_handle)
+                .map_err(hsm_err_to_status)?;
+            let wrap_key = wrap_obj.read();
+            if wrap_key.slot_id != slot_id {
+                return Err(Status::not_found("Wrapping key not found"));
+            }
+            if !wrap_key.can_wrap {
+                return Err(Status::permission_denied("Key cannot be used for wrapping"));
+            }
+
+            // Get key to wrap
+            let target_obj = self
+                .hsm
+                .object_store()
+                .get_object(key_handle)
+                .map_err(hsm_err_to_status)?;
+            let target_key = target_obj.read();
+            if target_key.slot_id != slot_id {
+                return Err(Status::not_found("Key not found"));
+            }
+            if !target_key.extractable {
+                return Err(Status::permission_denied(
+                    "Key is not extractable — cannot wrap",
+                ));
+            }
+
+            let wrapping_material = wrap_key
+                .key_material
+                .as_ref()
+                .ok_or_else(|| Status::internal("Wrapping key has no material"))?
+                .as_bytes();
+            let key_material = target_key
+                .key_material
+                .as_ref()
+                .ok_or_else(|| Status::internal("Key has no material"))?
+                .as_bytes();
+
+            let wrapped_key = match mech_type {
+                CKM_AES_KEY_WRAP | CKM_AES_KEY_WRAP_KWP => craton_hsm::crypto::wrap::aes_key_wrap(
+                    wrapping_material,
+                    key_material,
+                    fips_mode,
+                )
+                .map_err(hsm_err_to_status)?,
+                _ => return Err(Status::invalid_argument("Unsupported wrapping mechanism")),
+            };
+
+            drop(wrap_key);
+            drop(target_key);
+
+            self.audit(
+                req.session_handle,
+                AuditOperation::WrapKey {
+                    mechanism: mech_type as u64,
+                    fips_approved,
+                },
+                AuditResult::Success,
+                Some(format!(
+                    "wrapping_key={}, wrapped_key={}",
+                    req.wrapping_key_handle, req.key_handle
+                )),
+                &client_id,
+            )?;
+
+            Ok(Response::new(WrapKeyResponse { wrapped_key }))
+        })
     }
 
     async fn unwrap_key(
         &self,
         request: Request<UnwrapKeyRequest>,
     ) -> Result<Response<UnwrapKeyResponse>, Status> {
-        let client_id = client_id_from_request(&request);
-        let req = request.into_inner();
-        let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
+        blocking(|| {
+            let client_id = client_id_from_request(&request);
+            let req = request.into_inner();
+            let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
 
-        let mech = req
-            .mechanism
-            .ok_or_else(|| Status::invalid_argument("mechanism required"))?;
-        let mech_type = to_ck_ulong(mech.mechanism_type, "mechanism_type")?;
+            let mech = req
+                .mechanism
+                .ok_or_else(|| Status::invalid_argument("mechanism required"))?;
+            let mech_type = to_ck_ulong(mech.mechanism_type, "mechanism_type")?;
 
-        if !craton_hsm::crypto::mechanisms::is_wrap_mechanism(mech_type) {
-            return Err(Status::invalid_argument("Unsupported unwrapping mechanism"));
-        }
+            if !craton_hsm::crypto::mechanisms::is_wrap_mechanism(mech_type) {
+                return Err(Status::invalid_argument("Unsupported unwrapping mechanism"));
+            }
 
-        craton_hsm::crypto::mechanisms::validate_mechanism_for_policy(
-            mech_type,
-            self.hsm.algorithm_config(),
-            false,
-        )
-        .map_err(|_| Status::permission_denied("Mechanism blocked by algorithm policy"))?;
-
-        let fips_mode = self.hsm.algorithm_config().fips_approved_only;
-        let fips_approved = craton_hsm::crypto::mechanisms::is_fips_approved(mech_type);
-
-        let unwrapping_handle = to_ck_ulong(req.unwrapping_key_handle, "unwrapping_key_handle")?;
-
-        // Get unwrapping key
-        let unwrap_obj = self
-            .hsm
-            .object_store()
-            .get_object(unwrapping_handle)
-            .map_err(hsm_err_to_status)?;
-        let unwrap_key = unwrap_obj.read();
-        if unwrap_key.slot_id != slot_id {
-            return Err(Status::not_found("Unwrapping key not found"));
-        }
-        if !unwrap_key.can_unwrap {
-            return Err(Status::permission_denied(
-                "Key cannot be used for unwrapping",
-            ));
-        }
-
-        let unwrapping_material = unwrap_key
-            .key_material
-            .as_ref()
-            .ok_or_else(|| Status::internal("Unwrapping key has no material"))?
-            .as_bytes();
-
-        let key_material = match mech_type {
-            CKM_AES_KEY_WRAP | CKM_AES_KEY_WRAP_KWP => craton_hsm::crypto::wrap::aes_key_unwrap(
-                unwrapping_material,
-                &req.wrapped_key,
-                fips_mode,
+            craton_hsm::crypto::mechanisms::validate_mechanism_for_policy(
+                mech_type,
+                self.hsm.algorithm_config(),
+                false,
             )
-            .map_err(hsm_err_to_status)?,
-            _ => return Err(Status::invalid_argument("Unsupported unwrapping mechanism")),
-        };
+            .map_err(|_| Status::permission_denied("Mechanism blocked by algorithm policy"))?;
 
-        drop(unwrap_key);
+            let fips_mode = self.hsm.algorithm_config().fips_approved_only;
+            let fips_approved = craton_hsm::crypto::mechanisms::is_fips_approved(mech_type);
 
-        // Build a new secret key object from the unwrapped material
-        let template = proto_attrs_to_template(&req.template)?;
-        let handle = self
-            .hsm
-            .object_store()
-            .next_handle()
-            .map_err(hsm_err_to_status)?;
+            let unwrapping_handle =
+                to_ck_ulong(req.unwrapping_key_handle, "unwrapping_key_handle")?;
 
-        let mut obj = craton_hsm::store::object::StoredObject::new(handle, CKO_SECRET_KEY);
-        obj.slot_id = slot_id;
-        // Use key type from template if specified, default to CKK_GENERIC_SECRET
-        let key_type = template
-            .iter()
-            .find(|(attr_type, _)| *attr_type == CKA_KEY_TYPE)
-            .and_then(|(_, value)| {
-                if value.len() >= std::mem::size_of::<CK_ULONG>() {
-                    Some(CK_ULONG::from_ne_bytes(
-                        value[..std::mem::size_of::<CK_ULONG>()].try_into().ok()?,
-                    ))
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(CKK_GENERIC_SECRET);
-        obj.key_type = Some(key_type);
-        obj.value_len = Some(key_material.len() as CK_ULONG);
-        obj.key_material = Some(craton_hsm::store::key_material::RawKeyMaterial::new(
-            key_material,
-        ));
-        obj.sensitive = true;
-        obj.extractable = false;
-
-        // Apply template attributes
-        for (attr_type, value) in &template {
-            craton_hsm::store::attributes::apply_attribute(&mut obj, *attr_type, value)
+            // Get unwrapping key
+            let unwrap_obj = self
+                .hsm
+                .object_store()
+                .get_object(unwrapping_handle)
                 .map_err(hsm_err_to_status)?;
-        }
+            let unwrap_key = unwrap_obj.read();
+            if unwrap_key.slot_id != slot_id {
+                return Err(Status::not_found("Unwrapping key not found"));
+            }
+            if !unwrap_key.can_unwrap {
+                return Err(Status::permission_denied(
+                    "Key cannot be used for unwrapping",
+                ));
+            }
 
-        let new_handle = self
-            .hsm
-            .object_store()
-            .insert_object(obj)
-            .map_err(hsm_err_to_status)?;
+            let unwrapping_material = unwrap_key
+                .key_material
+                .as_ref()
+                .ok_or_else(|| Status::internal("Unwrapping key has no material"))?
+                .as_bytes();
 
-        self.audit(
-            req.session_handle,
-            AuditOperation::UnwrapKey {
-                mechanism: mech_type as u64,
-                fips_approved,
-            },
-            AuditResult::Success,
-            Some(format!(
-                "unwrapping_key={}, new_key={}",
-                req.unwrapping_key_handle, new_handle
-            )),
-            &client_id,
-        )?;
+            let key_material = match mech_type {
+                CKM_AES_KEY_WRAP | CKM_AES_KEY_WRAP_KWP => {
+                    craton_hsm::crypto::wrap::aes_key_unwrap(
+                        unwrapping_material,
+                        &req.wrapped_key,
+                        fips_mode,
+                    )
+                    .map_err(hsm_err_to_status)?
+                }
+                _ => return Err(Status::invalid_argument("Unsupported unwrapping mechanism")),
+            };
 
-        Ok(Response::new(UnwrapKeyResponse {
-            key_handle: new_handle as u64,
-        }))
+            drop(unwrap_key);
+
+            // Build a new secret key object from the unwrapped material
+            let template = proto_attrs_to_template(&req.template)?;
+            let handle = self
+                .hsm
+                .object_store()
+                .next_handle()
+                .map_err(hsm_err_to_status)?;
+
+            let mut obj = craton_hsm::store::object::StoredObject::new(handle, CKO_SECRET_KEY);
+            obj.slot_id = slot_id;
+            // Use key type from template if specified, default to CKK_GENERIC_SECRET
+            let key_type = template
+                .iter()
+                .find(|(attr_type, _)| *attr_type == CKA_KEY_TYPE)
+                .and_then(|(_, value)| {
+                    if value.len() >= std::mem::size_of::<CK_ULONG>() {
+                        Some(CK_ULONG::from_ne_bytes(
+                            value[..std::mem::size_of::<CK_ULONG>()].try_into().ok()?,
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(CKK_GENERIC_SECRET);
+            obj.key_type = Some(key_type);
+            obj.value_len = Some(key_material.len() as CK_ULONG);
+            obj.key_material = Some(craton_hsm::store::key_material::RawKeyMaterial::new(
+                key_material,
+            ));
+            obj.sensitive = true;
+            obj.extractable = false;
+
+            // Apply template attributes
+            for (attr_type, value) in &template {
+                craton_hsm::store::attributes::apply_attribute(&mut obj, *attr_type, value)
+                    .map_err(hsm_err_to_status)?;
+            }
+
+            let new_handle = self
+                .hsm
+                .object_store()
+                .insert_object(obj)
+                .map_err(hsm_err_to_status)?;
+
+            self.audit(
+                req.session_handle,
+                AuditOperation::UnwrapKey {
+                    mechanism: mech_type as u64,
+                    fips_approved,
+                },
+                AuditResult::Success,
+                Some(format!(
+                    "unwrapping_key={}, new_key={}",
+                    req.unwrapping_key_handle, new_handle
+                )),
+                &client_id,
+            )?;
+
+            Ok(Response::new(UnwrapKeyResponse {
+                key_handle: new_handle as u64,
+            }))
+        })
     }
 
     async fn derive_key(
         &self,
         request: Request<DeriveKeyRequest>,
     ) -> Result<Response<DeriveKeyResponse>, Status> {
-        let client_id = client_id_from_request(&request);
-        let req = request.into_inner();
-        let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
+        blocking(|| {
+            let client_id = client_id_from_request(&request);
+            let req = request.into_inner();
+            let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
 
-        let mech = req
-            .mechanism
-            .ok_or_else(|| Status::invalid_argument("mechanism required"))?;
-        let mech_type = to_ck_ulong(mech.mechanism_type, "mechanism_type")?;
+            let mech = req
+                .mechanism
+                .ok_or_else(|| Status::invalid_argument("mechanism required"))?;
+            let mech_type = to_ck_ulong(mech.mechanism_type, "mechanism_type")?;
 
-        if !craton_hsm::crypto::mechanisms::is_derive_mechanism(mech_type) {
-            return Err(Status::invalid_argument("Unsupported derivation mechanism"));
-        }
-
-        craton_hsm::crypto::mechanisms::validate_mechanism_for_policy(
-            mech_type,
-            self.hsm.algorithm_config(),
-            false,
-        )
-        .map_err(|_| Status::permission_denied("Mechanism blocked by algorithm policy"))?;
-
-        let fips_approved = craton_hsm::crypto::mechanisms::is_fips_approved(mech_type);
-
-        let base_handle = to_ck_ulong(req.base_key_handle, "base_key_handle")?;
-
-        // Get base key
-        let base_obj = self
-            .hsm
-            .object_store()
-            .get_object(base_handle)
-            .map_err(hsm_err_to_status)?;
-        let base_key = base_obj.read();
-        if base_key.slot_id != slot_id {
-            return Err(Status::not_found("Base key not found"));
-        }
-        if !base_key.can_derive {
-            return Err(Status::permission_denied(
-                "Key cannot be used for derivation",
-            ));
-        }
-
-        let base_material = base_key
-            .key_material
-            .as_ref()
-            .ok_or_else(|| Status::internal("Base key has no material"))?
-            .as_bytes();
-
-        // The mechanism parameter carries the peer public key for ECDH
-        let peer_public_key = &mech.parameter;
-        if peer_public_key.is_empty() {
-            return Err(Status::invalid_argument(
-                "Mechanism parameter must contain the peer public key",
-            ));
-        }
-
-        // Parse CKA_VALUE_LEN from template for desired derived key length
-        let template = proto_attrs_to_template(&req.template)?;
-        let derived_len = template
-            .iter()
-            .find(|(t, _)| *t == CKA_VALUE_LEN)
-            .and_then(|(_, v)| craton_hsm::store::attributes::read_ck_ulong(v));
-
-        let derived_material = match mech_type {
-            CKM_ECDH1_DERIVE | CKM_ECDH1_COFACTOR_DERIVE => {
-                let ec_params = base_key.ec_params.as_deref().unwrap_or(&[]);
-                if is_p384_ec_params(ec_params) {
-                    craton_hsm::crypto::derive::ecdh_p384(
-                        base_material,
-                        peer_public_key,
-                        derived_len.map(|v| v as usize),
-                    )
-                    .map_err(hsm_err_to_status)?
-                } else if is_p256_ec_params(ec_params) {
-                    craton_hsm::crypto::derive::ecdh_p256(
-                        base_material,
-                        peer_public_key,
-                        derived_len.map(|v| v as usize),
-                    )
-                    .map_err(hsm_err_to_status)?
-                } else {
-                    return Err(Status::invalid_argument(
-                        "Unsupported EC parameters — only P-256 and P-384 are supported",
-                    ));
-                }
+            if !craton_hsm::crypto::mechanisms::is_derive_mechanism(mech_type) {
+                return Err(Status::invalid_argument("Unsupported derivation mechanism"));
             }
-            _ => return Err(Status::invalid_argument("Unsupported derivation mechanism")),
-        };
 
-        drop(base_key);
+            craton_hsm::crypto::mechanisms::validate_mechanism_for_policy(
+                mech_type,
+                self.hsm.algorithm_config(),
+                false,
+            )
+            .map_err(|_| Status::permission_denied("Mechanism blocked by algorithm policy"))?;
 
-        // Build new derived key object
-        let handle = self
-            .hsm
-            .object_store()
-            .next_handle()
-            .map_err(hsm_err_to_status)?;
+            let fips_approved = craton_hsm::crypto::mechanisms::is_fips_approved(mech_type);
 
-        let derived_len_actual = derived_material.as_bytes().len();
-        let mut obj = craton_hsm::store::object::StoredObject::new(handle, CKO_SECRET_KEY);
-        obj.slot_id = slot_id;
-        obj.key_type = Some(CKK_GENERIC_SECRET);
-        obj.value_len = Some(derived_len_actual as CK_ULONG);
-        obj.key_material = Some(derived_material);
-        obj.sensitive = true;
-        obj.extractable = false;
+            let base_handle = to_ck_ulong(req.base_key_handle, "base_key_handle")?;
 
-        // Apply template attributes (label, CKA_ENCRYPT, etc.)
-        for (attr_type, value) in &template {
-            if *attr_type == CKA_VALUE_LEN {
-                continue; // already handled
-            }
-            craton_hsm::store::attributes::apply_attribute(&mut obj, *attr_type, value)
+            // Get base key
+            let base_obj = self
+                .hsm
+                .object_store()
+                .get_object(base_handle)
                 .map_err(hsm_err_to_status)?;
-        }
+            let base_key = base_obj.read();
+            if base_key.slot_id != slot_id {
+                return Err(Status::not_found("Base key not found"));
+            }
+            if !base_key.can_derive {
+                return Err(Status::permission_denied(
+                    "Key cannot be used for derivation",
+                ));
+            }
 
-        let new_handle = self
-            .hsm
-            .object_store()
-            .insert_object(obj)
-            .map_err(hsm_err_to_status)?;
+            let base_material = base_key
+                .key_material
+                .as_ref()
+                .ok_or_else(|| Status::internal("Base key has no material"))?
+                .as_bytes();
 
-        self.audit(
-            req.session_handle,
-            AuditOperation::DeriveKey {
-                mechanism: mech_type as u64,
-                fips_approved,
-            },
-            AuditResult::Success,
-            Some(format!(
-                "base_key={}, derived_key={}",
-                req.base_key_handle, new_handle
-            )),
-            &client_id,
-        )?;
+            // The mechanism parameter carries the peer public key for ECDH
+            let peer_public_key = &mech.parameter;
+            if peer_public_key.is_empty() {
+                return Err(Status::invalid_argument(
+                    "Mechanism parameter must contain the peer public key",
+                ));
+            }
 
-        Ok(Response::new(DeriveKeyResponse {
-            key_handle: new_handle as u64,
-        }))
+            // Parse CKA_VALUE_LEN from template for desired derived key length
+            let template = proto_attrs_to_template(&req.template)?;
+            let derived_len = template
+                .iter()
+                .find(|(t, _)| *t == CKA_VALUE_LEN)
+                .and_then(|(_, v)| craton_hsm::store::attributes::read_ck_ulong(v));
+
+            let derived_material = match mech_type {
+                CKM_ECDH1_DERIVE | CKM_ECDH1_COFACTOR_DERIVE => {
+                    let ec_params = base_key.ec_params.as_deref().unwrap_or(&[]);
+                    if is_p384_ec_params(ec_params) {
+                        craton_hsm::crypto::derive::ecdh_p384(
+                            base_material,
+                            peer_public_key,
+                            derived_len.map(|v| v as usize),
+                        )
+                        .map_err(hsm_err_to_status)?
+                    } else if is_p256_ec_params(ec_params) {
+                        craton_hsm::crypto::derive::ecdh_p256(
+                            base_material,
+                            peer_public_key,
+                            derived_len.map(|v| v as usize),
+                        )
+                        .map_err(hsm_err_to_status)?
+                    } else {
+                        return Err(Status::invalid_argument(
+                            "Unsupported EC parameters — only P-256 and P-384 are supported",
+                        ));
+                    }
+                }
+                _ => return Err(Status::invalid_argument("Unsupported derivation mechanism")),
+            };
+
+            drop(base_key);
+
+            // Build new derived key object
+            let handle = self
+                .hsm
+                .object_store()
+                .next_handle()
+                .map_err(hsm_err_to_status)?;
+
+            let derived_len_actual = derived_material.as_bytes().len();
+            let mut obj = craton_hsm::store::object::StoredObject::new(handle, CKO_SECRET_KEY);
+            obj.slot_id = slot_id;
+            obj.key_type = Some(CKK_GENERIC_SECRET);
+            obj.value_len = Some(derived_len_actual as CK_ULONG);
+            obj.key_material = Some(derived_material);
+            obj.sensitive = true;
+            obj.extractable = false;
+
+            // Apply template attributes (label, CKA_ENCRYPT, etc.)
+            for (attr_type, value) in &template {
+                if *attr_type == CKA_VALUE_LEN {
+                    continue; // already handled
+                }
+                craton_hsm::store::attributes::apply_attribute(&mut obj, *attr_type, value)
+                    .map_err(hsm_err_to_status)?;
+            }
+
+            let new_handle = self
+                .hsm
+                .object_store()
+                .insert_object(obj)
+                .map_err(hsm_err_to_status)?;
+
+            self.audit(
+                req.session_handle,
+                AuditOperation::DeriveKey {
+                    mechanism: mech_type as u64,
+                    fips_approved,
+                },
+                AuditResult::Success,
+                Some(format!(
+                    "base_key={}, derived_key={}",
+                    req.base_key_handle, new_handle
+                )),
+                &client_id,
+            )?;
+
+            Ok(Response::new(DeriveKeyResponse {
+                key_handle: new_handle as u64,
+            }))
+        })
     }
 
     async fn copy_object(
         &self,
         request: Request<CopyObjectRequest>,
     ) -> Result<Response<CopyObjectResponse>, Status> {
-        let client_id = client_id_from_request(&request);
-        let req = request.into_inner();
-        let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
+        blocking(|| {
+            let client_id = client_id_from_request(&request);
+            let req = request.into_inner();
+            let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
 
-        let object_handle = to_ck_ulong(req.object_handle, "object_handle")?;
+            let object_handle = to_ck_ulong(req.object_handle, "object_handle")?;
 
-        // Get the source object
-        let src_obj = self
-            .hsm
-            .object_store()
-            .get_object(object_handle)
-            .map_err(hsm_err_to_status)?;
-        let src = src_obj.read();
-
-        if src.slot_id != slot_id {
-            return Err(Status::not_found("Object not found"));
-        }
-
-        // Clone the object
-        let new_handle_val = self
-            .hsm
-            .object_store()
-            .next_handle()
-            .map_err(hsm_err_to_status)?;
-
-        // PKCS#11: CKA_COPYABLE must be true to allow copying
-        if !src.copyable {
-            return Err(Status::permission_denied("Object is not copyable"));
-        }
-
-        let mut new_obj = craton_hsm::store::object::StoredObject::new(new_handle_val, src.class);
-        new_obj.slot_id = slot_id;
-        new_obj.key_type = src.key_type;
-        new_obj.value_len = src.value_len;
-        new_obj.key_material = src.key_material.clone();
-        new_obj.modulus = src.modulus.clone();
-        new_obj.modulus_bits = src.modulus_bits;
-        new_obj.public_exponent = src.public_exponent.clone();
-        new_obj.ec_params = src.ec_params.clone();
-        new_obj.ec_point = src.ec_point.clone();
-        new_obj.can_encrypt = src.can_encrypt;
-        new_obj.can_decrypt = src.can_decrypt;
-        new_obj.can_sign = src.can_sign;
-        new_obj.can_verify = src.can_verify;
-        new_obj.can_wrap = src.can_wrap;
-        new_obj.can_unwrap = src.can_unwrap;
-        new_obj.can_derive = src.can_derive;
-        new_obj.sensitive = src.sensitive;
-        new_obj.extractable = src.extractable;
-        new_obj.private = src.private;
-        new_obj.label = src.label.clone();
-        new_obj.token_object = src.token_object;
-        new_obj.id = src.id.clone();
-
-        // Save source security attributes before releasing the read lock
-        let src_sensitive = src.sensitive;
-        let src_extractable = src.extractable;
-
-        drop(src);
-
-        // Apply template overrides
-        let template = proto_attrs_to_template(&req.template)?;
-        for (attr_type, value) in &template {
-            craton_hsm::store::attributes::apply_attribute(&mut new_obj, *attr_type, value)
+            // Get the source object
+            let src_obj = self
+                .hsm
+                .object_store()
+                .get_object(object_handle)
                 .map_err(hsm_err_to_status)?;
-        }
+            let src = src_obj.read();
 
-        // PKCS#11 §5.7: CKA_SENSITIVE can only be set to TRUE, never weakened
-        if src_sensitive && !new_obj.sensitive {
-            return Err(Status::permission_denied(
-                "Cannot weaken CKA_SENSITIVE on copy",
-            ));
-        }
-        // PKCS#11 §5.7: CKA_EXTRACTABLE can only be set to FALSE, never weakened
-        if !src_extractable && new_obj.extractable {
-            return Err(Status::permission_denied(
-                "Cannot weaken CKA_EXTRACTABLE on copy",
-            ));
-        }
+            if src.slot_id != slot_id {
+                return Err(Status::not_found("Object not found"));
+            }
 
-        let inserted_handle = self
-            .hsm
-            .object_store()
-            .insert_object(new_obj)
-            .map_err(hsm_err_to_status)?;
+            // Clone the object
+            let new_handle_val = self
+                .hsm
+                .object_store()
+                .next_handle()
+                .map_err(hsm_err_to_status)?;
 
-        self.audit(
-            req.session_handle,
-            AuditOperation::CreateObject,
-            AuditResult::Success,
-            Some(format!(
-                "copied from={}, new={}",
-                req.object_handle, inserted_handle
-            )),
-            &client_id,
-        )?;
+            // PKCS#11: CKA_COPYABLE must be true to allow copying
+            if !src.copyable {
+                return Err(Status::permission_denied("Object is not copyable"));
+            }
 
-        Ok(Response::new(CopyObjectResponse {
-            new_object_handle: inserted_handle as u64,
-        }))
+            let mut new_obj =
+                craton_hsm::store::object::StoredObject::new(new_handle_val, src.class);
+            new_obj.slot_id = slot_id;
+            new_obj.key_type = src.key_type;
+            new_obj.value_len = src.value_len;
+            new_obj.key_material = src.key_material.clone();
+            new_obj.modulus = src.modulus.clone();
+            new_obj.modulus_bits = src.modulus_bits;
+            new_obj.public_exponent = src.public_exponent.clone();
+            new_obj.ec_params = src.ec_params.clone();
+            new_obj.ec_point = src.ec_point.clone();
+            new_obj.can_encrypt = src.can_encrypt;
+            new_obj.can_decrypt = src.can_decrypt;
+            new_obj.can_sign = src.can_sign;
+            new_obj.can_verify = src.can_verify;
+            new_obj.can_wrap = src.can_wrap;
+            new_obj.can_unwrap = src.can_unwrap;
+            new_obj.can_derive = src.can_derive;
+            new_obj.sensitive = src.sensitive;
+            new_obj.extractable = src.extractable;
+            new_obj.private = src.private;
+            new_obj.label = src.label.clone();
+            new_obj.token_object = src.token_object;
+            new_obj.id = src.id.clone();
+
+            // Save source security attributes before releasing the read lock
+            let src_sensitive = src.sensitive;
+            let src_extractable = src.extractable;
+
+            drop(src);
+
+            // Apply template overrides
+            let template = proto_attrs_to_template(&req.template)?;
+            for (attr_type, value) in &template {
+                craton_hsm::store::attributes::apply_attribute(&mut new_obj, *attr_type, value)
+                    .map_err(hsm_err_to_status)?;
+            }
+
+            // PKCS#11 §5.7: CKA_SENSITIVE can only be set to TRUE, never weakened
+            if src_sensitive && !new_obj.sensitive {
+                return Err(Status::permission_denied(
+                    "Cannot weaken CKA_SENSITIVE on copy",
+                ));
+            }
+            // PKCS#11 §5.7: CKA_EXTRACTABLE can only be set to FALSE, never weakened
+            if !src_extractable && new_obj.extractable {
+                return Err(Status::permission_denied(
+                    "Cannot weaken CKA_EXTRACTABLE on copy",
+                ));
+            }
+
+            let inserted_handle = self
+                .hsm
+                .object_store()
+                .insert_object(new_obj)
+                .map_err(hsm_err_to_status)?;
+
+            self.audit(
+                req.session_handle,
+                AuditOperation::CreateObject,
+                AuditResult::Success,
+                Some(format!(
+                    "copied from={}, new={}",
+                    req.object_handle, inserted_handle
+                )),
+                &client_id,
+            )?;
+
+            Ok(Response::new(CopyObjectResponse {
+                new_object_handle: inserted_handle as u64,
+            }))
+        })
     }
 
     async fn init_pin(
         &self,
         request: Request<InitPinRequest>,
     ) -> Result<Response<InitPinResponse>, Status> {
-        let client_id = client_id_from_request(&request);
-        let mut req = request.into_inner();
+        blocking(|| {
+            let client_id = client_id_from_request(&request);
+            let mut req = request.into_inner();
 
-        // InitPIN requires SO to be logged in — the session must exist and be authenticated
-        let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
+            // InitPIN requires SO to be logged in — the session must exist and be authenticated
+            let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
 
-        // C_InitPIN requires SO login — verify session state
-        let session = self
-            .hsm
-            .session_manager()
-            .get_session(
-                req.session_handle
-                    .try_into()
-                    .map_err(|_| Status::invalid_argument("bad handle"))?,
-            )
-            .map_err(hsm_err_to_status)?;
-        {
-            let s = session.read();
-            if !s.state.is_so() {
-                return Err(Status::permission_denied("C_InitPIN requires SO login"));
+            // C_InitPIN requires SO login — verify session state
+            let session = self
+                .hsm
+                .session_manager()
+                .get_session(
+                    req.session_handle
+                        .try_into()
+                        .map_err(|_| Status::invalid_argument("bad handle"))?,
+                )
+                .map_err(hsm_err_to_status)?;
+            {
+                let s = session.read();
+                if !s.state.is_so() {
+                    return Err(Status::permission_denied("C_InitPIN requires SO login"));
+                }
             }
-        }
 
-        let token = self
-            .hsm
-            .slot_manager()
-            .get_token(slot_id)
-            .map_err(hsm_err_to_status)?;
+            let token = self
+                .hsm
+                .slot_manager()
+                .get_token(slot_id)
+                .map_err(hsm_err_to_status)?;
 
-        let result = token.init_pin(&req.pin);
+            let result = token.init_pin(&req.pin);
 
-        // Zeroize PIN material immediately after use, regardless of outcome
-        req.pin.zeroize();
+            // Zeroize PIN material immediately after use, regardless of outcome
+            req.pin.zeroize();
 
-        result.map_err(hsm_err_to_status)?;
+            result.map_err(hsm_err_to_status)?;
 
-        self.audit(
-            req.session_handle,
-            AuditOperation::InitPIN {
-                slot_id: slot_id as u64,
-            },
-            AuditResult::Success,
-            None,
-            &client_id,
-        )?;
+            self.audit(
+                req.session_handle,
+                AuditOperation::InitPIN {
+                    slot_id: slot_id as u64,
+                },
+                AuditResult::Success,
+                None,
+                &client_id,
+            )?;
 
-        Ok(Response::new(InitPinResponse {}))
+            Ok(Response::new(InitPinResponse {}))
+        })
     }
 
     async fn set_pin(
         &self,
         request: Request<SetPinRequest>,
     ) -> Result<Response<SetPinResponse>, Status> {
-        let client_id = client_id_from_request(&request);
-        let mut req = request.into_inner();
+        blocking(|| {
+            let client_id = client_id_from_request(&request);
+            let mut req = request.into_inner();
 
-        // SetPIN requires the user (or SO) to be logged in
-        let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
+            // SetPIN requires the user (or SO) to be logged in
+            let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
 
-        let token = self
-            .hsm
-            .slot_manager()
-            .get_token(slot_id)
-            .map_err(hsm_err_to_status)?;
+            let token = self
+                .hsm
+                .slot_manager()
+                .get_token(slot_id)
+                .map_err(hsm_err_to_status)?;
 
-        let result = token.set_pin(&req.old_pin, &req.new_pin);
+            let result = token.set_pin(&req.old_pin, &req.new_pin);
 
-        // Zeroize PIN material immediately after use, regardless of outcome
-        req.old_pin.zeroize();
-        req.new_pin.zeroize();
+            // Zeroize PIN material immediately after use, regardless of outcome
+            req.old_pin.zeroize();
+            req.new_pin.zeroize();
 
-        result.map_err(hsm_err_to_status)?;
+            result.map_err(hsm_err_to_status)?;
 
-        self.audit(
-            req.session_handle,
-            AuditOperation::SetPIN,
-            AuditResult::Success,
-            Some("set_pin".to_string()),
-            &client_id,
-        )?;
+            self.audit(
+                req.session_handle,
+                AuditOperation::SetPIN,
+                AuditResult::Success,
+                Some("set_pin".to_string()),
+                &client_id,
+            )?;
 
-        Ok(Response::new(SetPinResponse {}))
+            Ok(Response::new(SetPinResponse {}))
+        })
     }
 
     async fn health_check(

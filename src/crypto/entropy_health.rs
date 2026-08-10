@@ -356,7 +356,31 @@ pub fn global_reset_for_tests() {
 /// key material or signatures, and `panic!()` could be caught by the
 /// host application across the C ABI boundary.
 pub struct HealthMonitoredRng {
-    source: Box<dyn EntropySource + Send + Sync>,
+    source: RngSource,
+}
+
+/// Entropy source backing a [`HealthMonitoredRng`].
+///
+/// The production variant is inline rather than boxed: `HealthMonitoredRng` is
+/// constructed on every DRBG reseed, and a DRBG reseed happens on every
+/// `generate()` call (prediction resistance), so a `Box::new` here was one heap
+/// allocation plus a virtual call per random-byte request. Test injection still
+/// gets a boxed trait object, but only under `cfg(test)`.
+enum RngSource {
+    Os(OsEntropySource),
+    #[cfg(test)]
+    Injected(Box<dyn EntropySource + Send + Sync>),
+}
+
+impl RngSource {
+    #[inline]
+    fn fill(&mut self, dest: &mut [u8]) {
+        match self {
+            RngSource::Os(s) => s.fill(dest),
+            #[cfg(test)]
+            RngSource::Injected(s) => s.fill(dest),
+        }
+    }
 }
 
 /// Test-injectable entropy source. Production code uses the
@@ -379,7 +403,7 @@ impl HealthMonitoredRng {
     /// Construct the production health-monitored RNG that draws from `OsRng`.
     pub fn new() -> Self {
         Self {
-            source: Box::new(OsEntropySource),
+            source: RngSource::Os(OsEntropySource),
         }
     }
 
@@ -388,7 +412,9 @@ impl HealthMonitoredRng {
     /// verify the monitor trips.
     #[cfg(test)]
     pub fn with_source(source: Box<dyn EntropySource + Send + Sync>) -> Self {
-        Self { source }
+        Self {
+            source: RngSource::Injected(source),
+        }
     }
 }
 

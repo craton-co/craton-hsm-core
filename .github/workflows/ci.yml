@@ -279,6 +279,119 @@ jobs:
 
 
   # ── Documentation: build on PRs, deploy on main ──
+  # ── Performance regression check ──
+  #
+  # Two distinct jobs in one, deliberately:
+  #
+  #   1. A *gate*: every benchmark must still compile and run. Benchmarks rot
+  #      silently because nothing else builds them, and a benchmark that no
+  #      longer runs cannot catch anything. This part fails the build.
+  #
+  #   2. A *report*: Criterion compares the PR head against the merge base and
+  #      prints the deltas into the job summary. This part does NOT fail the
+  #      build. GitHub-hosted runners are shared, burstable VMs whose timings
+  #      vary by tens of percent between runs; gating on them would produce
+  #      flaky failures that train reviewers to ignore the job. Treat the
+  #      report as a prompt to re-measure locally on a quiesced machine
+  #      (see docs/performance-tuning.md) rather than as a verdict.
+  bench:
+    name: Benchmarks (compile gate + regression report)
+    needs: fmt-check
+    runs-on: ubuntu-latest
+    # Benchmarks are slow and their report is only actionable on a PR.
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          # Need the merge base to build the comparison baseline.
+          fetch-depth: 0
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2
+
+      # ── Gate: benchmarks must build ──
+      - name: Build benchmarks
+        run: cargo build --release --benches
+
+      # ── Baseline: measure the merge base ──
+      #
+      # `--save-baseline base` writes into target/criterion/. The working tree
+      # is restored afterwards so the head measurement builds the PR's code.
+      - name: Measure baseline (merge base)
+        # Best-effort: the merge base is old code that may not build or run its
+        # benchmarks any more. A missing baseline only costs the comparison —
+        # the gate is the PR-head step below, which is not allowed to fail.
+        # `git checkout --force` runs unconditionally so the working tree is
+        # restored even if the measurement bailed out.
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          BASE="$(git merge-base HEAD "origin/${GITHUB_BASE_REF}")"
+          echo "Merge base: $BASE"
+          git checkout --detach "$BASE"
+          cargo bench --bench crypto_bench -- \
+            --save-baseline base --sample-size 10 --measurement-time 2 || \
+            echo "::warning::baseline crypto_bench did not complete; comparison will be partial"
+          cargo bench --bench pkcs11_abi_bench -- \
+            --save-baseline base --sample-size 10 --measurement-time 2 || \
+            echo "::warning::baseline pkcs11_abi_bench did not complete; comparison will be partial"
+          git checkout --force "$GITHUB_SHA"
+
+      # ── Head: measure the PR and compare ──
+      #
+      # `--baseline base` makes Criterion emit "Performance has regressed" /
+      # "improved" lines against the saved run. Failures here are the gate
+      # (a benchmark that panics or returns a wrong result), not the timings.
+      - name: Measure PR head against baseline
+        run: |
+          set -euo pipefail
+          # `--baseline-lenient` compares where a saved baseline exists and
+          # simply reports absolute numbers where it does not, so a partial or
+          # missing baseline cannot fail the gate.
+          cargo bench --bench crypto_bench -- \
+            --baseline-lenient base --sample-size 10 --measurement-time 2 \
+            2>&1 | tee bench-head.txt
+          cargo bench --bench pkcs11_abi_bench -- \
+            --baseline-lenient base --sample-size 10 --measurement-time 2 \
+            2>&1 | tee -a bench-head.txt
+
+      - name: Summarise regressions
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "## Benchmark comparison vs merge base"
+            echo
+            echo "Runner timings are noisy; re-measure locally before acting."
+            echo "See \`docs/performance-tuning.md\` for a reproducible setup."
+            echo
+            if grep -qE "Performance has (regressed|improved)" bench-head.txt; then
+              echo '```'
+              grep -B 3 -E "Performance has (regressed|improved)" bench-head.txt
+              echo '```'
+            else
+              echo "No changes outside Criterion's noise threshold."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Criterion reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: criterion-reports
+          path: target/criterion/
+          retention-days: 14
+
   docs:
     name: Documentation
     needs: fmt-check

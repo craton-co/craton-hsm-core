@@ -260,6 +260,12 @@ fn oaep_encrypt_via_internal(modulus: &[u8], pub_exp: &[u8], plaintext: &[u8]) -
 // ============================================================================
 
 #[test]
+#[cfg_attr(
+    not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+    ignore = "needs RustCrypto RSA private-key operations, which release builds \
+              refuse (RUSTSEC-2023-0071); run in debug or with \
+              --features insecure-rustcrypto-rsa-private-ops"
+)]
 fn test_rsa_2048_pkcs1v15_sign_verify() {
     let session = setup_user_session();
     let (pub_key, priv_key) = generate_rsa_keypair(session, 2048);
@@ -277,6 +283,12 @@ fn test_rsa_2048_pkcs1v15_sign_verify() {
 // ============================================================================
 
 #[test]
+#[cfg_attr(
+    not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+    ignore = "needs RustCrypto RSA private-key operations, which release builds \
+              refuse (RUSTSEC-2023-0071); run in debug or with \
+              --features insecure-rustcrypto-rsa-private-ops"
+)]
 fn test_rsa_2048_pss_sign_verify() {
     let session = setup_user_session();
     let (pub_key, priv_key) = generate_rsa_keypair(session, 2048);
@@ -294,6 +306,12 @@ fn test_rsa_2048_pss_sign_verify() {
 // ============================================================================
 
 #[test]
+#[cfg_attr(
+    not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+    ignore = "needs RustCrypto RSA private-key operations, which release builds \
+              refuse (RUSTSEC-2023-0071); run in debug or with \
+              --features insecure-rustcrypto-rsa-private-ops"
+)]
 fn test_rsa_2048_oaep_encrypt_decrypt() {
     let session = setup_user_session();
     let (pub_key, priv_key) = generate_rsa_keypair(session, 2048);
@@ -336,6 +354,12 @@ fn test_rsa_2048_oaep_encrypt_decrypt() {
 // ============================================================================
 
 #[test]
+#[cfg_attr(
+    not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+    ignore = "needs RustCrypto RSA private-key operations, which release builds \
+              refuse (RUSTSEC-2023-0071); run in debug or with \
+              --features insecure-rustcrypto-rsa-private-ops"
+)]
 fn test_rsa_3072_keygen() {
     let session = setup_user_session();
     let (pub_key, priv_key) = generate_rsa_keypair(session, 3072);
@@ -348,6 +372,12 @@ fn test_rsa_3072_keygen() {
 // ============================================================================
 
 #[test]
+#[cfg_attr(
+    not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+    ignore = "needs RustCrypto RSA private-key operations, which release builds \
+              refuse (RUSTSEC-2023-0071); run in debug or with \
+              --features insecure-rustcrypto-rsa-private-ops"
+)]
 fn test_rsa_3072_sign_verify() {
     let session = setup_user_session();
     let (pub_key, priv_key) = generate_rsa_keypair(session, 3072);
@@ -365,6 +395,12 @@ fn test_rsa_3072_sign_verify() {
 // ============================================================================
 
 #[test]
+#[cfg_attr(
+    not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+    ignore = "needs RustCrypto RSA private-key operations, which release builds \
+              refuse (RUSTSEC-2023-0071); run in debug or with \
+              --features insecure-rustcrypto-rsa-private-ops"
+)]
 fn test_rsa_sign_wrong_key_verifies_false() {
     let session = setup_user_session();
     let (_pub_a, priv_a) = generate_rsa_keypair(session, 2048);
@@ -385,6 +421,12 @@ fn test_rsa_sign_wrong_key_verifies_false() {
 // ============================================================================
 
 #[test]
+#[cfg_attr(
+    not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+    ignore = "needs RustCrypto RSA private-key operations, which release builds \
+              refuse (RUSTSEC-2023-0071); run in debug or with \
+              --features insecure-rustcrypto-rsa-private-ops"
+)]
 fn test_rsa_sign_tampered_data_fails() {
     let session = setup_user_session();
     let (pub_key, priv_key) = generate_rsa_keypair(session, 2048);
@@ -405,6 +447,12 @@ fn test_rsa_sign_tampered_data_fails() {
 // ============================================================================
 
 #[test]
+#[cfg_attr(
+    not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+    ignore = "needs RustCrypto RSA private-key operations, which release builds \
+              refuse (RUSTSEC-2023-0071); run in debug or with \
+              --features insecure-rustcrypto-rsa-private-ops"
+)]
 fn test_rsa_pkcs1v15_sha384_sign_verify() {
     let session = setup_user_session();
     let (pub_key, priv_key) = generate_rsa_keypair(session, 2048);
@@ -422,6 +470,12 @@ fn test_rsa_pkcs1v15_sha384_sign_verify() {
 // ============================================================================
 
 #[test]
+#[cfg_attr(
+    not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+    ignore = "needs RustCrypto RSA private-key operations, which release builds \
+              refuse (RUSTSEC-2023-0071); run in debug or with \
+              --features insecure-rustcrypto-rsa-private-ops"
+)]
 fn test_rsa_pkcs1v15_sha512_sign_verify() {
     let session = setup_user_session();
     let (pub_key, priv_key) = generate_rsa_keypair(session, 2048);
@@ -439,6 +493,12 @@ fn test_rsa_pkcs1v15_sha512_sign_verify() {
 // ============================================================================
 
 #[test]
+#[cfg_attr(
+    not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+    ignore = "needs RustCrypto RSA private-key operations, which release builds \
+              refuse (RUSTSEC-2023-0071); run in debug or with \
+              --features insecure-rustcrypto-rsa-private-ops"
+)]
 fn test_rsa_pss_sha384_sign_verify() {
     let session = setup_user_session();
     let (pub_key, priv_key) = generate_rsa_keypair(session, 2048);
@@ -456,6 +516,12 @@ fn test_rsa_pss_sha384_sign_verify() {
 // ============================================================================
 
 #[test]
+#[cfg_attr(
+    not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+    ignore = "needs RustCrypto RSA private-key operations, which release builds \
+              refuse (RUSTSEC-2023-0071); run in debug or with \
+              --features insecure-rustcrypto-rsa-private-ops"
+)]
 fn test_rsa_pss_sha512_sign_verify() {
     let session = setup_user_session();
     let (pub_key, priv_key) = generate_rsa_keypair(session, 2048);
@@ -473,6 +539,12 @@ fn test_rsa_pss_sha512_sign_verify() {
 // ============================================================================
 
 #[test]
+#[cfg_attr(
+    not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+    ignore = "needs RustCrypto RSA private-key operations, which release builds \
+              refuse (RUSTSEC-2023-0071); run in debug or with \
+              --features insecure-rustcrypto-rsa-private-ops"
+)]
 fn test_rsa_oaep_wrong_key_decrypt_fails() {
     let session = setup_user_session();
     let (pub_a, _priv_a) = generate_rsa_keypair(session, 2048);
@@ -510,6 +582,12 @@ fn test_rsa_oaep_wrong_key_decrypt_fails() {
 // ============================================================================
 
 #[test]
+#[cfg_attr(
+    not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+    ignore = "needs RustCrypto RSA private-key operations, which release builds \
+              refuse (RUSTSEC-2023-0071); run in debug or with \
+              --features insecure-rustcrypto-rsa-private-ops"
+)]
 fn test_rsa_oaep_tampered_ciphertext_fails() {
     let session = setup_user_session();
     let (pub_key, priv_key) = generate_rsa_keypair(session, 2048);
@@ -549,6 +627,12 @@ fn test_rsa_oaep_tampered_ciphertext_fails() {
 // ============================================================================
 
 #[test]
+#[cfg_attr(
+    not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+    ignore = "needs RustCrypto RSA private-key operations, which release builds \
+              refuse (RUSTSEC-2023-0071); run in debug or with \
+              --features insecure-rustcrypto-rsa-private-ops"
+)]
 fn test_rsa_sign_null_output_gets_size() {
     let session = setup_user_session();
     let (_pub_key, priv_key) = generate_rsa_keypair(session, 2048);
@@ -583,6 +667,12 @@ fn test_rsa_sign_null_output_gets_size() {
 // ============================================================================
 
 #[test]
+#[cfg_attr(
+    not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+    ignore = "needs RustCrypto RSA private-key operations, which release builds \
+              refuse (RUSTSEC-2023-0071); run in debug or with \
+              --features insecure-rustcrypto-rsa-private-ops"
+)]
 fn test_rsa_sign_buffer_too_small() {
     let session = setup_user_session();
     let (_pub_key, priv_key) = generate_rsa_keypair(session, 2048);
@@ -614,6 +704,12 @@ fn test_rsa_sign_buffer_too_small() {
 // ============================================================================
 
 #[test]
+#[cfg_attr(
+    not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+    ignore = "needs RustCrypto RSA private-key operations, which release builds \
+              refuse (RUSTSEC-2023-0071); run in debug or with \
+              --features insecure-rustcrypto-rsa-private-ops"
+)]
 fn test_rsa_decrypt_null_output_gets_size() {
     let session = setup_user_session();
     let (pub_key, priv_key) = generate_rsa_keypair(session, 2048);
@@ -650,6 +746,12 @@ fn test_rsa_decrypt_null_output_gets_size() {
 // ============================================================================
 
 #[test]
+#[cfg_attr(
+    not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+    ignore = "needs RustCrypto RSA private-key operations, which release builds \
+              refuse (RUSTSEC-2023-0071); run in debug or with \
+              --features insecure-rustcrypto-rsa-private-ops"
+)]
 fn test_rsa_keygen_attributes_correct() {
     let session = setup_user_session();
     let (pub_key, _priv_key) = generate_rsa_keypair(session, 2048);
@@ -671,6 +773,12 @@ fn test_rsa_keygen_attributes_correct() {
 // ============================================================================
 
 #[test]
+#[cfg_attr(
+    not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+    ignore = "needs RustCrypto RSA private-key operations, which release builds \
+              refuse (RUSTSEC-2023-0071); run in debug or with \
+              --features insecure-rustcrypto-rsa-private-ops"
+)]
 fn test_rsa_keygen_public_exponent() {
     let session = setup_user_session();
     let (pub_key, _priv_key) = generate_rsa_keypair(session, 2048);
@@ -712,6 +820,12 @@ fn test_rsa_keygen_public_exponent() {
 // ============================================================================
 
 #[test]
+#[cfg_attr(
+    not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+    ignore = "needs RustCrypto RSA private-key operations, which release builds \
+              refuse (RUSTSEC-2023-0071); run in debug or with \
+              --features insecure-rustcrypto-rsa-private-ops"
+)]
 fn test_rsa_private_key_is_sensitive() {
     let session = setup_user_session();
     let (_pub_key, priv_key) = generate_rsa_keypair(session, 2048);
@@ -732,6 +846,12 @@ fn test_rsa_private_key_is_sensitive() {
 // ============================================================================
 
 #[test]
+#[cfg_attr(
+    not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+    ignore = "needs RustCrypto RSA private-key operations, which release builds \
+              refuse (RUSTSEC-2023-0071); run in debug or with \
+              --features insecure-rustcrypto-rsa-private-ops"
+)]
 fn test_rsa_public_key_not_sensitive() {
     let session = setup_user_session();
     let (pub_key, _priv_key) = generate_rsa_keypair(session, 2048);
@@ -998,6 +1118,12 @@ fn test_rsa_sign_init_wrong_key_type() {
 // ============================================================================
 
 #[test]
+#[cfg_attr(
+    not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+    ignore = "needs RustCrypto RSA private-key operations, which release builds \
+              refuse (RUSTSEC-2023-0071); run in debug or with \
+              --features insecure-rustcrypto-rsa-private-ops"
+)]
 fn test_rsa_2048_keygen_modulus_size() {
     let session = setup_user_session();
     let (pub_key, _priv_key) = generate_rsa_keypair(session, 2048);
@@ -1039,6 +1165,12 @@ fn test_rsa_2048_keygen_modulus_size() {
 // ============================================================================
 
 #[test]
+#[cfg_attr(
+    not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+    ignore = "needs RustCrypto RSA private-key operations, which release builds \
+              refuse (RUSTSEC-2023-0071); run in debug or with \
+              --features insecure-rustcrypto-rsa-private-ops"
+)]
 fn test_rsa_verify_with_public_key_only() {
     let session = setup_user_session();
     let (pub_key, priv_key) = generate_rsa_keypair(session, 2048);
@@ -1060,6 +1192,12 @@ fn test_rsa_verify_with_public_key_only() {
 // ============================================================================
 
 #[test]
+#[cfg_attr(
+    not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+    ignore = "needs RustCrypto RSA private-key operations, which release builds \
+              refuse (RUSTSEC-2023-0071); run in debug or with \
+              --features insecure-rustcrypto-rsa-private-ops"
+)]
 fn test_rsa_sign_different_data_different_sigs() {
     let session = setup_user_session();
     let (_pub_key, priv_key) = generate_rsa_keypair(session, 2048);
@@ -1076,6 +1214,12 @@ fn test_rsa_sign_different_data_different_sigs() {
 // ============================================================================
 
 #[test]
+#[cfg_attr(
+    not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+    ignore = "needs RustCrypto RSA private-key operations, which release builds \
+              refuse (RUSTSEC-2023-0071); run in debug or with \
+              --features insecure-rustcrypto-rsa-private-ops"
+)]
 fn test_rsa_2048_sign_large_data() {
     let session = setup_user_session();
     let (pub_key, priv_key) = generate_rsa_keypair(session, 2048);
@@ -1093,6 +1237,12 @@ fn test_rsa_2048_sign_large_data() {
 // ============================================================================
 
 #[test]
+#[cfg_attr(
+    not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+    ignore = "needs RustCrypto RSA private-key operations, which release builds \
+              refuse (RUSTSEC-2023-0071); run in debug or with \
+              --features insecure-rustcrypto-rsa-private-ops"
+)]
 fn test_rsa_keygen_produces_unique_keys() {
     let session = setup_user_session();
     let (pub_key_1, _priv_key_1) = generate_rsa_keypair(session, 2048);

@@ -154,6 +154,81 @@ impl EncryptedStore {
         Ok(())
     }
 
+    /// Store several encrypted blobs under a **single** redb transaction.
+    ///
+    /// `redb` issues an `fsync` on every `commit()`, so writing N objects with
+    /// N calls to [`EncryptedStore::store_encrypted`] costs N `fsync`s — the
+    /// dominant cost of object creation by a wide margin. Every caller that
+    /// already knows it is writing more than one object should use this
+    /// instead; `C_GenerateKeyPair` alone halves its persistence cost by
+    /// committing the public and private object together.
+    ///
+    /// # Atomicity
+    ///
+    /// This is *stronger* than a loop over `store_encrypted`, not weaker: the
+    /// batch commits atomically, so a crash cannot leave a key pair
+    /// half-persisted with the private half missing. Durability is unchanged —
+    /// the single `commit()` still `fsync`s before returning.
+    ///
+    /// Each blob gets its own freshly generated nonce, exactly as in the
+    /// single-blob path.
+    /// Plaintexts stay wrapped in `Zeroizing` all the way in, so a batch of
+    /// serialized key material is never copied into an unzeroized buffer.
+    pub fn store_encrypted_batch(
+        &self,
+        items: &[(String, Zeroizing<Vec<u8>>)],
+        encryption_key: &[u8; KEY_LEN],
+    ) -> HsmResult<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let db = self.db.as_ref().ok_or(HsmError::GeneralError)?;
+
+        let aes_key = Key::<Aes256Gcm>::from_slice(encryption_key);
+        let cipher = Aes256Gcm::new(aes_key);
+
+        // Encrypt everything before opening the transaction so the write lock
+        // is held only for the duration of the inserts.
+        let mut sealed: Vec<(&str, Vec<u8>)> = Vec::with_capacity(items.len());
+        let mut drbg = HmacDrbg::new()?;
+        for (store_key, plaintext) in items {
+            let mut nonce_bytes = [0u8; NONCE_LEN];
+            drbg.generate(&mut nonce_bytes)?;
+            let nonce = Nonce::from_slice(&nonce_bytes);
+            let ciphertext = cipher.encrypt(nonce, plaintext.as_slice()).map_err(|e| {
+                tracing::error!("AES-GCM encryption failed for key '{}': {}", store_key, e);
+                HsmError::GeneralError
+            })?;
+            let mut stored = Vec::with_capacity(NONCE_LEN + ciphertext.len());
+            stored.extend_from_slice(&nonce_bytes);
+            stored.extend_from_slice(&ciphertext);
+            sealed.push((store_key.as_str(), stored));
+        }
+
+        let write_txn = db.begin_write().map_err(|e| {
+            tracing::error!("Failed to begin batch write transaction: {}", e);
+            HsmError::GeneralError
+        })?;
+        {
+            let mut table = write_txn.open_table(OBJECTS_TABLE).map_err(|e| {
+                tracing::error!("Failed to open objects table for batch write: {}", e);
+                HsmError::GeneralError
+            })?;
+            for (store_key, stored) in &sealed {
+                table.insert(*store_key, stored.as_slice()).map_err(|e| {
+                    tracing::error!("Failed to insert key '{}': {}", store_key, e);
+                    HsmError::GeneralError
+                })?;
+            }
+        }
+        write_txn.commit().map_err(|e| {
+            tracing::error!("Failed to commit batch write transaction: {}", e);
+            HsmError::GeneralError
+        })?;
+
+        Ok(())
+    }
+
     /// Load and decrypt a blob.
     ///
     /// The returned buffer is wrapped in `Zeroizing` so that decrypted

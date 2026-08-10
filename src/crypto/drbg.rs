@@ -259,6 +259,25 @@ impl HmacDrbg {
 ///
 /// All code paths that need randomness MUST use `DrbgRng` instead of `OsRng`
 /// directly (except for DRBG seeding itself and self-tests).
+///
+/// # Why this is not buffered
+///
+/// [`HmacDrbg::generate`] reseeds from OS entropy on every call (prediction
+/// resistance), costing ~15 us largely independent of the requested size, so
+/// buffering a block of output and serving small requests from it looks like an
+/// obvious win. It was implemented and measured, and it is not:
+///
+/// * RSA-2048 key generation makes **423** RNG calls totalling 54 KB across a
+///   ~760 ms operation. Even at zero DRBG cost that bounds the saving at under
+///   1% — key generation is bound by Miller-Rabin bignum arithmetic, not by
+///   randomness.
+/// * EC P-256 key generation makes exactly **one** 32-byte call. A 512-byte
+///   refill buffer makes it generate 16x more output than it consumes, which
+///   measured as a ~10% *regression* on that path.
+///
+/// Buffering would also weaken the granularity at which prediction resistance
+/// is claimed, for no measured benefit. Do not reintroduce it without a
+/// profile showing a consumer that actually makes many small requests.
 pub struct DrbgRng {
     drbg: HmacDrbg,
 }

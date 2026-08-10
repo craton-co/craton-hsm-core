@@ -9,6 +9,21 @@ use crate::error::{HsmError, HsmResult};
 use crate::pkcs11_abi::constants::*;
 use crate::pkcs11_abi::types::CK_MECHANISM_TYPE;
 
+/// Whether this build permits RustCrypto RSA private-key operations.
+///
+/// The same condition as [`require_rustcrypto_rsa_private_ops`], exposed as a
+/// query so callers that must *branch* on the capability rather than fail on it
+/// do not have to construct and discard an error. The power-on self-test uses
+/// it to choose between the sign/verify roundtrip KAT and the verify-only KAT:
+/// an unconditional signing KAT fails the POST — and therefore
+/// `C_Initialize` — in any release build.
+pub(crate) const fn rsa_private_ops_permitted() -> bool {
+    cfg!(any(
+        debug_assertions,
+        feature = "insecure-rustcrypto-rsa-private-ops"
+    ))
+}
+
 /// RUSTSEC-2023-0071 (Marvin) affects RustCrypto RSA private-key operations.
 /// Release artifacts must use a hardened backend; debug/vector builds can opt
 /// in to these routines only for development coverage.
@@ -1486,6 +1501,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+        ignore = "RustCrypto RSA private-key operations are refused in release builds \
+                  (RUSTSEC-2023-0071); run in debug or with \
+                  --features insecure-rustcrypto-rsa-private-ops"
+    )]
     fn rsa_pkcs1v15_verify_cached_populates_pub_cache() {
         let (slot, handle) = unique_ids();
         let (priv_der, modulus, pub_exp) = fresh_rsa_keypair();
@@ -1533,6 +1554,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+        ignore = "RustCrypto RSA private-key operations are refused in release builds \
+                  (RUSTSEC-2023-0071); run in debug or with \
+                  --features insecure-rustcrypto-rsa-private-ops"
+    )]
     fn evict_cached_keys_removes_entries() {
         let (slot, handle) = unique_ids();
         let (der, _, _) = fresh_rsa_keypair();
@@ -1547,6 +1574,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+        ignore = "RustCrypto RSA private-key operations are refused in release builds \
+                  (RUSTSEC-2023-0071); run in debug or with \
+                  --features insecure-rustcrypto-rsa-private-ops"
+    )]
     fn rsa_oaep_decrypt_cached_uses_handle_cache() {
         let (slot, handle) = unique_ids();
         let (priv_der, modulus, pub_exp) = fresh_rsa_keypair();
@@ -1579,6 +1612,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+        ignore = "RustCrypto RSA private-key operations are refused in release builds \
+                  (RUSTSEC-2023-0071); run in debug or with \
+                  --features insecure-rustcrypto-rsa-private-ops"
+    )]
     fn rsa_pss_verify_cached_populates_pub_cache() {
         let (slot, handle) = unique_ids();
         let (priv_der, modulus, pub_exp) = fresh_rsa_keypair();
@@ -1599,6 +1638,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+        ignore = "RustCrypto RSA private-key operations are refused in release builds \
+                  (RUSTSEC-2023-0071); run in debug or with \
+                  --features insecure-rustcrypto-rsa-private-ops"
+    )]
     fn rsa_oaep_encrypt_cached_populates_pub_cache_and_round_trips() {
         let (slot, handle) = unique_ids();
         let (priv_der, modulus, pub_exp) = fresh_rsa_keypair();
@@ -1620,6 +1665,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+        ignore = "RustCrypto RSA private-key operations are refused in release builds \
+                  (RUSTSEC-2023-0071); run in debug or with \
+                  --features insecure-rustcrypto-rsa-private-ops"
+    )]
     fn evict_cached_keys_clears_public_entry() {
         let (slot, handle) = unique_ids();
         let (priv_der, modulus, pub_exp) = fresh_rsa_keypair();
@@ -1645,6 +1696,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+        ignore = "RustCrypto RSA private-key operations are refused in release builds \
+                  (RUSTSEC-2023-0071); run in debug or with \
+                  --features insecure-rustcrypto-rsa-private-ops"
+    )]
     fn clear_for_slot_drops_only_targeted_slot() {
         // Populate two distinct slots in both caches; make sure clearing one
         // leaves the other untouched.
@@ -1694,6 +1751,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+        ignore = "RustCrypto RSA private-key operations are refused in release builds \
+                  (RUSTSEC-2023-0071); run in debug or with \
+                  --features insecure-rustcrypto-rsa-private-ops"
+    )]
     fn clear_all_drops_every_entry() {
         // Seed both caches across two slots, then assert clear_all wipes them.
         let (slot_a, handle_a) = unique_ids();

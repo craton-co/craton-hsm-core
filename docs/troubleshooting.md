@@ -115,6 +115,41 @@ The Power-On Self-Test (POST) runs during `C_Initialize`. If any self-test fails
 
 **Fix**: Rebuild from source or re-download the binary. Verify with SHA-256 checksum.
 
+### RSA operations return `CKR_MECHANISM_INVALID`
+
+A **release** build of the default (RustCrypto) backend provides no RSA
+private-key capability. `C_Sign`, `C_Decrypt`, and `C_GenerateKeyPair` with
+`CKM_RSA_PKCS_KEY_PAIR_GEN` are refused with `CKR_MECHANISM_INVALID`, and the
+log records:
+
+```
+WARN RSA key-pair generation refused: this build provides no RSA private-key
+     capability (RUSTSEC-2023-0071). Rebuild with the aws-lc-rs backend to use RSA.
+```
+
+This is deliberate, not a fault. The `rsa` crate is subject to the Marvin timing
+attack (RUSTSEC-2023-0071), which is exploitable exactly where an HSM lives — a
+service performing private-key operations on behalf of remote callers. Release
+builds therefore fail closed.
+
+RSA **verification** and every other algorithm (EC, Ed25519, AES, SHA-2/3, PQC)
+are unaffected.
+
+To use RSA private-key operations, build with the hardened backend:
+
+```bash
+cargo build --release --no-default-features --features awslc-backend
+```
+
+Do not enable `insecure-rustcrypto-rsa-private-ops` in production; it exists so
+development builds and interoperability tests can exercise the RustCrypto code
+paths, and it reinstates the vulnerable implementation.
+
+Note that refusing the mechanism leaves the module fully operational. If an
+unavailable RSA mechanism ever puts the module into an error state — every
+subsequent call, including AES and EC, returning `CKR_FUNCTION_FAILED` — that is
+a bug; see `test_unavailable_rsa_keygen_does_not_enter_error_state`.
+
 ### Audit log permission denied
 
 ```

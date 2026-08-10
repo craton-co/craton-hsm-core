@@ -238,6 +238,54 @@ impl ObjectStore {
         }
     }
 
+    /// Persist several token objects under a single store transaction.
+    ///
+    /// Equivalent to calling [`ObjectStore::persist_object`] on each object,
+    /// but pays one `fsync` for the whole set instead of one per object. Used
+    /// by [`ObjectStore::insert_objects`].
+    ///
+    /// Non-token objects in `objs` are skipped, exactly as in the single-object
+    /// path. If no token objects remain, this is a no-op and never touches disk.
+    fn persist_objects(&self, objs: &[StoredObject]) {
+        let store = match &self.persist_store {
+            Some(s) => s,
+            None => return,
+        };
+
+        let guard = self.persist_key.lock();
+        let key = match guard.as_ref() {
+            Some(k) => k,
+            None => return, // No key, can't persist
+        };
+
+        let mut items: Vec<(String, zeroize::Zeroizing<Vec<u8>>)> = Vec::with_capacity(objs.len());
+        for obj in objs {
+            if !obj.token_object {
+                continue;
+            }
+            let store_key = {
+                let map = self.handle_to_store_key.lock();
+                map.get(&obj.handle).cloned()
+            }
+            .unwrap_or_else(|| self.generate_store_key(obj.handle));
+
+            match crate::store::object_codec::encode(obj) {
+                Ok(data) => items.push((store_key, data)),
+                Err(e) => {
+                    tracing::error!("Failed to serialize object {}: {}", obj.handle, e);
+                }
+            }
+        }
+
+        if items.is_empty() {
+            return;
+        }
+
+        if let Err(e) = store.store_encrypted_batch(&items, key) {
+            tracing::error!("Failed to persist {} object(s): {:?}", items.len(), e);
+        }
+    }
+
     /// Remove a persisted object from the encrypted store.
     fn unpersist_object(&self, handle: CK_OBJECT_HANDLE) {
         let store = match &self.persist_store {
@@ -302,6 +350,40 @@ impl ObjectStore {
 
         self.objects.insert(handle, Arc::new(RwLock::new(obj)));
         Ok(handle)
+    }
+
+    /// Insert several pre-built objects, persisting them together.
+    ///
+    /// This exists because the objects produced by one logical operation must
+    /// be persisted as a unit. `C_GenerateKeyPair` is the motivating case: the
+    /// public and private objects were previously written with two separate
+    /// store commits, so key-pair generation paid two `fsync`s, and a crash
+    /// between them could persist the public key without its private half.
+    /// Committing them together is both faster and more correct.
+    ///
+    /// Objects become visible in the in-memory map only after persistence has
+    /// been attempted, matching the ordering of [`ObjectStore::insert_object`].
+    ///
+    /// Returns the handles in the same order as `objs`, or `Err(DeviceMemory)`
+    /// if the store cannot accommodate the whole set.
+    pub fn insert_objects(&self, objs: Vec<StoredObject>) -> HsmResult<Vec<CK_OBJECT_HANDLE>> {
+        if objs.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Check capacity for the whole set up front so a multi-object insert
+        // cannot half-succeed against the cap.
+        if self.objects.len().saturating_add(objs.len()) > MAX_OBJECTS {
+            return Err(HsmError::DeviceMemory);
+        }
+
+        let handles: Vec<CK_OBJECT_HANDLE> = objs.iter().map(|o| o.handle).collect();
+
+        self.persist_objects(&objs);
+
+        for obj in objs {
+            self.objects.insert(obj.handle, Arc::new(RwLock::new(obj)));
+        }
+        Ok(handles)
     }
 
     /// Allocate a new handle

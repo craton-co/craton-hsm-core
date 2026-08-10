@@ -4,6 +4,99 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased] (Performance & Availability)
+
+### Fixed
+
+- **CRITICAL: release builds could not start.** `C_Initialize` returned
+  `CKR_FUNCTION_FAILED` on any default release build. The power-on self-test ran
+  an RSA PKCS#1 v1.5 known-answer test that *signs*, and release builds refuse
+  RustCrypto RSA private-key operations (RUSTSEC-2023-0071 / Marvin), so the POST
+  failed on every start. The KAT now branches on capability: the sign/verify
+  roundtrip where RSA private-key operations are available, and a verify-only KAT
+  against a checked-in fixed vector — with a negative case — where they are not.
+  FIPS 140-3 requires a KAT per approved function the module *provides*, and when
+  signing is refused it is not a provided service. (`crypto/self_test.rs`)
+- **CRITICAL: one RSA key-pair attempt disabled the whole module.** With RSA
+  private-key operations refused, `C_GenerateKeyPair` generated the key anyway
+  and then failed its pairwise consistency test, which latched the FIPS error
+  state — every subsequent call, including EC and AES, returned
+  `CKR_FUNCTION_FAILED` for the life of the process. Unavailable mechanisms are
+  now refused up front with `CKR_MECHANISM_INVALID` via
+  `CryptoBackend::supports_rsa_private_ops()`, leaving the module usable.
+  (`pkcs11_abi/functions.rs`, `crypto/backend.rs`, `crypto/rustcrypto_backend.rs`)
+- **Audit chain could desynchronise after a transient write error.** The worker
+  advanced its chain head before writing and did not roll it back on I/O failure,
+  so the in-memory and on-disk chains diverged permanently after a single failed
+  write. The chain head now advances only once the batch is durable.
+  (`audit/log.rs`)
+- **`C_GenerateKeyPair` persisted its two objects in separate transactions**, so
+  a crash between them could leave a public key stored without its private half.
+  Both now commit atomically. (`store/attributes.rs`, `pkcs11_abi/functions.rs`)
+- Both benchmark suites aborted instead of running when RSA was unavailable, and
+  the PKCS#11 ABI suite wrote its audit trail to the repository root — hundreds
+  of megabytes per run, and a 100 MB rotation mid-run skewed later groups. The
+  suites now skip RSA with an explanatory note and write to `target/`.
+- 62 RSA tests (9 unit, 53 integration) failed under `cargo test --release`.
+  They are now marked `ignore` under the same condition as the gate they depend
+  on, so a release-mode run is green and each skip says why. The list was taken
+  from an actual `--no-fail-fast` release run rather than guessed, so nothing is
+  over-ignored.
+
+### Performance
+
+- **Audit trail group commit.** The worker coalesces every event already queued
+  behind the one it is writing into a single `write` + `fsync`, and keeps the log
+  file open instead of reopening it per event. Sustained asynchronous throughput
+  improved ~200x (1319 → 6.58 us/event, i.e. 758 → 152,000 events/s) and
+  `record_sync` latency by 57% (1482 → 633 us). Durability is unchanged: a
+  `record_sync` caller is still released only after its event is on stable
+  storage. Since every PKCS#11 cryptographic call emits an audit event, this
+  removed a ~760 ops/s ceiling that sat below the entire module. (`audit/log.rs`)
+- **Canonical binary audit chain encoding.** The chain hash input moved from
+  `serde_json` to a fixed-width, length-prefixed, injective binary encoding
+  (`AUDIT_LOG_FORMAT_VERSION = 1`), cutting per-event CPU by 68% (3.76 → 1.22
+  us). The on-disk NDJSON line is unchanged — it is a SIEM interop contract — and
+  verification dispatches on each record's own `format_version`, so existing logs
+  and mixed-version files still verify. (`audit/log.rs`)
+- **Daemon no longer blocks the async reactor.** All 23 gRPC handlers wrap their
+  synchronous bodies in `tokio::task::block_in_place`. Previously a `Login`
+  (600,000 PBKDF2 iterations) or `GenerateKeyPair` occupied a Tokio worker
+  thread outright, so a few concurrent logins could stall unrelated connections
+  including health checks and TLS handshakes. (`craton-hsm-daemon/src/server.rs`)
+- **Batched object persistence.** `EncryptedStore::store_encrypted_batch` and
+  `ObjectStore::insert_objects` commit multiple objects in one redb transaction,
+  halving the `fsync` cost of key-pair generation.
+- One heap allocation and one virtual call removed from every DRBG reseed
+  (`HealthMonitoredRng`'s entropy source is now an inline enum).
+
+### Added
+
+- `docs/performance-tuning.md` — build flags, PGO, the profiling workflow,
+  deployment tuning, and the optimisations that were **rejected** for security
+  reasons, with the measurements behind each decision.
+- `scripts/profile.sh` (CPU / allocation / I/O / lock profiling) and
+  `scripts/pgo.sh` (three-stage profile-guided build).
+- `[profile.profiling]` — release codegen with symbols retained, so profilers
+  resolve Rust frames.
+- Benchmark coverage for previously unmeasured behaviour: `C_FindObjects`
+  (selective and broad), payload scaling from 256 B to 1 MB for AES-GCM and
+  SHA-256, concurrency across 1–8 sessions, and the audit trail itself.
+- A CI `bench` job that gates on benchmarks still compiling and running, and
+  reports Criterion deltas against the merge base without gating on them.
+
+### Notes
+
+- Measurements above are medians from an A/B harness that alternates the order of
+  the two binaries and cools between runs; see `docs/benchmarks.md` for why that
+  matters on this reference machine.
+- Two proposals were implemented, measured, and reverted because the data did not
+  support them: buffering the DRBG adapter (RSA keygen makes only 423 RNG calls,
+  under 1% of its time; EC keygen makes exactly one) and an attribute index for
+  `C_FindObjects` (it would leak object existence to unauthenticated callers by
+  timing). Both are documented in `docs/performance-tuning.md` so they are not
+  re-attempted.
+
 ## [0.9.3] - 2026-06-24 (Persistent Storage)
 
 ### Added

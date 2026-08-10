@@ -151,7 +151,7 @@ Added in Phase 10. When `fips_approved_only = true` in config:
 |-----|-----------|--------|
 | DRBG bypass in key generation | All key types (RSA, EC P-256/P-384, Ed25519) now use `DrbgRng` wrapper routing through HMAC_DRBG instead of `OsRng` directly | ✅ Resolved |
 | Circular AES-CBC/CTR KATs | Replaced with genuine known-answer tests using hardcoded expected ciphertexts | ✅ Resolved |
-| Missing RSA KAT | Added RSA-2048 PKCS#1 v1.5 sign/verify roundtrip to POST | ✅ Resolved |
+| Missing RSA KAT | Added RSA-2048 PKCS#1 v1.5 KAT to POST. Now capability-aware: sign/verify roundtrip where RSA private-key operations are available, verify-only against a fixed vector (positive + negative) where the RUSTSEC-2023-0071 gate refuses them, so a KAT covers every approved function the build actually provides | ✅ Resolved |
 | Global AES-GCM nonce counter | Changed to per-key counters via `DashMap<u64, AtomicU64>` keyed by SHA-256 hash of key material | ✅ Resolved |
 | POST_FAILED not resettable | `POST_FAILED` now reset before re-running POST on `C_Initialize` | ✅ Resolved |
 | All-zero IV accepted at init time | Added early IV validation in `C_EncryptInit` for CBC and CTR modes | ✅ Resolved |
