@@ -324,17 +324,37 @@ SHA-NI. Expect several times that on a current server.
 
 ### Concurrency
 
-`pkcs11_concurrent_sign` (ECDSA P-256, one session per thread) scales roughly
-3.5x from 1 to 4 threads on a 4-core host and falls back at 8, which is the
-expected shape for CPU-bound signing on 4 physical cores with SMT. No
-serialisation bottleneck is visible.
+`pkcs11_concurrent_encrypt` and `pkcs11_concurrent_sign` open one session per
+thread and run 1, 2, 4, and 8 of them. They exist to catch a *scalability*
+regression: every other group is single-threaded, so a new lock on a shared path
+is invisible to them. A flat or inverted curve from 1 to 4 threads means
+contention.
 
-Absolute numbers are not reported here because this reference machine — a
-thermally throttling 4-core laptop — cannot measure concurrency scaling with
-enough stability to be worth publishing; the confidence intervals span more than
-2x. Run these groups on a quiesced multi-core host. Their value is the *shape* of
-the curve: a flat or inverted line from 1 to 4 threads means a new shared lock,
-and that shows up regardless of absolute noise.
+Absolute numbers are not published from this reference machine — a thermally
+throttling 4-core laptop where the control measurement (see below) reaches ±170%
+on these groups. Run them on a quiesced multi-core host.
+
+#### A caution these benchmarks taught us
+
+An early comparison of the audit group-commit change measured these groups as
+part of a full-suite run and reported improvements of 58x and 23x. Re-measuring
+each group in its **own process**, against a control, collapsed the difference to
+1.0x within a very wide noise band. The first result was an artifact of position
+in the suite, not a property of concurrent operation.
+
+The cause is worth understanding, because it is a real effect measured wrongly.
+Before group commit the audit worker sustained roughly 760 events/second. A full
+benchmark run generates events far faster than that, so by the time the
+concurrency groups ran — near the end of the suite, after key generation and
+hundreds of thousands of crypto iterations — the worker was still draining a
+backlog accumulated by every group before it, and its disk I/O contended with
+whatever was being measured. Start a fresh process and there is no backlog to
+contend with, and a single group's short measurement window does not build one.
+
+So the throughput ceiling is real (see Phase 4), and a long-running deployment
+does hit it. But attributing it to whichever benchmark happened to run last is
+wrong, and a whole-suite A/B will do exactly that. Measure the audit path
+directly, or isolate the group.
 
 ---
 
@@ -358,7 +378,12 @@ For a comparison to mean anything:
 - alternate which binary runs first, and take medians across several pairs;
 - insert a cooldown between runs;
 - fix the CPU governor to `performance` and disable turbo where possible;
-- never compare a number from one session against a number from another.
+- never compare a number from one session against a number from another;
+- **measure a control**: run the *unchanged* build twice, as though it were two
+  different builds, and compare those. That is your noise floor. On this host it
+  is around ±20% for micro-benchmarks, which means a 15% "improvement" is not a
+  result. Every claim in this document either clears its control by a wide
+  margin or is labelled inconclusive.
 
 This machine also lacks the SHA-NI instruction set (Intel added it to
 mainstream Core parts only with Ice Lake), which makes every SHA-256-bound
