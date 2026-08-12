@@ -43,6 +43,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   from an actual `--no-fail-fast` release run rather than guessed, so nothing is
   over-ignored.
 
+### Changed
+
+- **Audit records are written at `format_version: 1`.** The on-disk NDJSON line
+  format is unchanged, so SIEM and log-shipping integrations are unaffected, and
+  the verifier dispatches on each record's own version so existing logs and
+  mixed-version files verify end to end.
+
+  **Downgrading is one-way**: an older build verifies every record as version 0,
+  so it will compute the wrong hash for a version 1 record and report the chain
+  as tampered. Rotate the audit log before downgrading. See
+  [migration-guide.md](docs/migration-guide.md).
+
+- **RSA private-key mechanisms are now refused up front** with
+  `CKR_MECHANISM_INVALID` in builds that do not provide them, instead of failing
+  partway and disabling the module. Applications that relied on RSA in a default
+  release build were already broken; they now get an actionable error. Build with
+  `--no-default-features --features awslc-backend` for RSA.
+
+- *(Rust API)* `AuditEvent` gained a public `format_version: u32` field. Struct
+  literal construction must add it; set it to `AUDIT_LOG_FORMAT_VERSION`. PKCS#11
+  ABI consumers are unaffected.
+
 ### Performance
 
 - **Audit trail group commit.** The worker coalesces every event already queued

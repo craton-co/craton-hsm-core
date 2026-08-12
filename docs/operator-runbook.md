@@ -177,13 +177,36 @@ Each entry contains:
 
 ### Integrity verification
 
-The audit log uses chained SHA-256 hashes. Each entry's `previous_hash` equals `SHA-256(previous_entry)`. A broken chain means the log has been tampered with.
+The audit log is a SHA-256 hash chain. Each entry's `previous_hash` is
 
-To verify integrity programmatically:
-1. Read all entries in order
-2. For each entry after the first, compute `SHA-256(entry[n-1])`
-3. Compare with `entry[n].previous_hash`
-4. Any mismatch indicates tampering
+```
+SHA-256( previous_hash_of_that_entry's_predecessor || encode(payload) )
+```
+
+where `payload` is the entry **excluding** its own `previous_hash` (so the link
+is not self-referential), and `encode` is chosen by the entry's own
+`format_version` field:
+
+| `format_version` | Payload encoding |
+|---|---|
+| `0` | `serde_json` of the payload — written by builds before the encoding change |
+| `1` | Compact fixed-width binary encoding — what this build writes |
+
+To verify integrity programmatically, use `craton_hsm::audit::log::verify_chain_entries`,
+which handles the version dispatch. Verifying by hand means reproducing the
+encoding for each entry's declared version; a mismatch anywhere indicates
+tampering.
+
+Mixed-version files are normal and verify end to end: upgrading in place appends
+`format_version: 1` entries to a file of `format_version: 0` entries, and the
+verifier dispatches per entry.
+
+> **Downgrading is a one-way door for the audit log.** A build that predates
+> format version 1 does not dispatch on `format_version` — it verifies every
+> entry as if it were version 0. Pointed at a log containing version 1 entries it
+> will compute the wrong hashes, report the chain as **tampered**, and refuse to
+> append. Rotate the audit log before downgrading, and archive the version 1 file
+> for offline verification with a build that understands it.
 
 ## Daemon Operations
 

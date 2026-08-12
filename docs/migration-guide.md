@@ -1,5 +1,39 @@
 # Migration Guide
 
+## Migrating to the current development version
+
+### Audit log format
+
+New audit entries are written with `format_version: 1`, a compact binary payload
+encoding for the hash chain. The on-disk NDJSON line format is unchanged, so SIEM
+and log-shipping integrations are unaffected.
+
+Existing logs keep verifying: the verifier dispatches on each entry's own
+`format_version`, and a file that mixes version 0 and version 1 entries — what an
+in-place upgrade produces — verifies end to end.
+
+**Downgrading does not work.** Older builds verify every entry as version 0, so
+they will read a version 1 entry, compute the wrong hash, and report the chain as
+tampered. Rotate the audit log before downgrading and archive the version 1 file.
+
+### RSA availability
+
+Release builds of the default RustCrypto backend now refuse RSA private-key
+operations with `CKR_MECHANISM_INVALID` rather than failing them mid-operation.
+Previously an RSA `C_GenerateKeyPair` in a release build put the module into its
+error state, disabling every algorithm. If your application uses RSA signing,
+decryption, or key generation, build with `--no-default-features --features
+awslc-backend`. See
+[troubleshooting.md](troubleshooting.md#rsa-operations-return-ckr_mechanism_invalid).
+
+### Library API (Rust consumers only)
+
+`AuditEvent` gained a public `format_version: u32` field. Code that constructs an
+`AuditEvent` with a struct literal must add it; set it to
+`AUDIT_LOG_FORMAT_VERSION` for new events. PKCS#11 ABI consumers are unaffected.
+
+---
+
 ## Migrating from 0.9.0 to 0.9.1
 
 v0.9.1 is a security hardening release. It is fully backward-compatible with v0.9.0 at the PKCS#11 ABI level. No application code changes are required.
