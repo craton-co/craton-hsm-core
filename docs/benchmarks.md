@@ -205,8 +205,10 @@ Craton HSM is not the fastest software HSM on every operation. SoftHSMv2's Botan
 
 ## Phase 4: Audit Trail Throughput
 
-The audit trail sits on the critical path of every PKCS#11 cryptographic call,
-so its throughput is an upper bound on the module's. Optimisation #6 above moved
+The audit trail sits on the critical path of most PKCS#11 operations —
+`C_Sign`, `C_Verify`, `C_Encrypt`, `C_Decrypt`, key generation, and the object
+and session calls each emit an event (`C_Digest` notably does not) — so its
+throughput bounds the rate of audited operations. Optimisation #6 above moved
 the work off the caller's thread, which fixed *latency* — but the worker itself
 still opened the log file, serialised one event, wrote it, and `fsync`-ed once
 per event. That capped the whole module at roughly **760 operations per second**
@@ -252,6 +254,36 @@ cryptographic operation in the module.
 These figures come from a dedicated A/B harness that ran a "before" and an
 "after" binary alternately against the same workload, which is the only way to
 compare two builds credibly on this machine.
+
+### The same effect through the PKCS#11 ABI
+
+The numbers above measure the audit API directly. The effect also reproduces
+end-to-end through the C ABI, but **only under a sustained window** — and seeing
+why is the whole point.
+
+`C_Encrypt` (AES-256-GCM, 4 KB) measured through an identical harness with only
+the library swapped, at two Criterion measurement windows:
+
+| Library | 2 s window | 30 s window | Degradation |
+|---------|-----------:|------------:|------------:|
+| before  | 11.80 us | 41.94 us | **3.55x** |
+| after   | 10.04 us | 16.89 us | **1.68x** |
+
+At 2 seconds the two are indistinguishable — the caller-side audit path was
+always asynchronous, so a short benchmark only measures the ~0.2 us enqueue. Over
+30 seconds the difference is 2.5x, because the old worker sustained ~760
+events/second while the workload issues them far faster, so its queue grows for
+the entire run and its per-event `fsync` contends with the caller. The new worker
+keeps up.
+
+Note that the current build still degrades 1.68x over the same window: batched
+`fsync`s are cheaper, not free, and the log file is growing throughout. This is a
+much smaller effect than the ceiling it replaced, not its elimination.
+
+Pick the operation carefully when reproducing this. `C_Digest` emits **no** audit
+event, so digest benchmarks show nothing at any window length — the first attempt
+at this measurement used `C_Digest` and produced a flat result that looked like a
+refutation.
 
 The `audit_record_in_memory`, `audit_record_to_disk`, and `audit_record_sync`
 groups in `crypto_bench` guard against regressions going forward. Their absolute

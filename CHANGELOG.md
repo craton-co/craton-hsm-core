@@ -73,8 +73,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   improved ~200x (1319 → 6.58 us/event, i.e. 758 → 152,000 events/s) and
   `record_sync` latency by 57% (1482 → 633 us). Durability is unchanged: a
   `record_sync` caller is still released only after its event is on stable
-  storage. Since every PKCS#11 cryptographic call emits an audit event, this
-  removed a ~760 ops/s ceiling that sat below the entire module. (`audit/log.rs`)
+  storage. Most PKCS#11 operations emit an audit event -- signing, verification,
+  encryption, decryption, key generation, object and session calls (`C_Digest`
+  does not) -- so this removed a ~760 events/s ceiling from under them.
+  (`audit/log.rs`)
 - **Canonical binary audit chain encoding.** The chain hash input moved from
   `serde_json` to a fixed-width, length-prefixed, injective binary encoding
   (`AUDIT_LOG_FORMAT_VERSION = 1`), cutting per-event CPU by 68% (3.76 → 1.22

@@ -26,9 +26,10 @@ all: it was found by trying to run the study's own benchmarks.
 
 **The dominant bottleneck was the audit trail's I/O pattern, not its
 serialisation format.** Before this work the audit worker opened the log file,
-serialised one event, wrote it, and `fsync`-ed — *per event*. Since every
-PKCS#11 cryptographic call emits an audit event, that capped the entire module
-at **~760 operations per second** regardless of how fast the cryptography was.
+serialised one event, wrote it, and `fsync`-ed — *per event*. Most PKCS#11
+operations emit an audit event (`C_Digest` is a notable exception), so that
+capped audited operations at **~760 per second** regardless of how fast the
+cryptography was.
 Serialisation was 3.8 µs of a ~1320 µs cost: 0.3%. The study's proposal #2
 (swap JSON for CBOR/bincode) therefore targeted a rounding error, while the
 `fsync` pattern it did not mention was the ceiling.
@@ -120,7 +121,7 @@ that sat below every cryptographic operation in the module.
 | — | Library startup (found while trying to run the suites) | The POST's RSA KAT now branches on capability: the sign/verify roundtrip when RSA private-key operations are available, and a verify-only KAT against a checked-in fixed vector (with a negative case) when they are not. FIPS 140-3 requires a KAT per approved function the module *provides*; when signing is refused it is not a provided service, while verification still is. `C_Initialize` succeeds again on a default release build. |
 | — | Unavailable mechanism handling | `C_GenerateKeyPair` now consults `CryptoBackend::supports_rsa_private_ops()` and returns `CKR_MECHANISM_INVALID` *before* generating anything, instead of generating a key and letting the pairwise consistency test latch the module error state. Pinned by `test_unavailable_rsa_keygen_does_not_enter_error_state`, which asserts that AES key generation still works after an RSA attempt. |
 | — | Benchmark suites made runnable | Both suites detect the missing RSA capability, print how to enable it, and run every other group instead of aborting. `docs/benchmarks.md` now documents the `CRATON_HSM_INTEGRITY_BYPASS` requirement for the ABI suite. |
-| — | Benchmark hygiene | The ABI suite pointed the library at its default config, so every benchmarked operation appended to `craton_hsm_audit.jsonl` in the repository root — hundreds of megabytes per run, with a 100 MB rotation landing mid-run and skewing later groups. It now writes a scratch config under `target/bench-tokens/`. Audit logging stays enabled: it is part of the cost of every PKCS#11 call, and disabling it would flatter the numbers. |
+| — | Benchmark hygiene | The ABI suite pointed the library at its default config, so every benchmarked operation appended to `craton_hsm_audit.jsonl` in the repository root — hundreds of megabytes per run, with a 100 MB rotation landing mid-run and skewing later groups. It now writes a scratch config under `target/bench-tokens/`. Audit logging stays enabled: it is part of the cost of most PKCS#11 operations, and disabling it would flatter the numbers. |
 | — | Release-mode test run | 62 RSA tests (9 unit, 53 integration) failed under `cargo test --release`, which is what you run alongside the benchmarks; CI only exercises debug, where the gate is open, so nobody saw them. They are now marked `ignore` under the same cfg as the gate they depend on, with a message saying how to enable them. The list came from an actual `--no-fail-fast` release run, not from guesswork, so no test is ignored that could have run. |
 | — | CI regression testing | A `bench` job that gates on benchmarks still compiling and running, and reports Criterion deltas against the merge base without gating on them (shared runners are too noisy to gate). |
 
