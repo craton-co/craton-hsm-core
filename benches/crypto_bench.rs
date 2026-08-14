@@ -598,10 +598,12 @@ fn bench_backend_keygen_ec_p256(c: &mut Criterion) {
 // ============================================================================
 // Audit trail
 //
-// The audit trail is on the critical path of every PKCS#11 cryptographic call,
-// so its throughput is an upper bound on the module's. These benchmarks exist
-// because that bound was once ~760 operations/second — the worker opened,
-// wrote, and fsynced the log file once per event — and nothing measured it.
+// The audit trail is on the critical path of most PKCS#11 operations: signing,
+// verification, encryption, decryption, key generation, and the object and
+// session calls each emit an event. (`C_Digest` does not.) Its throughput
+// therefore bounds the rate of audited operations. These benchmarks exist
+// because that bound was once ~760 events/second -- the worker opened, wrote,
+// and fsynced the log file once per event -- and nothing measured it.
 // ============================================================================
 
 use craton_hsm::audit::log::{AuditLog, AuditOperation, AuditResult};
