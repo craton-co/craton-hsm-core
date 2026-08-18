@@ -82,6 +82,17 @@ fn configure_bench_environment() {
         );
         std::fs::write(&conf_path, conf).expect("Failed to write benchmark configuration");
 
+        // The config loader refuses a group- or world-writable config file, so
+        // the default 0644 from `fs::write` makes every benchmark abort at
+        // C_Initialize on Unix. Windows has no equivalent check, which is why
+        // this only shows up on Linux — including CI.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&conf_path, std::fs::Permissions::from_mode(0o600))
+                .expect("Failed to restrict benchmark configuration permissions");
+        }
+
         // Start each run from a clean audit trail so file growth from a previous
         // run does not carry into this one.
         for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
