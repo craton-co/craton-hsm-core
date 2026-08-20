@@ -2,7 +2,19 @@
 
 Craton HSM includes two benchmark suites that measure cryptographic performance at different abstraction levels. This document covers methodology, baseline results, the nine optimizations applied, before/after comparisons, and a three-way head-to-head against SoftHSMv2.
 
-All measurements on Windows 11, x86_64, single-threaded, `--release` with LTO and `target-cpu=native`. Median values reported via Criterion.rs (100 samples; 10 for RSA keygen).
+Two reference hosts are used, and the difference between them matters for
+anything I/O- or SHA-256-bound:
+
+| Ref | Host | Notes |
+|-----|------|-------|
+| **L** | Windows 11, Intel i7-8550U (4c/8t, mobile) | **No SHA-NI**; SATA-class storage; thermally throttling |
+| **S** | Ubuntu 24.04, AMD EPYC 9V45 (8 vCPU) | SHA-NI, AVX2; NVMe; shared host |
+
+Unless stated otherwise, figures are from **L** and are single-threaded,
+`--release` with LTO and `target-cpu=native`, medians via Criterion.rs (100
+samples; 10 for RSA keygen). SHA-256 through the ABI costs 28-56 us on L and
+2.4 us on S for the same 4 KB input -- roughly 15x, almost entirely SHA-NI. Do
+not compare absolute numbers across hosts.
 
 ## Benchmark Suites
 
@@ -257,40 +269,59 @@ compare two builds credibly on this machine.
 
 ### The same effect through the PKCS#11 ABI
 
-The numbers above measure the audit API directly. The effect also reproduces
-end-to-end through the C ABI, but **only under a sustained window** — and seeing
-why is the whole point.
+The figures above measure the audit API directly. Reproducing the effect through
+the C ABI needs care, because **Criterion's reported per-iteration time does not
+show it at all**.
 
-`C_Encrypt` (AES-256-GCM, 4 KB) measured through an identical harness with only
-the library swapped, at two Criterion measurement windows:
+`record()` only enqueues; the worker owes the write. A benchmark that issues N
+audited operations and stops has not paid for them yet — the queue drains when
+the module is finalised, outside the measured region. So Criterion reports the
+same ~4 us per `C_Encrypt` for both builds while one of them still owes several
+seconds of `fsync`.
 
-| Library | 2 s window | 30 s window | Degradation |
-|---------|-----------:|------------:|------------:|
-| before  | 11.80 us | 41.94 us | **3.55x** |
-| after   | 10.04 us | 16.89 us | **1.68x** |
+Measure the **whole process** instead. It ends when the audit worker has drained,
+so it accounts for the work actually generated:
 
-At 2 seconds the two are indistinguishable — the caller-side audit path was
-always asynchronous, so a short benchmark only measures the ~0.2 us enqueue. Over
-30 seconds the difference is 2.5x, because the old worker sustained ~760
-events/second while the workload issues them far faster, so its queue grows for
-the entire run and its per-event `fsync` contends with the caller. The new worker
-keeps up.
+AES-256-GCM 4 KB, `--measurement-time 5`, total wall clock, median of 5, one
+harness with only the library swapped:
 
-Note that the current build still degrades 1.68x over the same window: batched
-`fsync`s are cheaper, not free, and the log file is growing throughout. This is a
-much smaller effect than the ceiling it replaced, not its elimination.
+| Arm | Wall clock | |
+|-----|-----------:|--|
+| before (A) | 16.11 s | |
+| before (B) | 16.57 s | control, +2.9% |
+| after | 11.08 s | **1.45x faster** (−31%) |
 
-Pick the operation carefully when reproducing this. `C_Digest` emits **no** audit
-event, so digest benchmarks show nothing at any window length — the first attempt
-at this measurement used `C_Digest` and produced a flat result that looked like a
-refutation.
+The control — the same build measured as though it were two — is +2.9%, so a 31%
+difference is comfortably real.
 
-The `audit_record_in_memory`, `audit_record_to_disk`, and `audit_record_sync`
-groups in `crypto_bench` guard against regressions going forward. Their absolute
-values are **not** comparable to the table above: each iteration uses a fresh log
-file for reproducibility, and `fsync` on a file that is still being extended
-costs considerably more than on the long-lived file a deployment actually has.
-Compare them against previous runs of the same benchmark, not against the table.
+#### This is strongly host-dependent
+
+The size of the effect tracks `fsync` latency, so it varies enormously with
+storage:
+
+| Host | Audit events/s sustained (before) |
+|------|---------------------------------:|
+| Laptop, SATA-class storage, no SHA-NI | ~760 |
+| Server, NVMe, SHA-NI | ~13,700 |
+
+On the laptop the worker fell so far behind that even a 30-second Criterion
+window showed it (per-iteration time degraded 3.55x, versus 1.68x after). On the
+NVMe server the worker keeps up well enough that the same window shows nothing —
+1.04x versus 1.00x, inside the ±3% control. The cost has not disappeared; it has
+moved into teardown, where the wall-clock method above finds it.
+
+Use the wall-clock method. The window comparison only works on slow storage and
+will read as a null result on a fast host.
+
+#### Two ways to measure this wrongly
+
+Both were hit while producing the numbers above, and both look like clean
+refutations:
+
+* **Benchmark an operation that is not audited.** `C_Digest` emits no audit
+  event, so digest benchmarks are flat at every window length and every host.
+* **Trust Criterion's per-iteration time.** It excludes the queued audit work,
+  which on this workload is most of the cost.
 
 ---
 
