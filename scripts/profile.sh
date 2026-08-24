@@ -19,6 +19,12 @@
 # e.g. `./scripts/profile.sh cpu pkcs11_rsa_sign`.
 #
 # Outputs land in target/profiles/.
+#
+# Env:
+#   CRATON_PROFILE_SECS   seconds to iterate under the profiler (default 10)
+#
+# `perf` modes need kernel.perf_event_paranoid <= 1:
+#   sudo sysctl -w kernel.perf_event_paranoid=1
 
 set -euo pipefail
 
@@ -29,6 +35,14 @@ MODE="${1:-cpu}"
 FILTER="${2:-}"
 OUT_DIR="target/profiles"
 mkdir -p "$OUT_DIR"
+
+# Seconds to spend iterating the benchmark under the profiler.
+#
+# Criterion's `--profile-time` runs the benchmark loop for this long and skips
+# the statistical analysis entirely. That matters: without it, `perf record`
+# also samples Criterion's own post-processing -- KDE estimation parallelised
+# across rayon -- which dominates the profile and buries the code under test.
+PROFILE_SECS="${CRATON_PROFILE_SECS:-10}"
 
 # Release codegen + frame pointers. `target-cpu=native` matches how the
 # benchmarks in docs/benchmarks.md are built; drop it if you need a profile
@@ -82,7 +96,7 @@ cpu)
     # sampler does not lock onto a periodic workload.
     # -g:    capture call graphs (frame-pointer based, see RUSTFLAGS above).
     perf record -F 99 -g --call-graph fp -o "$OUT_DIR/perf.data" -- \
-        "$BIN" --bench ${FILTER:+"$FILTER"}
+        "$BIN" --bench --profile-time "$PROFILE_SECS" ${FILTER:+"$FILTER"}
     perf script -i "$OUT_DIR/perf.data" >"$OUT_DIR/perf.script"
 
     if command -v flamegraph.pl &>/dev/null && command -v stackcollapse-perf.pl &>/dev/null; then
@@ -95,8 +109,14 @@ cpu)
         echo "      git clone https://github.com/brendangregg/FlameGraph"
         echo "      export PATH=\"\$PWD/FlameGraph:\$PATH\""
     fi
-    echo "==> Top symbols:"
-    perf report -i "$OUT_DIR/perf.data" --stdio --sort symbol 2>/dev/null | head -40 || true
+    echo "==> Top symbols (self time):"
+    # --no-children gives self time rather than cumulative, which is what you
+    # want for finding the hot leaf; the default inverts the useful ordering
+    # here. Symbol names are truncated because monomorphised Rust generics run
+    # to hundreds of characters and wrap unreadably.
+    perf report -i "$OUT_DIR/perf.data" --stdio --no-children \
+        --sort symbol --percent-limit 0.5 2>/dev/null |
+        grep -E '^\s+[0-9]' | cut -c1-160 | head -30 || true
     ;;
 
 # ── Allocation profiling ─────────────────────────────────────────────────────
@@ -108,7 +128,7 @@ alloc)
     # Criterion's default sample count is far too slow under valgrind; cut it
     # down so the run finishes while still exercising every allocation site.
     valgrind --tool=dhat --dhat-out-file="$OUT_DIR/dhat.out" -- \
-        "$BIN" --bench --sample-size 10 --measurement-time 1 ${FILTER:+"$FILTER"}
+        "$BIN" --bench --profile-time 2 ${FILTER:+"$FILTER"}
     echo "==> DHAT output: $OUT_DIR/dhat.out"
     echo "    View it at https://nnethercote.github.io/dh_view/dh_view.html"
     ;;
@@ -122,12 +142,12 @@ io)
     # -c summarises syscall counts and time; the audit trail and the redb
     # object store are both fsync-bound, so watch fsync/fdatasync/openat here.
     strace -c -f -o "$OUT_DIR/strace.summary" -- \
-        "$BIN" --bench --sample-size 10 --measurement-time 1 ${FILTER:+"$FILTER"} || true
+        "$BIN" --bench --profile-time 2 ${FILTER:+"$FILTER"} || true
     cat "$OUT_DIR/strace.summary"
     echo
     echo "==> Per-call fsync trace: $OUT_DIR/strace.fsync"
     strace -f -e trace=fsync,fdatasync,openat,write -T -o "$OUT_DIR/strace.fsync" -- \
-        "$BIN" --bench --sample-size 10 --measurement-time 1 ${FILTER:+"$FILTER"} || true
+        "$BIN" --bench --profile-time 2 ${FILTER:+"$FILTER"} || true
     ;;
 
 # ── Lock contention ──────────────────────────────────────────────────────────
@@ -139,9 +159,9 @@ lock)
     echo "    Note: parking_lot and DashMap park via futex, so 'perf lock' needs"
     echo "    CONFIG_LOCKDEP; if it reports nothing, use the futex tracepoints below."
     perf lock record -o "$OUT_DIR/perf-lock.data" -- \
-        "$BIN" --bench ${FILTER:+"$FILTER"} 2>/dev/null ||
+        "$BIN" --bench --profile-time "$PROFILE_SECS" ${FILTER:+"$FILTER"} 2>/dev/null ||
         perf record -e 'syscalls:sys_enter_futex' -g -o "$OUT_DIR/perf-lock.data" -- \
-            "$BIN" --bench ${FILTER:+"$FILTER"}
+            "$BIN" --bench --profile-time "$PROFILE_SECS" ${FILTER:+"$FILTER"}
     perf lock report -i "$OUT_DIR/perf-lock.data" 2>/dev/null |
         head -40 || perf report -i "$OUT_DIR/perf-lock.data" --stdio | head -40
     ;;
