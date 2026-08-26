@@ -67,8 +67,28 @@ need() {
 }
 
 build_bench() {
-    echo "==> Building benches with --profile profiling"
+    echo "==> Building benches and library with --profile profiling"
     cargo build --profile profiling --benches
+    # Build the cdylib under the same profile and point the ABI benchmark at it.
+    #
+    # Without this the harness auto-detects target/release/, where the release
+    # profile's `strip = "symbols"` has removed every symbol -- so the library
+    # actually under test shows up in the profile as bare hex addresses while
+    # only the harness resolves. That makes the CPU mode close to useless for
+    # the ABI suite.
+    cargo build --profile profiling
+    case "$(uname -s)" in
+    Darwin) libname="libcraton_hsm.dylib" ;;
+    MINGW* | MSYS* | CYGWIN*) libname="craton_hsm.dll" ;;
+    *) libname="libcraton_hsm.so" ;;
+    esac
+    if [[ -f "target/profiling/$libname" ]]; then
+        export CRATON_HSM_LIB="$REPO_ROOT/target/profiling/$libname"
+        echo "==> Profiling library: $CRATON_HSM_LIB (symbols retained)"
+    else
+        echo "Warning: target/profiling/$libname not found; the harness will load" >&2
+        echo "         the stripped release library and HSM frames will not resolve." >&2
+    fi
 }
 
 # Locate the most recently built binary for a bench target.
