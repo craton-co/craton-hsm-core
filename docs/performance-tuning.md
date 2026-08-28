@@ -116,6 +116,40 @@ The script requires Linux tooling (`perf`, `valgrind`, `strace`). On macOS use
 `cargo instruments`; on Windows use Windows Performance Recorder or VTune
 against the same `--profile profiling` binary.
 
+### A worked example
+
+`C_Encrypt` with AES-256-GCM over 4 KB, profiled on host **S** (see
+`benchmarks.md`) with `./scripts/profile.sh cpu pkcs11_aes_gcm_encrypt_4kb`:
+
+| Self time | Symbol |
+|----------:|--------|
+| 32.0% | `polyval …proc_block` — GHASH, the GCM authenticator |
+| 27.4% | `__memmove_avx512_unaligned_erms` — buffer copying |
+| 8.3% | AES-CTR keystream |
+| 3.7% | `sha2::sha256::compress256` — mostly the audit chain |
+| 2.8% | `serde_json::to_writer::<AuditEvent>` — the on-disk NDJSON line |
+| 1.5% | GHASH padding |
+| ~2% | `C_Encrypt` + `C_EncryptInit` themselves |
+
+Two things are worth drawing out.
+
+**The cryptography is where it should be.** GHASH plus the CTR keystream is ~42%,
+and the ABI entry points themselves are ~2%. There is no hidden overhead in the
+session or object layers on this path.
+
+**Buffer copying is 27%.** That is the single largest non-cryptographic cost, and
+it is a genuine open question rather than a known-good result. PKCS#11 requires
+copying between caller-provided buffers and internal ones, so some of it is
+unavoidable, but 27% is worth an investigation into how many intermediate `Vec`s
+a single `C_Encrypt` actually allocates and copies through. The original
+optimisation study guessed that "RSA signing or buffer copies" might dominate;
+for bulk symmetric operations the copies are the larger half of that guess, and
+nothing has yet been done about them.
+
+**The audit trail costs ~6% here** (JSON line plus its share of SHA-256), on a
+host with SHA-NI and NVMe. On a host without SHA-NI that share is several times
+larger — see the reference-host table in `benchmarks.md`.
+
 ### Making measurements reproducible
 
 Small operations here are microseconds, so measurement noise easily exceeds the
