@@ -87,6 +87,34 @@ PGO profiles go stale as the code changes. Regenerate whenever hot paths move,
 always re-benchmark to confirm the gain is real, and never ship a binary built
 from a profile you cannot reproduce.
 
+#### Measured: PGO does not currently help
+
+The optimisation study estimated "up to 10–20%" from PGO. It was run end to end
+on host **S** and measured against a matched non-PGO build (same
+`target-cpu=native`, same features, only `-C profile-use` differing), with a
+control:
+
+| Benchmark | PGO vs baseline | Control |
+|-----------|----------------:|--------:|
+| `aes_gcm_encrypt_4kb` | +5.4% | +7.7% |
+| `sha256_digest_4kb` | −1.6% | −1.1% |
+| `ecdsa_p256_verify` | −1.9% | +8.1% |
+| `find_objects_selective` | +0.7% | +3.1% |
+
+Every difference is inside its own control: **no measurable effect**.
+
+That is a reasonable outcome rather than a surprise. PGO earns its keep on
+branchy control-heavy code, by improving block layout and inlining decisions.
+The hot paths here are cryptographic inner loops — GHASH, the AES keystream,
+SHA-256 compression, bignum arithmetic — which are straight-line, have highly
+predictable branches, and are limited by arithmetic and data movement. There is
+little for a profile to inform.
+
+The tooling is kept because it is correct and cheap to re-run: if the hot path
+ever shifts toward the session, object, or ABI marshalling layers, PGO becomes
+worth retrying. Do not enable it in a release pipeline on the strength of the
+estimate alone.
+
 ---
 
 ## 2. Profiling

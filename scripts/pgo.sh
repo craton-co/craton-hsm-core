@@ -110,10 +110,13 @@ echo "    collected $RAW_COUNT profile file(s)"
 echo "==> Stage 3/3: merging profiles and rebuilding"
 "$LLVM_PROFDATA" merge -o "$MERGED" "$PROFILE_DIR"
 
-# `-C llvm-args=-pgo-warn-missing-function` surfaces functions that changed
-# enough since stage 1 that their profile no longer applies — a signal that the
-# profile is stale and should be regenerated.
-RUSTFLAGS="$BASE_FLAGS -C profile-use=$MERGED -C llvm-args=-pgo-warn-missing-function" \
+# Note: `-C llvm-args=-pgo-warn-missing-function` was tried here as a
+# staleness detector and removed. It warns for every function with no profile
+# data, which includes everything the training workload simply never called --
+# 1729 warnings on this crate, covering SHA-2 wrappers, AES key init, serde
+# derives and so on. It cannot distinguish "your profile is stale" from "this
+# code is not in your workload", so it is noise rather than signal.
+RUSTFLAGS="$BASE_FLAGS -C profile-use=$MERGED" \
     cargo build --release
 
 echo
