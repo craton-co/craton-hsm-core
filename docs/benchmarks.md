@@ -129,7 +129,7 @@ Both backends benchmarked with `target-cpu=native`. The aws-lc-rs backend uses a
 | ECDSA P-256 Sign | 331.6 us | 291.8 us | **1.1x** |
 | ECDSA P-256 Verify | 298.3 us | 66.44 us | **4.5x** |
 | AES-GCM Decrypt 4KB | 3.590 us | 2.015 us | **1.8x** |
-| SHA-256 4KB | 16.63 us | 11.52 us | **1.4x** |
+| SHA-256 4KB | 16.63 us | 11.52 us | **1.4x** (host L only — inverts on a SHA-NI CPU, see below) |
 | SHA-512 4KB | 10.14 us | 8.362 us | **1.2x** |
 | RSA-2048 Keygen | 214.7 ms | 91.42 ms | **2.3x** |
 | EC P-256 Keygen | 184.4 us | 157.3 us | **1.2x** |
@@ -322,6 +322,55 @@ refutations:
   event, so digest benchmarks are flat at every window length and every host.
 * **Trust Criterion's per-iteration time.** It excludes the queued audit work,
   which on this workload is most of the cost.
+
+---
+
+## Backend Comparison on Host S (RustCrypto vs AWS-LC FIPS)
+
+Measured through the PKCS#11 ABI on host **S** (AMD EPYC, SHA-NI, NVMe), one
+harness with only the library swapped. RustCrypto is built with
+`insecure-rustcrypto-rsa-private-ops` so that its RSA paths can run at all;
+AWS-LC is `--no-default-features --features awslc-backend`.
+
+| Operation | RustCrypto | AWS-LC | |
+|-----------|-----------:|-------:|--|
+| RSA-2048 sign | 1.453 ms | 610 us | **2.4x** |
+| RSA-2048 verify | 160.1 us | 19.5 us | **8.2x** |
+| RSA-2048 keygen | 121.8 ms | 78.6 ms | **1.5x** |
+| ECDSA P-256 sign | 294.7 us | 178.8 us | **1.6x** |
+| ECDSA P-256 verify | 231.3 us | 73.4 us | **3.2x** |
+| EC P-256 keygen | 680.9 us | 418.6 us | **1.6x** |
+| AES-GCM decrypt 4 KB | 3.643 us | 1.454 us | **2.5x** |
+| SHA-256 4 KB | **2.331 us** | 2.717 us | RustCrypto 1.17x |
+
+AWS-LC wins everything asymmetric, and RSA verify by 8.2x — closely matching the
+8.3x recorded on host L.
+
+**SHA-256 is the exception, and it inverts on this host.** The Phase 2 table
+(measured on host L) shows AWS-LC 1.4x faster at SHA-256. On host S, RustCrypto
+is 1.17x *faster*. The reason is SHA-NI: the `sha2` crate dispatches to the
+hardware instruction at runtime, and on a CPU that has it there is nothing left
+for hand-written assembly to win. Host L has no SHA-NI, so the comparison there
+measured two software implementations.
+
+Choose the backend for the asymmetric and AES numbers, not the digest one, and
+be aware that any SHA-256 comparison you read is really a statement about the
+CPU it was measured on.
+
+### AWS-LC and RSA availability
+
+The AWS-LC backend is also the answer to the RSA restriction described in
+[troubleshooting.md](troubleshooting.md#rsa-operations-return-ckr_mechanism_invalid):
+`CryptoBackend::supports_rsa_private_ops()` reports `true` for it, so
+`C_GenerateKeyPair`, `C_Sign`, and `C_Decrypt` all work with RSA, as the table
+above shows.
+
+Note that before the power-on self-test was made capability-aware, an AWS-LC
+release build failed `C_Initialize` for the same reason the RustCrypto one did —
+the POST's RSA known-answer test called the RustCrypto signing path regardless of
+the configured backend. The POST still exercises RustCrypto rather than the
+selected backend; that is pre-existing and worth revisiting, since it means the
+KATs do not cover the primitives an AWS-LC deployment actually uses.
 
 ---
 
