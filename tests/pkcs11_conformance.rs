@@ -844,10 +844,15 @@ fn test_sign_without_init() {
 
 #[test]
 #[cfg_attr(
-    not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
-    ignore = "needs RustCrypto RSA private-key operations, which release builds \
-              refuse (RUSTSEC-2023-0071); run in debug or with \
-              --features insecure-rustcrypto-rsa-private-ops"
+    not(any(
+        debug_assertions,
+        feature = "insecure-rustcrypto-rsa-private-ops",
+        all(feature = "awslc-backend", not(feature = "rustcrypto-backend"))
+    )),
+    ignore = "needs a backend providing RSA private-key operations; release \
+              builds of the RustCrypto backend refuse them (RUSTSEC-2023-0071). \
+              Run in debug, with --features insecure-rustcrypto-rsa-private-ops, \
+              or with --no-default-features --features awslc-backend"
 )]
 fn test_rsa_keygen_sign_verify_via_abi() {
     let session = setup_user_session();
