@@ -218,6 +218,40 @@ impl CryptoBackend for AwsLcBackend {
     //   - FIPS-strict deployments should prefer single-part operations or
     //     document this limitation in their security policy.
 
+    // ========================================================================
+    // KNOWN GAP: the four `*_prehashed` RSA methods below are NOT AWS-LC.
+    //
+    // They are implemented with the RustCrypto `rsa` crate, so on this
+    // "FIPS-validated backend" the multi-part RSA paths -- C_SignUpdate /
+    // C_SignFinal and C_VerifyUpdate / C_VerifyFinal -- do not run through
+    // AWS-LC at all. Three consequences, in descending severity:
+    //
+    // 1. FIPS scope. A deployment selecting this backend is not using the
+    //    validated module for prehashed RSA. Any security policy claiming
+    //    AWS-LC covers RSA is inaccurate for the multi-part paths.
+    //
+    // 2. RUSTSEC-2023-0071 (Marvin). The two *signing* methods call
+    //    `require_rustcrypto_rsa_private_ops()`, so in release they fail
+    //    closed -- which is why multi-part RSA signing returns
+    //    CKR_MECHANISM_INVALID under this backend rather than producing a
+    //    signature. The two *verify* methods are ungated and silently use
+    //    RustCrypto; that is a public-key operation, so not a Marvin
+    //    exposure, but it is still not the validated implementation.
+    //
+    // 3. `rsa_pss_sign_prehashed` draws its PSS salt from `OsRng` directly,
+    //    bypassing the SP 800-90A HMAC_DRBG. The crate's own rule is that all
+    //    randomness routes through `DrbgRng` (see `crypto/drbg.rs`); a direct
+    //    `OsRng` in key generation was treated as a CRITICAL finding in
+    //    v0.9.1. This one is still here.
+    //
+    // Fixing this means implementing prehashed RSA on aws-lc-rs properly, and
+    // routing the PSS salt through the DRBG. It is deliberately not bundled
+    // into the change that found it. `test_multipart_sign_verify` fails
+    // against this backend and is left failing on purpose: it is reporting a
+    // real defect, not a test problem. Do not silence it by widening a cfg
+    // gate.
+    // ========================================================================
+
     fn rsa_pkcs1v15_sign_prehashed(
         &self,
         private_key_der: &[u8],

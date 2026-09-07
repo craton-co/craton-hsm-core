@@ -1,5 +1,25 @@
 # FIPS 140-3 Mode Operator Guide
 
+> ## Known gap: multi-part RSA does not use AWS-LC
+>
+> The `AwsLcBackend`'s four `*_prehashed` RSA methods are implemented with the
+> RustCrypto `rsa` crate, not AWS-LC. These back the multi-part PKCS#11 paths:
+> `C_SignUpdate`/`C_SignFinal` and `C_VerifyUpdate`/`C_VerifyFinal`.
+>
+> * **Multi-part RSA signing does not work** on a release build of this backend.
+>   It returns `CKR_MECHANISM_INVALID`, because the RustCrypto private-key gate
+>   (RUSTSEC-2023-0071) refuses it. Single-shot `C_Sign` is unaffected and does
+>   use AWS-LC.
+> * **Multi-part RSA verification silently uses RustCrypto.** It works, but it is
+>   not the validated implementation.
+> * **PSS salt generation in this path uses `OsRng` directly**, bypassing the
+>   SP 800-90A DRBG that the rest of the module routes through.
+>
+> Do not represent prehashed/multi-part RSA as covered by the AWS-LC validation
+> until this is fixed. See the comment block above
+> `rsa_pkcs1v15_sign_prehashed` in `src/crypto/awslc_backend.rs`.
+
+
 ## Overview
 
 Craton HSM supports a FIPS-approved mode of operation when configured correctly. This guide covers the required build, configuration, and deployment steps for FIPS compliance.
