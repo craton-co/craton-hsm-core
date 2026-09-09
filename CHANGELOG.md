@@ -43,6 +43,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   from an actual `--no-fail-fast` release run rather than guessed, so nothing is
   over-ignored.
 
+- **Multi-part RSA now works on the AWS-LC backend, and no longer routes through
+  RustCrypto.** `AwsLcBackend`'s prehashed RSA signing used the RustCrypto `rsa`
+  crate, so `C_SignUpdate`/`C_SignFinal` with an RSA key returned
+  `CKR_MECHANISM_INVALID` in release builds (refused by the RUSTSEC-2023-0071
+  gate) and was silently Marvin-exposed in debug ones. PSS additionally drew its
+  salt from `OsRng`, bypassing the SP 800-90A DRBG.
+
+  Both signing paths now use `aws_lc_rs::rsa::KeyPair::sign_digest`, so they are
+  constant-time and the salt is generated inside AWS-LC — the DRBG bypass is
+  removed rather than relocated. Salt length is unchanged (digest length), so
+  existing signatures and third-party verifiers are unaffected.
+
+  Two caveats, documented in [fips-mode-guide.md](docs/fips-mode-guide.md):
+  `sign_digest` is outside aws-lc-rs's FIPS-approved service set, so a
+  validation scope covering every RSA signature should use single-shot `C_Sign`;
+  and multi-part RSA *verification* still uses RustCrypto, because aws-lc-rs has
+  no prehashed verification API. That is a public-key operation over non-secret
+  inputs, so it is a scope matter rather than a security one.
+
 ### Changed
 
 - **Audit records are written at `format_version: 1`.** The on-disk NDJSON line

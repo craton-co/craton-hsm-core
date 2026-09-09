@@ -22,6 +22,42 @@ use crate::pkcs11_abi::constants::*;
 use crate::pkcs11_abi::types::CK_MECHANISM_TYPE;
 use crate::store::key_material::RawKeyMaterial;
 
+/// Build an aws-lc `Digest` from digest bytes produced elsewhere in the module.
+///
+/// `import_less_safe` is "less safe" because it trusts the caller to supply a
+/// genuine digest of the right length. That trust is satisfied here: the bytes
+/// come from the module's own multi-part digest accumulator, driven by
+/// `C_SignUpdate`, never from across the ABI boundary. The length is checked by
+/// `import_less_safe` itself against the algorithm.
+fn import_digest(digest: &[u8], hash_alg: HashAlg) -> HsmResult<digest::Digest> {
+    let algorithm = match hash_alg {
+        HashAlg::Sha256 => &digest::SHA256,
+        HashAlg::Sha384 => &digest::SHA384,
+        HashAlg::Sha512 => &digest::SHA512,
+    };
+    digest::Digest::import_less_safe(digest, algorithm).map_err(|_| HsmError::DataLenRange)
+}
+
+/// Sign an already-computed digest with AWS-LC under the given padding.
+///
+/// Shared by the PKCS#1 v1.5 and PSS prehashed paths, which differ only in the
+/// `RsaEncoding` they pass.
+fn sign_prehashed_with(
+    private_key_der: &[u8],
+    digest: &[u8],
+    hash_alg: HashAlg,
+    encoding: &'static dyn signature::RsaEncoding,
+) -> HsmResult<Vec<u8>> {
+    let key_pair =
+        awslc_rsa::KeyPair::from_pkcs8(private_key_der).map_err(|_| HsmError::KeyHandleInvalid)?;
+    let imported = import_digest(digest, hash_alg)?;
+    let mut sig = vec![0u8; key_pair.public_modulus_len()];
+    key_pair
+        .sign_digest(encoding, &imported, &mut sig)
+        .map_err(|_| HsmError::GeneralError)?;
+    Ok(sig)
+}
+
 /// FIPS-validated crypto backend using aws-lc-rs.
 pub struct AwsLcBackend;
 
@@ -219,37 +255,32 @@ impl CryptoBackend for AwsLcBackend {
     //     document this limitation in their security policy.
 
     // ========================================================================
-    // KNOWN GAP: the four `*_prehashed` RSA methods below are NOT AWS-LC.
+    // Prehashed RSA (the multi-part C_Sign*/C_Verify* paths).
     //
-    // They are implemented with the RustCrypto `rsa` crate, so on this
-    // "FIPS-validated backend" the multi-part RSA paths -- C_SignUpdate /
-    // C_SignFinal and C_VerifyUpdate / C_VerifyFinal -- do not run through
-    // AWS-LC at all. Three consequences, in descending severity:
+    // The two *signing* methods below run on AWS-LC via
+    // `KeyPair::sign_digest`. They previously used the RustCrypto `rsa` crate,
+    // which meant multi-part RSA signing on this backend was (a) refused
+    // outright in release builds by the RUSTSEC-2023-0071 gate, and (b) in
+    // debug builds silently Marvin-exposed. PSS additionally drew its salt
+    // from `OsRng`, bypassing the SP 800-90A DRBG; AWS-LC generates the salt
+    // internally, so that bypass is gone rather than relocated.
     //
-    // 1. FIPS scope. A deployment selecting this backend is not using the
-    //    validated module for prehashed RSA. Any security policy claiming
-    //    AWS-LC covers RSA is inaccurate for the multi-part paths.
+    // FIPS scope: aws-lc-rs annotates `sign_digest` as outside its
+    // FIPS-approved service set, because the caller supplies the digest rather
+    // than the module hashing the message in one call. The module *does* do the
+    // hashing -- `C_SignUpdate` accumulates into our own digest context -- but
+    // the signing primitive is still invoked with an external digest, so a FIPS
+    // deployment should prefer single-shot `C_Sign`, which routes through
+    // `KeyPair::sign` and is in scope. This is strictly better than what it
+    // replaces, which was neither validated nor constant-time.
     //
-    // 2. RUSTSEC-2023-0071 (Marvin). The two *signing* methods call
-    //    `require_rustcrypto_rsa_private_ops()`, so in release they fail
-    //    closed -- which is why multi-part RSA signing returns
-    //    CKR_MECHANISM_INVALID under this backend rather than producing a
-    //    signature. The two *verify* methods are ungated and silently use
-    //    RustCrypto; that is a public-key operation, so not a Marvin
-    //    exposure, but it is still not the validated implementation.
-    //
-    // 3. `rsa_pss_sign_prehashed` draws its PSS salt from `OsRng` directly,
-    //    bypassing the SP 800-90A HMAC_DRBG. The crate's own rule is that all
-    //    randomness routes through `DrbgRng` (see `crypto/drbg.rs`); a direct
-    //    `OsRng` in key generation was treated as a CRITICAL finding in
-    //    v0.9.1. This one is still here.
-    //
-    // Fixing this means implementing prehashed RSA on aws-lc-rs properly, and
-    // routing the PSS salt through the DRBG. It is deliberately not bundled
-    // into the change that found it. `test_multipart_sign_verify` fails
-    // against this backend and is left failing on purpose: it is reporting a
-    // real defect, not a test problem. Do not silence it by widening a cfg
-    // gate.
+    // The two *verify* methods still use RustCrypto, because aws-lc-rs has no
+    // prehashed verification API: `rsa::PublicKey` exposes only `verify`, which
+    // hashes the message itself, and there is no public raw public-key
+    // operation to build on. These are public-key operations over
+    // non-secret inputs, so there is no timing exposure and no Marvin
+    // relevance; the cost is FIPS scope only. Do not "fix" them by hand-rolling
+    // PKCS#1 padding comparison.
     // ========================================================================
 
     fn rsa_pkcs1v15_sign_prehashed(
@@ -258,20 +289,12 @@ impl CryptoBackend for AwsLcBackend {
         digest: &[u8],
         hash_alg: HashAlg,
     ) -> HsmResult<Vec<u8>> {
-        super::sign::require_rustcrypto_rsa_private_ops()?;
-        use rsa::pkcs8::DecodePrivateKey;
-        use rsa::{Pkcs1v15Sign, RsaPrivateKey};
-
-        let private_key = RsaPrivateKey::from_pkcs8_der(private_key_der)
-            .map_err(|_| HsmError::KeyHandleInvalid)?;
-        let scheme = match hash_alg {
-            HashAlg::Sha256 => Pkcs1v15Sign::new::<sha2::Sha256>(),
-            HashAlg::Sha384 => Pkcs1v15Sign::new::<sha2::Sha384>(),
-            HashAlg::Sha512 => Pkcs1v15Sign::new::<sha2::Sha512>(),
+        let encoding: &'static dyn signature::RsaEncoding = match hash_alg {
+            HashAlg::Sha256 => &signature::RSA_PKCS1_SHA256,
+            HashAlg::Sha384 => &signature::RSA_PKCS1_SHA384,
+            HashAlg::Sha512 => &signature::RSA_PKCS1_SHA512,
         };
-        private_key
-            .sign(scheme, digest)
-            .map_err(|_| HsmError::GeneralError)
+        sign_prehashed_with(private_key_der, digest, hash_alg, encoding)
     }
 
     fn rsa_pkcs1v15_verify_prehashed(
@@ -301,39 +324,18 @@ impl CryptoBackend for AwsLcBackend {
         digest: &[u8],
         hash_alg: HashAlg,
     ) -> HsmResult<Vec<u8>> {
-        super::sign::require_rustcrypto_rsa_private_ops()?;
-        use rand::rngs::OsRng;
-        use rsa::pkcs8::DecodePrivateKey;
-        use rsa::pss::SigningKey;
-        use rsa::signature::hazmat::RandomizedPrehashSigner;
-        use rsa::signature::SignatureEncoding;
-        use rsa::RsaPrivateKey;
-
-        let private_key = RsaPrivateKey::from_pkcs8_der(private_key_der)
-            .map_err(|_| HsmError::KeyHandleInvalid)?;
-        match hash_alg {
-            HashAlg::Sha256 => {
-                let signing_key = SigningKey::<sha2::Sha256>::new(private_key);
-                let sig = signing_key
-                    .sign_prehash_with_rng(&mut OsRng, digest)
-                    .map_err(|_| HsmError::GeneralError)?;
-                Ok(sig.to_vec())
-            }
-            HashAlg::Sha384 => {
-                let signing_key = SigningKey::<sha2::Sha384>::new(private_key);
-                let sig = signing_key
-                    .sign_prehash_with_rng(&mut OsRng, digest)
-                    .map_err(|_| HsmError::GeneralError)?;
-                Ok(sig.to_vec())
-            }
-            HashAlg::Sha512 => {
-                let signing_key = SigningKey::<sha2::Sha512>::new(private_key);
-                let sig = signing_key
-                    .sign_prehash_with_rng(&mut OsRng, digest)
-                    .map_err(|_| HsmError::GeneralError)?;
-                Ok(sig.to_vec())
-            }
-        }
+        // AWS-LC configures RSA_PSS_SALTLEN_DIGEST, i.e. salt length == digest
+        // length, which is what the RustCrypto `pss::SigningKey` this replaces
+        // also used. Signature verification by third parties is unaffected.
+        //
+        // The salt itself is generated inside AWS-LC. That removes the previous
+        // direct `OsRng` draw, which bypassed the module's SP 800-90A DRBG.
+        let encoding: &'static dyn signature::RsaEncoding = match hash_alg {
+            HashAlg::Sha256 => &signature::RSA_PSS_SHA256,
+            HashAlg::Sha384 => &signature::RSA_PSS_SHA384,
+            HashAlg::Sha512 => &signature::RSA_PSS_SHA512,
+        };
+        sign_prehashed_with(private_key_der, digest, hash_alg, encoding)
     }
 
     fn rsa_pss_verify_prehashed(
