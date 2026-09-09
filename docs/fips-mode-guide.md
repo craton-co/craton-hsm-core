@@ -1,23 +1,36 @@
 # FIPS 140-3 Mode Operator Guide
 
-> ## Known gap: multi-part RSA does not use AWS-LC
+> ## Multi-part RSA: what is and is not in FIPS scope
 >
-> The `AwsLcBackend`'s four `*_prehashed` RSA methods are implemented with the
-> RustCrypto `rsa` crate, not AWS-LC. These back the multi-part PKCS#11 paths:
-> `C_SignUpdate`/`C_SignFinal` and `C_VerifyUpdate`/`C_VerifyFinal`.
+> Multi-part RSA (`C_SignUpdate`/`C_SignFinal` and
+> `C_VerifyUpdate`/`C_VerifyFinal`) needs a *prehashed* RSA primitive, because
+> the digest is accumulated across calls. That has scope consequences worth
+> knowing before you write a security policy.
 >
-> * **Multi-part RSA signing does not work** on a release build of this backend.
->   It returns `CKR_MECHANISM_INVALID`, because the RustCrypto private-key gate
->   (RUSTSEC-2023-0071) refuses it. Single-shot `C_Sign` is unaffected and does
->   use AWS-LC.
-> * **Multi-part RSA verification silently uses RustCrypto.** It works, but it is
->   not the validated implementation.
-> * **PSS salt generation in this path uses `OsRng` directly**, bypassing the
->   SP 800-90A DRBG that the rest of the module routes through.
+> **Signing runs on AWS-LC, but outside its FIPS-approved service set.**
+> `KeyPair::sign_digest` is what makes prehashed signing possible, and aws-lc-rs
+> annotates it as not FIPS-allowed: the primitive is invoked with a digest rather
+> than hashing the message itself. The module *does* perform the hashing — the
+> digest is accumulated in our own context from `C_SignUpdate` — but the
+> signature operation still receives an external digest.
 >
-> Do not represent prehashed/multi-part RSA as covered by the AWS-LC validation
-> until this is fixed. See the comment block above
-> `rsa_pkcs1v15_sign_prehashed` in `src/crypto/awslc_backend.rs`.
+> If your validation scope must cover every RSA signature the module produces,
+> use single-shot **`C_Sign`**, which routes through `KeyPair::sign` and is in
+> scope. Multi-part RSA signing is correct and constant-time; it is the
+> *validation boundary* that does not cover it.
+>
+> **Verification still uses RustCrypto.** aws-lc-rs has no prehashed
+> verification API — `rsa::PublicKey` exposes only `verify`, which hashes the
+> message itself — so multi-part RSA verification runs on the RustCrypto `rsa`
+> crate. These are public-key operations over non-secret inputs, so there is no
+> timing exposure and RUSTSEC-2023-0071 does not apply; the cost is FIPS scope
+> only. Single-shot `C_Verify` uses AWS-LC.
+>
+> Everything else — single-shot RSA sign/verify, ECDSA, Ed25519, AES, AES-GCM,
+> key wrapping, digests, and RSA key generation — runs on AWS-LC.
+>
+> See the comment block above `rsa_pkcs1v15_sign_prehashed` in
+> `src/crypto/awslc_backend.rs`.
 
 
 ## Overview

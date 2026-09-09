@@ -372,6 +372,12 @@ the configured backend. The POST still exercises RustCrypto rather than the
 selected backend; that is pre-existing and worth revisiting, since it means the
 KATs do not cover the primitives an AWS-LC deployment actually uses.
 
+Multi-part RSA on this backend has its own scope caveat — signing works and runs
+on AWS-LC, but through an API outside its FIPS-approved set, and verification
+still uses RustCrypto. See
+[fips-mode-guide.md](fips-mode-guide.md) before relying on it for a validated
+deployment.
+
 ---
 
 ## Coverage Added
