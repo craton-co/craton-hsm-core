@@ -6,6 +6,19 @@
 //! cryptographic service is available. If any test fails, the module
 //! enters an error state and refuses all operations.
 //!
+//! # The KATs run against the configured backend
+//!
+//! [`run_post`] takes the `CryptoBackend` the module will actually use, and the
+//! algorithm KATs are dispatched through it. This matters when a backend other
+//! than the built-in RustCrypto one is selected: FIPS 140-3 requires a known-
+//! answer test for each approved algorithm *the module implements*, and testing
+//! a different implementation than the one in service establishes nothing about
+//! it. Before this was wired through, an AWS-LC deployment self-tested
+//! RustCrypto, so a broken or miscompiled AWS-LC would have passed POST.
+//!
+//! HMAC, SHA3, the PQC algorithms, and the RNG/DRBG health tests are not
+//! backend-swapped, so those KATs call the shared implementations directly.
+//!
 //! KATs cover all approved algorithms:
 //! - SHA-256, SHA-384, SHA-512, SHA3-256 (digest)
 //! - HMAC-SHA256, HMAC-SHA384, HMAC-SHA512 (MAC)
@@ -15,27 +28,42 @@
 //! - ML-KEM-768 (post-quantum KEM)
 //! - RNG health + continuous test (entropy source)
 
+use crate::crypto::backend::CryptoBackend;
 use crate::error::HsmResult;
+use crate::pkcs11_abi::constants::{CKM_SHA256, CKM_SHA384, CKM_SHA512};
 
-/// Run all POST known-answer tests. Returns Ok(()) if all pass.
-pub fn run_post() -> HsmResult<()> {
-    // Reset IV-reuse trackers and GCM counters so that KATs can run
-    // deterministically with fixed IVs/nonces. This is safe because POST
-    // is called on initialization, before any user operations.
+/// §9.4 software integrity test (HMAC-SHA256 over the module binary).
+///
+/// Split out from the algorithm KATs so it can keep running *first*, before
+/// anything else at all. The KATs need the configured backend, which is only
+/// known once the configuration has been read; this does not, and must not wait
+/// for it.
+pub fn run_post_integrity() -> HsmResult<()> {
+    // Reset IV-reuse trackers and GCM counters so that the KATs can later run
+    // deterministically with fixed IVs/nonces. Safe here because this runs on
+    // initialization, before any user operation.
     crate::crypto::encrypt::reset_gcm_counters();
     crate::crypto::encrypt::reset_iv_trackers();
 
-    // §9.4: Software integrity test (HMAC-SHA256 of module binary)
-    // Must run before any algorithm KATs.
     if let Err(msg) = crate::crypto::integrity::check_integrity() {
         tracing::error!("POST: Software integrity test failed: {}", msg);
         return Err(crate::error::HsmError::GeneralError);
     }
+    Ok(())
+}
 
+/// Run every algorithm known-answer test against `backend`.
+///
+/// `backend` must be the instance the module will actually serve requests with
+/// — see the module documentation for why testing a different one proves
+/// nothing. Call [`run_post_integrity`] first.
+pub fn run_post_algorithms(backend: &dyn CryptoBackend) -> HsmResult<()> {
     // Digest KATs
-    post_sha256_kat()?;
-    post_sha384_kat()?;
-    post_sha512_kat()?;
+    post_sha256_kat(backend)?;
+    post_sha384_kat(backend)?;
+    post_sha512_kat(backend)?;
+    // SHA3 has no backend entry point; it is served by the shared
+    // implementation regardless of the configured backend.
     post_sha3_256_kat()?;
 
     // MAC KATs
@@ -44,16 +72,16 @@ pub fn run_post() -> HsmResult<()> {
     post_hmac_sha512_kat()?;
 
     // Symmetric encryption KATs
-    post_aes_gcm_kat()?;
-    post_aes_cbc_kat()?;
-    post_aes_ctr_kat()?;
+    post_aes_gcm_kat(backend)?;
+    post_aes_cbc_kat(backend)?;
+    post_aes_ctr_kat(backend)?;
 
     // Asymmetric KATs — FIPS 140-3 IG §9.4 requires every approved
     // algorithm's KAT to run on every module initialization, regardless
     // of build profile. These are slow in unoptimized debug builds but
     // must NOT be skipped.
-    post_rsa_pkcs1v15_kat()?;
-    post_ecdsa_p256_kat()?;
+    post_rsa_pkcs1v15_kat(backend)?;
+    post_ecdsa_p256_kat(backend)?;
 
     // PQC KATs
     post_ml_dsa_kat()?;
@@ -68,29 +96,36 @@ pub fn run_post() -> HsmResult<()> {
     Ok(())
 }
 
+/// Run the integrity test followed by every algorithm KAT.
+///
+/// Convenience wrapper for callers that already hold the backend and do not
+/// need to interleave configuration loading between the two phases.
+pub fn run_post(backend: &dyn CryptoBackend) -> HsmResult<()> {
+    run_post_integrity()?;
+    run_post_algorithms(backend)
+}
+
 // ============================================================================
 // Digest KATs
 // ============================================================================
 
 /// SHA-256 KAT: hash "abc", compare against NIST digest.
-fn post_sha256_kat() -> HsmResult<()> {
-    use sha2::{Digest, Sha256};
-    let result = Sha256::digest(b"abc");
+fn post_sha256_kat(backend: &dyn CryptoBackend) -> HsmResult<()> {
+    let result = backend.compute_digest(CKM_SHA256, b"abc")?;
     let expected: [u8; 32] = [
         0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22,
         0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00,
         0x15, 0xad,
     ];
-    if result.as_slice() != expected {
+    if result != expected {
         return Err(crate::error::HsmError::GeneralError);
     }
     Ok(())
 }
 
 /// SHA-384 KAT: hash "abc", compare full 48-byte NIST digest.
-fn post_sha384_kat() -> HsmResult<()> {
-    use sha2::{Digest, Sha384};
-    let result = Sha384::digest(b"abc");
+fn post_sha384_kat(backend: &dyn CryptoBackend) -> HsmResult<()> {
+    let result = backend.compute_digest(CKM_SHA384, b"abc")?;
     // NIST SHA-384("abc") — full 48-byte digest
     let expected: [u8; 48] = [
         0xcb, 0x00, 0x75, 0x3f, 0x45, 0xa3, 0x5e, 0x8b, 0xb5, 0xa0, 0x3d, 0x69, 0x9a, 0xc6, 0x50,
@@ -98,16 +133,15 @@ fn post_sha384_kat() -> HsmResult<()> {
         0x5b, 0xed, 0x80, 0x86, 0x07, 0x2b, 0xa1, 0xe7, 0xcc, 0x23, 0x58, 0xba, 0xec, 0xa1, 0x34,
         0xc8, 0x25, 0xa7,
     ];
-    if result.as_slice() != expected {
+    if result != expected {
         return Err(crate::error::HsmError::GeneralError);
     }
     Ok(())
 }
 
 /// SHA-512 KAT: hash "abc", compare full 64-byte NIST digest.
-fn post_sha512_kat() -> HsmResult<()> {
-    use sha2::{Digest, Sha512};
-    let result = Sha512::digest(b"abc");
+fn post_sha512_kat(backend: &dyn CryptoBackend) -> HsmResult<()> {
+    let result = backend.compute_digest(CKM_SHA512, b"abc")?;
     // NIST SHA-512("abc") — full 64-byte digest
     let expected: [u8; 64] = [
         0xdd, 0xaf, 0x35, 0xa1, 0x93, 0x61, 0x7a, 0xba, 0xcc, 0x41, 0x73, 0x49, 0xae, 0x20, 0x41,
@@ -116,7 +150,7 @@ fn post_sha512_kat() -> HsmResult<()> {
         0xfe, 0xeb, 0xbd, 0x45, 0x4d, 0x44, 0x23, 0x64, 0x3c, 0xe8, 0x0e, 0x2a, 0x9a, 0xc9, 0x4f,
         0xa5, 0x4c, 0xa4, 0x9f,
     ];
-    if result.as_slice() != expected {
+    if result != expected {
         return Err(crate::error::HsmError::GeneralError);
     }
     Ok(())
@@ -225,25 +259,28 @@ fn post_hmac_sha512_kat() -> HsmResult<()> {
 
 /// AES-256-GCM KAT: encrypt then decrypt roundtrip, plus verify the decryption
 /// path independently with a known nonce to catch symmetric implementation bugs.
-fn post_aes_gcm_kat() -> HsmResult<()> {
-    use crate::crypto::encrypt;
+fn post_aes_gcm_kat(backend: &dyn CryptoBackend) -> HsmResult<()> {
     use aes_gcm::{
         aead::{Aead, KeyInit},
         Aes256Gcm, Key, Nonce,
     };
 
-    // Part 1: roundtrip test (catches gross failures)
+    // Part 1: roundtrip through the configured backend (catches gross failures).
     let key = [0x42u8; 32];
     let plaintext = b"FIPS POST AES-GCM self-test data";
-    let ciphertext = encrypt::aes_256_gcm_encrypt(&key, plaintext)?;
-    let decrypted = encrypt::aes_256_gcm_decrypt(&key, &ciphertext)?;
+    let ciphertext = backend.aes_256_gcm_encrypt(&key, plaintext)?;
+    let decrypted = backend.aes_256_gcm_decrypt(&key, &ciphertext)?;
     if decrypted != plaintext {
         return Err(crate::error::HsmError::GeneralError);
     }
 
-    // Part 2: known-answer decrypt test with a fixed nonce
-    // This ensures the AES-GCM implementation produces correct output even if
-    // both encrypt and decrypt have the same symmetric bug.
+    // Part 2: fixed-nonce check of the shared AES-GCM primitive.
+    //
+    // This one cannot go through the backend: `aes_256_gcm_encrypt` generates
+    // its own nonce by design (see `crypto/encrypt.rs`), so there is no entry
+    // point that accepts a fixed nonce, and a deterministic vector needs one.
+    // Part 1 above is what exercises the configured backend; this part guards
+    // the shared primitive against a symmetric encrypt/decrypt bug.
     let kat_key = [0x00u8; 32];
     let kat_nonce = [0x00u8; 12];
     let kat_plaintext = b"";
@@ -276,9 +313,7 @@ fn post_aes_gcm_kat() -> HsmResult<()> {
 /// Uses a genuine known-answer test with a pre-computed expected ciphertext
 /// that was generated and verified independently. This catches implementation
 /// bugs that a roundtrip-only test or a circular self-comparison would miss.
-fn post_aes_cbc_kat() -> HsmResult<()> {
-    use crate::crypto::encrypt;
-
+fn post_aes_cbc_kat(backend: &dyn CryptoBackend) -> HsmResult<()> {
     let key = [0x55u8; 32];
     let iv = [0xAAu8; 16];
     let plaintext = b"FIPS POST AES-CBC test data!!!!"; // 31 bytes, tests PKCS#7 padding
@@ -286,7 +321,7 @@ fn post_aes_cbc_kat() -> HsmResult<()> {
     // Part 1: Known-answer test — compare against hardcoded expected ciphertext.
     // Pre-computed with a verified AES-256-CBC implementation (PKCS#7 padding).
     // 31 bytes plaintext + 1 byte PKCS#7 pad = 32 bytes = 2 AES blocks.
-    let ciphertext = encrypt::aes_cbc_encrypt(&key, &iv, plaintext)?;
+    let ciphertext = backend.aes_cbc_encrypt(&key, &iv, plaintext)?;
     let expected_ct: [u8; 32] = [
         0xb9, 0xf9, 0x93, 0x5b, 0xe0, 0x5d, 0x47, 0x0d, 0xe9, 0x8c, 0x11, 0x92, 0x18, 0xe5, 0xa9,
         0xc8, 0xf7, 0x31, 0x6a, 0xd6, 0x6d, 0xee, 0x0a, 0xd7, 0x1b, 0x1c, 0xb2, 0x1d, 0xa0, 0x32,
@@ -297,7 +332,7 @@ fn post_aes_cbc_kat() -> HsmResult<()> {
     }
 
     // Part 2: Roundtrip — verify decryption recovers original plaintext
-    let decrypted = encrypt::aes_cbc_decrypt(&key, &iv, &ciphertext)?;
+    let decrypted = backend.aes_cbc_decrypt(&key, &iv, &ciphertext)?;
     if decrypted != plaintext {
         return Err(crate::error::HsmError::GeneralError);
     }
@@ -309,16 +344,14 @@ fn post_aes_cbc_kat() -> HsmResult<()> {
 /// Uses a genuine known-answer test with a pre-computed expected ciphertext
 /// that was generated and verified independently. A roundtrip-only or circular
 /// self-comparison test would miss symmetric bugs (e.g., XOR with wrong keystream).
-fn post_aes_ctr_kat() -> HsmResult<()> {
-    use crate::crypto::encrypt;
-
+fn post_aes_ctr_kat(backend: &dyn CryptoBackend) -> HsmResult<()> {
     let key = [0x77u8; 32];
     let iv = [0xBBu8; 16];
     let plaintext = b"FIPS POST AES-CTR self-test";
 
     // Part 1: Known-answer test — compare against hardcoded expected ciphertext.
     // Pre-computed with a verified AES-256-CTR (big-endian counter) implementation.
-    let ciphertext = encrypt::aes_ctr_encrypt(&key, &iv, plaintext)?;
+    let ciphertext = backend.aes_ctr_encrypt(&key, &iv, plaintext)?;
     let expected_ct: [u8; 27] = [
         0xf4, 0x1e, 0x8e, 0x60, 0x27, 0xfe, 0xb9, 0xb4, 0x1b, 0x89, 0x9f, 0x12, 0x84, 0xde, 0x34,
         0x03, 0x8b, 0x0d, 0x0d, 0xd6, 0xd1, 0x6d, 0x98, 0x23, 0xd8, 0x5b, 0x56,
@@ -328,7 +361,7 @@ fn post_aes_ctr_kat() -> HsmResult<()> {
     }
 
     // Part 2: Roundtrip — CTR is symmetric, encrypting ciphertext recovers plaintext
-    let decrypted = encrypt::aes_ctr_decrypt(&key, &iv, &ciphertext)?;
+    let decrypted = backend.aes_ctr_decrypt(&key, &iv, &ciphertext)?;
     if decrypted != plaintext {
         return Err(crate::error::HsmError::GeneralError);
     }
@@ -407,29 +440,30 @@ const RSA_KAT_SIGNATURE: &[u8] = &[
 ///
 /// When private-key operations are available (debug builds, or an explicit
 /// opt-in), the stronger generate-sign-verify roundtrip runs instead.
-fn post_rsa_pkcs1v15_kat() -> HsmResult<()> {
-    if crate::crypto::sign::rsa_private_ops_permitted() {
-        post_rsa_pkcs1v15_roundtrip_kat()
+fn post_rsa_pkcs1v15_kat(backend: &dyn CryptoBackend) -> HsmResult<()> {
+    // Ask the *backend* whether it provides RSA private-key operations, rather
+    // than testing the build-time RustCrypto gate. A backend that provides them
+    // (AWS-LC does) gets the stronger generate-sign-verify roundtrip against
+    // its own implementation.
+    if backend.supports_rsa_private_ops() {
+        post_rsa_pkcs1v15_roundtrip_kat(backend)
     } else {
-        post_rsa_pkcs1v15_verify_kat()
+        post_rsa_pkcs1v15_verify_kat(backend)
     }
 }
 
 /// Full roundtrip: generate a key, sign, and verify.
-fn post_rsa_pkcs1v15_roundtrip_kat() -> HsmResult<()> {
-    use crate::crypto::{keygen, sign};
-    let (priv_key, modulus, pub_exp) = keygen::generate_rsa_key_pair(2048, false)?;
-    let signature = sign::rsa_pkcs1v15_sign(
-        priv_key.as_bytes(),
-        RSA_KAT_MESSAGE,
-        Some(sign::HashAlg::Sha256),
-    )?;
-    let valid = sign::rsa_pkcs1v15_verify(
+fn post_rsa_pkcs1v15_roundtrip_kat(backend: &dyn CryptoBackend) -> HsmResult<()> {
+    use crate::crypto::sign::HashAlg;
+    let (priv_key, modulus, pub_exp) = backend.generate_rsa_key_pair(2048, false)?;
+    let signature =
+        backend.rsa_pkcs1v15_sign(priv_key.as_bytes(), RSA_KAT_MESSAGE, Some(HashAlg::Sha256))?;
+    let valid = backend.rsa_pkcs1v15_verify(
         &modulus,
         &pub_exp,
         RSA_KAT_MESSAGE,
         &signature,
-        Some(sign::HashAlg::Sha256),
+        Some(HashAlg::Sha256),
     )?;
     if !valid {
         return Err(crate::error::HsmError::GeneralError);
@@ -442,15 +476,15 @@ fn post_rsa_pkcs1v15_roundtrip_kat() -> HsmResult<()> {
 /// Checks both directions: the valid signature must verify, and a signature
 /// with one bit flipped must not. Without the negative case a verifier that
 /// returned `true` unconditionally would pass.
-fn post_rsa_pkcs1v15_verify_kat() -> HsmResult<()> {
-    use crate::crypto::sign;
+fn post_rsa_pkcs1v15_verify_kat(backend: &dyn CryptoBackend) -> HsmResult<()> {
+    use crate::crypto::sign::HashAlg;
 
-    let valid = sign::rsa_pkcs1v15_verify(
+    let valid = backend.rsa_pkcs1v15_verify(
         RSA_KAT_MODULUS,
         RSA_KAT_PUBLIC_EXPONENT,
         RSA_KAT_MESSAGE,
         RSA_KAT_SIGNATURE,
-        Some(sign::HashAlg::Sha256),
+        Some(HashAlg::Sha256),
     )?;
     if !valid {
         tracing::error!("POST: RSA PKCS#1 v1.5 verify KAT rejected a valid signature");
@@ -459,14 +493,15 @@ fn post_rsa_pkcs1v15_verify_kat() -> HsmResult<()> {
 
     let mut corrupted = RSA_KAT_SIGNATURE.to_vec();
     corrupted[0] ^= 0x01;
-    let accepted = sign::rsa_pkcs1v15_verify(
-        RSA_KAT_MODULUS,
-        RSA_KAT_PUBLIC_EXPONENT,
-        RSA_KAT_MESSAGE,
-        &corrupted,
-        Some(sign::HashAlg::Sha256),
-    )
-    .unwrap_or(false);
+    let accepted = backend
+        .rsa_pkcs1v15_verify(
+            RSA_KAT_MODULUS,
+            RSA_KAT_PUBLIC_EXPONENT,
+            RSA_KAT_MESSAGE,
+            &corrupted,
+            Some(HashAlg::Sha256),
+        )
+        .unwrap_or(false);
     if accepted {
         tracing::error!("POST: RSA PKCS#1 v1.5 verify KAT accepted a corrupted signature");
         return Err(crate::error::HsmError::GeneralError);
@@ -475,12 +510,11 @@ fn post_rsa_pkcs1v15_verify_kat() -> HsmResult<()> {
 }
 
 /// ECDSA P-256 sign/verify roundtrip with generated key.
-fn post_ecdsa_p256_kat() -> HsmResult<()> {
-    use crate::crypto::{keygen, sign};
-    let (priv_key, pub_key) = keygen::generate_ec_p256_key_pair()?;
+fn post_ecdsa_p256_kat(backend: &dyn CryptoBackend) -> HsmResult<()> {
+    let (priv_key, pub_key) = backend.generate_ec_p256_key_pair()?;
     let message = b"FIPS POST ECDSA self-test";
-    let signature = sign::ecdsa_p256_sign(priv_key.as_bytes(), message)?;
-    let valid = sign::ecdsa_p256_verify(&pub_key, message, &signature)?;
+    let signature = backend.ecdsa_p256_sign(priv_key.as_bytes(), message)?;
+    let valid = backend.ecdsa_p256_verify(&pub_key, message, &signature)?;
     if !valid {
         return Err(crate::error::HsmError::GeneralError);
     }
@@ -593,6 +627,31 @@ mod tests {
         // setup that is safe to leave in place for the remainder of the test
         // process.
         unsafe { std::env::set_var("CRATON_HSM_INTEGRITY_BYPASS", "unsafe-dev-only") };
-        run_post().expect("POST self-tests should pass");
+        // Whichever backend this build compiled; POST must pass against it.
+        #[cfg(feature = "rustcrypto-backend")]
+        let backend = crate::crypto::rustcrypto_backend::RustCryptoBackend;
+        #[cfg(all(feature = "awslc-backend", not(feature = "rustcrypto-backend")))]
+        let backend = crate::crypto::awslc_backend::AwsLcBackend;
+        run_post(&backend).expect("POST self-tests should pass");
+    }
+
+    /// The KATs must pass against **AWS-LC specifically**, not just against
+    /// whichever backend happens to be the default.
+    ///
+    /// This is the test that has teeth. It runs in a build where the RustCrypto
+    /// backend is also compiled and is what `HsmCore` would select by default,
+    /// so it cannot accidentally be exercising RustCrypto: it names the AWS-LC
+    /// backend and asserts the algorithm KATs pass against that. Before the KATs
+    /// took a backend, this assertion could not even be written -- `run_post()`
+    /// had no way to be pointed at a particular implementation, which is exactly
+    /// how an AWS-LC deployment ended up self-testing RustCrypto.
+    #[test]
+    #[cfg(feature = "awslc-backend")]
+    fn post_algorithm_kats_pass_against_awslc() {
+        // SAFETY: process-global env var; the integrity test is covered
+        // separately and is not what this test is about.
+        unsafe { std::env::set_var("CRATON_HSM_INTEGRITY_BYPASS", "unsafe-dev-only") };
+        let backend = crate::crypto::awslc_backend::AwsLcBackend;
+        run_post_algorithms(&backend).expect("algorithm KATs must pass against AWS-LC");
     }
 }

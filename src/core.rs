@@ -108,7 +108,16 @@ impl HsmCore {
     /// The built-in RustCrypto backend is the default. External backends
     /// (e.g., the FIPS-validated aws-lc-rs backend in `craton_hsm-awslc`)
     /// can be injected via [`HsmCore::new_with_backend`].
-    fn select_crypto_backend(config: &HsmConfig) -> Arc<dyn CryptoBackend> {
+    /// Resolve the crypto backend a given configuration selects, without
+    /// building a core.
+    ///
+    /// Public because any embedder that runs the power-on self-tests must run
+    /// them against the backend it is about to use — see
+    /// [`crate::crypto::self_test::run_post_algorithms`]. Both `C_Initialize`
+    /// and the daemon select once here and pass the same instance to
+    /// [`HsmCore::new_with_backend`], so the tested and served implementations
+    /// cannot diverge. Selection itself performs no cryptography.
+    pub fn select_crypto_backend(config: &HsmConfig) -> Arc<dyn CryptoBackend> {
         let requested = config.algorithms.crypto_backend.as_str();
 
         match requested {

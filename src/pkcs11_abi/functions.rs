@@ -298,8 +298,15 @@ pub extern "C" fn C_Initialize(p_init_args: CK_VOID_PTR) -> CK_RV {
         // If POST fails again below, POST_FAILED will be set back to true.
         POST_FAILED.store(false, Ordering::Release);
 
-        // Run FIPS 140-3 Power-On Self-Tests before any crypto service is available
-        if crate::crypto::self_test::run_post().is_err() {
+        // FIPS 140-3 Power-On Self-Tests, in two phases.
+        //
+        // The §9.4 integrity test runs first, before anything else. The
+        // algorithm KATs must run against the backend the module will actually
+        // use, and that is chosen by the configuration — so the config is read
+        // in between. Reading and validating a config file is not a
+        // cryptographic service, and no service is offered until C_Initialize
+        // returns, so the pre-operational ordering still holds.
+        if crate::crypto::self_test::run_post_integrity().is_err() {
             POST_FAILED.store(true, Ordering::Release);
             return CKR_GENERAL_ERROR;
         }
@@ -311,7 +318,16 @@ pub extern "C" fn C_Initialize(p_init_args: CK_VOID_PTR) -> CK_RV {
                 return CKR_GENERAL_ERROR;
             }
         };
-        let core = Arc::new(HsmCore::new(&config));
+
+        // Select once and hand the same instance to the core, so the KATs and
+        // the served operations cannot diverge.
+        let backend = HsmCore::select_crypto_backend(&config);
+        if crate::crypto::self_test::run_post_algorithms(backend.as_ref()).is_err() {
+            POST_FAILED.store(true, Ordering::Release);
+            return CKR_GENERAL_ERROR;
+        }
+
+        let core = Arc::new(HsmCore::new_with_backend(&config, backend));
 
         // Record the PID for fork detection
         INIT_PID.store(current_pid(), Ordering::Release);

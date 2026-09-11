@@ -91,15 +91,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    // Run FIPS POST
-    if let Err(e) = craton_hsm::crypto::self_test::run_post() {
+    // FIPS POST, in two phases: the §9.4 integrity test first, then the
+    // algorithm KATs against the backend this daemon will actually serve with.
+    // Testing a different implementation than the one in service proves nothing
+    // about it.
+    if let Err(e) = craton_hsm::crypto::self_test::run_post_integrity() {
+        tracing::error!("FIPS POST software integrity test failed: {:?}", e);
+        std::process::exit(1);
+    }
+    let backend = HsmCore::select_crypto_backend(&hsm_config);
+    if let Err(e) = craton_hsm::crypto::self_test::run_post_algorithms(backend.as_ref()) {
         tracing::error!("FIPS POST self-tests failed: {:?}", e);
         std::process::exit(1);
     }
     tracing::info!("FIPS POST self-tests passed");
 
-    // Initialize HsmCore
-    let hsm = Arc::new(HsmCore::new(&hsm_config));
+    // Initialize HsmCore with the very backend the KATs just validated.
+    let hsm = Arc::new(HsmCore::new_with_backend(&hsm_config, backend));
 
     let service = server::HsmServiceImpl::new(
         hsm,

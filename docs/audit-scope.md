@@ -78,12 +78,31 @@ The cryptographic module boundary encompasses all code that handles key material
 
 ## Self-Test Coverage (POST) — 17 tests (integrity + 16 KATs) ✅
 
+**The KATs run against the configured backend.** `run_post_algorithms` takes
+the `CryptoBackend` the module will serve requests with, and the AES-GCM/CBC/CTR,
+SHA-2, ECDSA and RSA KATs dispatch through it. This matters whenever a backend
+other than the built-in RustCrypto one is selected: FIPS 140-3 requires a
+known-answer test for each approved algorithm *the module implements*, and
+testing a different implementation than the one in service establishes nothing
+about it. Until this was wired through, an AWS-LC deployment self-tested
+RustCrypto, so a broken or miscompiled AWS-LC would have passed POST.
+
+HMAC, SHA3, the PQC algorithms, and the RNG/DRBG health tests are not
+backend-swapped, so those KATs call the shared implementations directly. The
+AES-GCM fixed-nonce check is likewise on the shared primitive: the backend's
+GCM entry point generates its own nonce by design, so there is no interface
+through which to pass a deterministic one. The GCM roundtrip half of that KAT
+does go through the backend.
+
 **RSA KAT and the RUSTSEC-2023-0071 gate.** Release builds of the RustCrypto
 backend refuse RSA *private-key* operations because the `rsa` crate is subject to
 the Marvin timing attack, so RSA signature **generation** is not a security
-function those builds provide. The POST's RSA KAT therefore branches: where
-private-key operations are available it runs the sign/verify roundtrip, and where
-they are not it runs a verify-only known-answer test against a fixed vector,
+function those builds provide. The POST's RSA KAT therefore branches on the
+*backend's* reported capability (`CryptoBackend::supports_rsa_private_ops`)
+rather than on the build-time gate, so a backend that provides RSA — AWS-LC does
+— gets the full sign/verify roundtrip against its own implementation. Where
+private-key operations are refused it runs a verify-only known-answer test
+against a fixed vector,
 including a negative case so a verifier that accepts everything cannot pass. This
 keeps a KAT for every approved function the module actually provides. Before this
 branch existed the KAT signed unconditionally, so the POST — and therefore

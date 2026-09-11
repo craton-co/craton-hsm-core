@@ -62,6 +62,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   no prehashed verification API. That is a public-key operation over non-secret
   inputs, so it is a scope matter rather than a security one.
 
+- **The power-on self-tests now run against the configured crypto backend.**
+  `run_post()` took no backend and every KAT called the RustCrypto free
+  functions, so a deployment running AWS-LC self-tested an implementation it
+  does not use — a broken or miscompiled AWS-LC would have passed POST cleanly.
+  FIPS 140-3 wants a KAT per approved algorithm *the module implements*.
+
+  `run_post_algorithms(&dyn CryptoBackend)` now dispatches the AES-GCM/CBC/CTR,
+  SHA-2, ECDSA and RSA KATs through the backend. Both `C_Initialize` and the
+  daemon select the backend once and hand the same instance to the KATs and to
+  `HsmCore::new_with_backend`, so the tested and served implementations cannot
+  diverge. The RSA KAT reads its capability from `supports_rsa_private_ops()`
+  rather than the build-time gate, so AWS-LC now gets the full
+  generate-sign-verify roundtrip instead of the verify-only fallback.
+
+  The §9.4 integrity test is split into `run_post_integrity()` and still runs
+  first, before the configuration is read — only the algorithm KATs need the
+  backend, and reading a config file is not a cryptographic service.
+
+  `HsmCore::select_crypto_backend` is now public, since any embedder running the
+  POST must be able to resolve the backend before constructing a core.
+
 ### Changed
 
 - **Audit records are written at `format_version: 1`.** The on-disk NDJSON line
