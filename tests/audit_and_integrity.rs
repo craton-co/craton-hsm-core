@@ -524,7 +524,13 @@ fn test_fips_post_passes() {
     unsafe { std::env::set_var("CRATON_HSM_INTEGRITY_BYPASS", "unsafe-dev-only") };
 
     // Run all FIPS Power-On Self Tests (KATs)
-    let result = self_test::run_post();
+    // Whichever backend this build compiled; POST must pass against it, which
+    // is the property that matters now that the KATs follow the backend.
+    #[cfg(feature = "rustcrypto-backend")]
+    let backend = craton_hsm::crypto::rustcrypto_backend::RustCryptoBackend;
+    #[cfg(all(feature = "awslc-backend", not(feature = "rustcrypto-backend")))]
+    let backend = craton_hsm::crypto::awslc_backend::AwsLcBackend;
+    let result = self_test::run_post(&backend);
     assert!(result.is_ok(), "FIPS POST should pass: {:?}", result.err());
 }
 

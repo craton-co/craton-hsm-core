@@ -368,9 +368,9 @@ above shows.
 Note that before the power-on self-test was made capability-aware, an AWS-LC
 release build failed `C_Initialize` for the same reason the RustCrypto one did —
 the POST's RSA known-answer test called the RustCrypto signing path regardless of
-the configured backend. The POST still exercises RustCrypto rather than the
-selected backend; that is pre-existing and worth revisiting, since it means the
-KATs do not cover the primitives an AWS-LC deployment actually uses.
+the configured backend. The POST now runs its algorithm KATs against the
+configured backend, so an AWS-LC deployment self-tests AWS-LC; it previously
+tested RustCrypto regardless of what the module was about to use.
 
 Multi-part RSA on this backend has its own scope caveat — signing works and runs
 on AWS-LC, but through an API outside its FIPS-approved set, and verification
