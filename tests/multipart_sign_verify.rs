@@ -516,7 +516,7 @@ fn test_multipart_sign_verify() {
     // ========================================================================
     println!("Test 11: RSA SHA-256 single-byte chunks");
     let short_msg = b"Hi!";
-    let byte_chunks: Vec<&[u8]> = short_msg.iter().map(|b| std::slice::from_ref(b)).collect();
+    let byte_chunks: Vec<&[u8]> = short_msg.iter().map(std::slice::from_ref).collect();
     let sig = multi_part_sign(session, CKM_SHA256_RSA_PKCS, rsa_priv, &byte_chunks);
     let rv = single_shot_verify(session, CKM_SHA256_RSA_PKCS, rsa_pub, short_msg, &sig);
     assert_eq!(rv, CKR_OK, "Single-byte chunks sign/verify failed");
@@ -624,7 +624,7 @@ fn test_multipart_sign_verify() {
     // ========================================================================
     println!("Test 20: RSA SHA-256 many small updates (100 chunks)");
     let many_msg: Vec<u8> = (0..100u8).collect();
-    let many_chunks: Vec<&[u8]> = many_msg.iter().map(|b| std::slice::from_ref(b)).collect();
+    let many_chunks: Vec<&[u8]> = many_msg.iter().map(std::slice::from_ref).collect();
     let sig = multi_part_sign(session, CKM_SHA256_RSA_PKCS, rsa_priv, &many_chunks);
     let rv = single_shot_verify(session, CKM_SHA256_RSA_PKCS, rsa_pub, &many_msg, &sig);
     assert_eq!(rv, CKR_OK, "Many small updates sign/verify failed");

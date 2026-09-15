@@ -76,6 +76,12 @@ pub struct ConditionalSelfTest {
     error_state: AtomicBool,
 }
 
+impl Default for ConditionalSelfTest {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ConditionalSelfTest {
     /// Create a new CST tracker with no algorithms tested.
     pub fn new() -> Self {

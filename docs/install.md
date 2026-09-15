@@ -170,7 +170,7 @@ kubectl logs deploy/my-hsm-craton_hsm
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `image.repository` | `craton_hsm` | Container image |
-| `image.tag` | `0.9.1` | Image tag |
+| `image.tag` | `0.10.0` | Image tag |
 | `daemon.bind` | `0.0.0.0:5696` | gRPC listen address |
 | `daemon.replicas` | `1` | Replica count |
 | `tls.enabled` | `false` | Enable TLS |

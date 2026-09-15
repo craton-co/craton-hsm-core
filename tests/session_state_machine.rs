@@ -6,7 +6,6 @@
 
 use craton_hsm::error::HsmError;
 use craton_hsm::pkcs11_abi::constants::*;
-use craton_hsm::pkcs11_abi::types::*;
 use craton_hsm::session::manager::SessionManager;
 use craton_hsm::session::session::{ActiveOperation, FindContext, Session, SessionState};
 use craton_hsm::token::token::{LoginState, Token};
@@ -692,6 +691,7 @@ fn test_pin_lockout_concurrent_attempts() {
     //   wave 0: 100ms, wave 1: 200ms, wave 2: 400ms, wave 3: 800ms,
     //   wave 4: 1600ms, wave 5 (final): capped 5000ms.
     let backoff_ms = [200, 300, 500, 1000, 2000];
+    #[allow(clippy::needless_range_loop)]
     for wave in 0..6 {
         let token = Arc::clone(&token);
         let h = std::thread::spawn(move || {

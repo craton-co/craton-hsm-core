@@ -15,10 +15,6 @@ use std::ptr;
 
 mod common;
 
-fn ck_ulong_bytes(val: CK_ULONG) -> Vec<u8> {
-    val.to_ne_bytes().to_vec()
-}
-
 /// Create a FIPS config file and set CRATON_HSM_CONFIG before C_Initialize.
 ///
 /// SAFETY: `std::env::set_var` is unsound in multi-threaded processes

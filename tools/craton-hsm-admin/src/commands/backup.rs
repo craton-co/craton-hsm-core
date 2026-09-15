@@ -92,6 +92,7 @@ fn prompt_passphrase(confirm: bool) -> Result<Zeroizing<String>, Box<dyn std::er
 }
 
 /// Set restrictive file permissions (owner-only read/write).
+#[allow(dead_code)]
 #[cfg(unix)]
 fn set_restrictive_permissions(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     use std::os::unix::fs::PermissionsExt;
@@ -101,6 +102,7 @@ fn set_restrictive_permissions(path: &str) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
+#[allow(dead_code)]
 #[cfg(not(unix))]
 fn set_restrictive_permissions(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     // On Windows, use icacls to strip inherited ACEs and grant access only to

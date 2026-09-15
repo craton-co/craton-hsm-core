@@ -411,11 +411,11 @@ fn test_concurrent_find_objects_while_creating() {
 
     // Writer threads: create objects
     let mut writer_handles = Vec::new();
-    for tid in 0..num_writers {
+    for _tid in 0..num_writers {
         let barrier = barrier.clone();
         let h = std::thread::spawn(move || {
             barrier.wait();
-            for i in 0..3 {
+            for _ in 0..3 {
                 let value_len_bytes = ck_ulong_bytes(32);
                 let ck_true: CK_BBOOL = CK_TRUE;
                 let mut mechanism = CK_MECHANISM {

@@ -68,7 +68,7 @@ pub fn change(config_path: &str, user_type: &str) -> CliResult {
         const MAX_ATTEMPTS: u32 = 3;
         let mut authenticated_pin = None;
         for attempt in 1..=MAX_ATTEMPTS {
-            let pin = Zeroizing::new(rpassword::prompt_password(&format!(
+            let pin = Zeroizing::new(rpassword::prompt_password(format!(
                 "Enter current {} PIN: ",
                 user_type.to_uppercase()
             ))?);
@@ -99,7 +99,7 @@ pub fn change(config_path: &str, user_type: &str) -> CliResult {
     };
 
     // Prompt for new PIN (zeroized on drop)
-    let new_pin = Zeroizing::new(rpassword::prompt_password(&format!(
+    let new_pin = Zeroizing::new(rpassword::prompt_password(format!(
         "Enter new {} PIN: ",
         user_type.to_uppercase()
     ))?);

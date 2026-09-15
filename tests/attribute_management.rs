@@ -745,7 +745,7 @@ fn test_find_and_get_combined_workflow() {
     let (session, _guard) = setup_user_session();
     let label = b"workflow_test";
     let id = b"\x11\x22\x33";
-    let key = generate_aes_key_with_id(session, label, id);
+    let _key = generate_aes_key_with_id(session, label, id);
 
     // Find by label
     let mut find_template = [CK_ATTRIBUTE {

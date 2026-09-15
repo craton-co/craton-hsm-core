@@ -45,7 +45,7 @@ Audit log export (JSON, NDJSON, syslog RFC 5424), audit chain verification, admi
 
 - **126/130 tasks complete** (2 interop tests deferred, 2 Phase 2/3 items deferred)
 - **717+ tests** passing
-- **v0.9.1** released
+- **v0.10.0** released
 
 ## Future Directions
 

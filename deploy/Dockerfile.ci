@@ -31,8 +31,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Stable components
 RUN rustup component add rustfmt clippy
 
-# Nightly + Miri
-RUN rustup toolchain install nightly --component miri
+# Nightly + Miri + rust-src
+RUN rustup toolchain install nightly --component miri,rust-src
 
 # 3. Install Cargo tools
 # We use cargo-binstall or manual downloads where possible to skip compilation time.

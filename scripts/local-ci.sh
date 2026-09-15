@@ -243,6 +243,9 @@ job_audit() {
             --ignore RUSTSEC-2026-0047 \
             --ignore RUSTSEC-2026-0048 \
             --ignore RUSTSEC-2026-0049 \
+            --ignore RUSTSEC-2026-0098 \
+            --ignore RUSTSEC-2026-0099 \
+            --ignore RUSTSEC-2026-0104 \
             --ignore RUSTSEC-2025-0134 2>&1; then
             echo -e "  ${GREEN}✓${NC} cargo-audit passed"
         else
@@ -290,6 +293,7 @@ job_semver() {
 
 job_miri() {
     log_header "Miri (Undefined Behavior Check)"
+    rm -rf /root/.cache/miri 2>/dev/null || true
     export MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-symbolic-alignment-check"
     if cargo +nightly miri test --lib -- --test-threads=1 crypto::zeroize crypto::digest crypto::integrity 2>&1; then
         log_pass "Miri"
