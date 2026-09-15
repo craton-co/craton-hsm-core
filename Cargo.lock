@@ -604,7 +604,7 @@ dependencies = [
 
 [[package]]
 name = "craton-hsm-admin"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "clap",
  "comfy-table",
@@ -626,7 +626,7 @@ dependencies = [
 
 [[package]]
 name = "craton-hsm-daemon"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "async-stream",

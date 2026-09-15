@@ -1,6 +1,6 @@
 [package]
 name = "craton-hsm-daemon"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 description = "Craton HSM network daemon — gRPC over TLS for remote HSM access"
 license = "Apache-2.0"
