@@ -456,7 +456,7 @@ fn test_derive_with_aes_key_fails() {
     assert_eq!(rv, CKR_OK);
 
     // Try ECDH derive with AES key
-    let fake_point = vec![0u8; 65]; // random bytes
+    let fake_point = [0u8; 65]; // random bytes
     let mut mechanism = CK_MECHANISM {
         mechanism: CKM_ECDH1_DERIVE,
         p_parameter: fake_point.as_ptr() as CK_VOID_PTR,
@@ -567,7 +567,7 @@ fn test_derive_without_login() {
     );
     // Don't login
 
-    let fake_point = vec![0u8; 65];
+    let fake_point = [0u8; 65];
     let mut mechanism = CK_MECHANISM {
         mechanism: CKM_ECDH1_DERIVE,
         p_parameter: fake_point.as_ptr() as CK_VOID_PTR,

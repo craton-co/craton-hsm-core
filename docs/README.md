@@ -37,6 +37,7 @@
 ## Operations & Release
 
 - [Operator Runbook](operator-runbook.md) — day-to-day operations
+- [Publishing Guide](publishing-guide.md) — step-by-step instructions for publishing releases to crates.io
 - [Troubleshooting](troubleshooting.md) — common errors, build issues, runtime problems
 - [Release Signing](release-signing.md) — GPG, cosign, Authenticode binary verification
 - [Future Work Guide](future-work-guide.md) — PQC upgrades, rand_core unification, FIPS certification, clustering, KMIP

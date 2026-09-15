@@ -225,7 +225,7 @@ impl MetricsCollector {
                 let failed = m.failed_ops.load(Ordering::Relaxed);
                 let total_lat = m.total_latency_us.load(Ordering::Relaxed);
                 let max_lat = m.max_latency_us.load(Ordering::Relaxed);
-                let avg = if total > 0 { total_lat / total } else { 0 };
+                let avg = total_lat.checked_div(total).unwrap_or(0);
                 OperationSnapshot {
                     name: op.name(),
                     total,

@@ -257,7 +257,6 @@ fn test_full_pkcs11_lifecycle() {
         parameter_len: 0,
     };
     let modulus_bits_bytes = ck_ulong_bytes(2048);
-    let pub_exp_bytes: Vec<u8> = vec![0x01, 0x00, 0x01]; // 65537
     let sign_true: CK_BBOOL = CK_TRUE;
     let verify_true: CK_BBOOL = CK_TRUE;
 

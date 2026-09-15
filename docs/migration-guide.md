@@ -1,6 +1,19 @@
 # Migration Guide
 
-## Migrating to the current development version
+## Migrating from 0.9.x to 0.10.0
+
+### Breaking Changes Summary
+
+| Area | Change | Impact / Migration Action |
+|------|--------|---------------------------|
+| **Rust API** | `AuditEvent` added `format_version: u32` | Update struct literals to include `format_version: AUDIT_LOG_FORMAT_VERSION`. |
+| **Rust API** | `aes_ctr_crypt` feature-gated | Gated behind `legacy-insecure-ctr`. Migrate to `aes_ctr_encrypt`/`aes_ctr_decrypt`. |
+| **Daemon** | mTLS required for non-loopback binds | Provide `tls_client_ca` or explicitly set `allow_unauthenticated_tls = true`. |
+| **Storage** | Bounded binary codec (`RHSO\x01`) | Secret object store moved from JSON to binary serialization. |
+| **Backup** | Backup format upgraded to v2 | `BACKUP_VERSION = 2` uses binary payloads. Create fresh backups post-upgrade. |
+| **Audit Log** | Canonical binary chain hashing (`format_version: 1`) | Mixed v0/v1 logs verify on 0.10.0; downgrading to 0.9.x requires log rotation. |
+| **PKCS#11** | `CKM_RSA_PKCS` unadvertised | Use prefixed mechanisms such as `CKM_SHA256_RSA_PKCS`. |
+| **Crypto** | RustCrypto RSA private operations refused in release | Build with `--no-default-features --features awslc-backend` for RSA private ops. |
 
 ### Audit log format
 
@@ -15,6 +28,16 @@ in-place upgrade produces — verifies end to end.
 **Downgrading does not work.** Older builds verify every entry as version 0, so
 they will read a version 1 entry, compute the wrong hash, and report the chain as
 tampered. Rotate the audit log before downgrading and archive the version 1 file.
+
+### Daemon mTLS enforcement
+
+When running `craton-hsm-daemon` with TLS on non-loopback TCP interfaces (e.g. `0.0.0.0:5696`),
+the daemon now requires `tls_client_ca` for mutual authentication. If client verification
+is not configured, the daemon will terminate at startup.
+
+To migrate:
+1. Configure `tls_client_ca` in the `[daemon]` section with your client CA certificate.
+2. Or, if protected by an external network security layer, explicitly set `allow_unauthenticated_tls = true`.
 
 ### RSA availability
 
@@ -31,6 +54,9 @@ awslc-backend`. See
 `AuditEvent` gained a public `format_version: u32` field. Code that constructs an
 `AuditEvent` with a struct literal must add it; set it to
 `AUDIT_LOG_FORMAT_VERSION` for new events. PKCS#11 ABI consumers are unaffected.
+
+The legacy `aes_ctr_crypt` function is now gated behind the `legacy-insecure-ctr` feature
+flag. Update code to use `aes_ctr_encrypt` / `aes_ctr_decrypt`.
 
 ---
 

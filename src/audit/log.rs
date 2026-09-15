@@ -64,17 +64,17 @@ type HmacSha256 = Hmac<Sha256>;
 /// audit trail written by an older build keeps verifying after an upgrade.
 ///
 /// - `0`: legacy chain — `SHA-256(previous_hash || serde_json(payload))`.
-///        Accepted for verification of pre-existing logs; never written.
+///   Accepted for verification of pre-existing logs; never written.
 /// - `1`: current chain — `SHA-256(previous_hash || canonical(payload))`,
-///        where `canonical` is the fixed-width binary encoding implemented by
-///        [`encode_payload_v1`]. The JSON payload encoding it replaces cost
-///        ~2.2 us per event to produce and inflated the hashed input from
-///        ~40 to ~148 bytes; the binary encoding roughly halves the audit
-///        worker's per-event CPU.
+///   where `canonical` is the fixed-width binary encoding implemented by
+///   [`encode_payload_v1`]. The JSON payload encoding it replaces cost
+///   ~2.2 us per event to produce and inflated the hashed input from
+///   ~40 to ~148 bytes; the binary encoding roughly halves the audit
+///   worker's per-event CPU.
 /// - `2`: RESERVED for the in-flight HMAC-SHA-256 chain migration (see the
-///        module-level `security/hmac-audit-chain` notes). That migration
-///        should MAC over the same [`encode_payload_v1`] canonical bytes
-///        rather than over JSON.
+///   module-level `security/hmac-audit-chain` notes). That migration
+///   should MAC over the same [`encode_payload_v1`] canonical bytes
+///   rather than over JSON.
 ///
 /// Records are always written at [`AUDIT_LOG_FORMAT_VERSION`]; the verifier
 /// dispatches on each record's own `format_version` so mixed-version files

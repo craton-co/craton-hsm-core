@@ -13,6 +13,7 @@ pub fn print_table(rows: &[(&str, String)]) {
 }
 
 /// Wrapper for JSON-or-table output.
+#[allow(dead_code)]
 pub fn print_json_or_table(json: bool, json_value: &serde_json::Value, rows: &[(&str, String)]) {
     if json {
         println!("{}", serde_json::to_string_pretty(json_value).unwrap());
@@ -22,6 +23,7 @@ pub fn print_json_or_table(json: bool, json_value: &serde_json::Value, rows: &[(
 }
 
 /// Format a byte slice as hex string.
+#[allow(dead_code)]
 pub fn hex_string(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }

@@ -3,7 +3,7 @@ members = ["tools/craton-hsm-admin", "tools/pkcs11-spy", "craton-hsm-daemon"]
 
 [package]
 name = "craton-hsm"
-version = "0.9.3"
+version = "0.10.0"
 edition = "2021"
 description = "A production-grade PKCS#11 v3.0-compliant Software HSM written in Rust"
 license = "Apache-2.0"
@@ -11,7 +11,7 @@ repository = "https://github.com/craton-co/craton-hsm-core"
 homepage = "https://github.com/craton-co/craton-hsm-core"
 keywords = ["pkcs11", "hsm", "cryptography", "security", "fips"]
 categories = ["cryptography", "api-bindings"]
-rust-version = "1.75"
+rust-version = "1.80"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -126,6 +126,9 @@ harness = false
 [[bench]]
 name = "pkcs11_abi_bench"
 harness = false
+
+[profile.dev.package."*"]
+opt-level = 2
 
 [profile.release]
 lto = true

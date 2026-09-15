@@ -306,7 +306,7 @@ fn test_set_operation_state_invalid_blob() {
     );
 
     // Invalid operation type byte
-    let mut bad_blob2 = vec![0u8; 20];
+    let mut bad_blob2 = [0u8; 20];
     bad_blob2[0] = 255; // invalid op type
     let rv = C_SetOperationState(
         session,

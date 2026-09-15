@@ -291,9 +291,9 @@ journalctl -u craton_hsm -f
 ### Deploy
 
 ```bash
-helm install my-hsm deploy/helm/craton_hsm/ \
+helm install my-hsm deploy/helm/craton-hsm/ \
   --set image.repository=registry.example.com/craton_hsm \
-  --set image.tag=0.9.1 \
+  --set image.tag=0.10.0 \
   --set tls.enabled=true \
   --set tls.secretName=craton_hsm-tls
 ```
@@ -311,8 +311,8 @@ kubectl get pods -l app=craton_hsm
 ### Upgrade
 
 ```bash
-helm upgrade my-hsm deploy/helm/craton_hsm/ \
-  --set image.tag=0.9.1
+helm upgrade my-hsm deploy/helm/craton-hsm/ \
+  --set image.tag=0.10.0
 ```
 
 ## Troubleshooting

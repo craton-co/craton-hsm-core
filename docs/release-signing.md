@@ -60,9 +60,9 @@ Every release should include a `SHA256SUMS` file:
 
 ```
 # SHA256SUMS
-a1b2c3d4...  libcraton_hsm-0.9.0-x86_64-unknown-linux-gnu.so
-e5f6a7b8...  craton_hsm-0.9.0-x86_64-pc-windows-msvc.dll
-c9d0e1f2...  libcraton_hsm-0.9.0-aarch64-apple-darwin.dylib
+a1b2c3d4...  libcraton_hsm-0.10.0-x86_64-unknown-linux-gnu.so
+e5f6a7b8...  craton_hsm-0.10.0-x86_64-pc-windows-msvc.dll
+c9d0e1f2...  libcraton_hsm-0.10.0-aarch64-apple-darwin.dylib
 ```
 
 ## CI/CD Integration
@@ -123,8 +123,8 @@ Users should verify the library before loading it with `dlopen` / `LoadLibrary`:
 
 ```bash
 # 1. Download the library and signature bundle
-wget https://github.com/craton-co/craton-hsm-core/releases/download/v0.9.0/libcraton_hsm.so
-wget https://github.com/craton-co/craton-hsm-core/releases/download/v0.9.0/libcraton_hsm.so.bundle
+wget https://github.com/craton-co/craton-hsm-core/releases/download/v0.10.0/libcraton_hsm.so
+wget https://github.com/craton-co/craton-hsm-core/releases/download/v0.10.0/libcraton_hsm.so.bundle
 
 # 2. Verify signature
 cosign verify-blob --bundle libcraton_hsm.so.bundle \

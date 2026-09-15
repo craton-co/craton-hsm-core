@@ -38,7 +38,7 @@ fn authenticate_user(hsm: &HsmCore) -> CliResult {
     let role_name = if ck_user == CKU_SO { "SO" } else { "User" };
 
     for attempt in 1..=MAX_AUTH_ATTEMPTS {
-        let pin = Zeroizing::new(rpassword::prompt_password(&format!(
+        let pin = Zeroizing::new(rpassword::prompt_password(format!(
             "Enter {} PIN: ",
             role_name
         ))?);

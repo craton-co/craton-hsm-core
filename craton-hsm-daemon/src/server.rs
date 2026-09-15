@@ -989,6 +989,7 @@ impl HsmService for HsmServiceImpl {
             match mech_type {
                 CKM_RSA_PKCS_KEY_PAIR_GEN => {
                     // Parse CKA_MODULUS_BITS from public template
+                    #[allow(clippy::unnecessary_cast)]
                     let modulus_bits = pub_template
                         .iter()
                         .find(|(t, _)| *t == CKA_MODULUS_BITS)
@@ -1130,7 +1131,7 @@ impl HsmService for HsmServiceImpl {
                 req.session_handle,
                 AuditOperation::GenerateKeyPair {
                     mechanism: mech_type as u64,
-                    key_length: key_length,
+                    key_length,
                     fips_approved,
                 },
                 AuditResult::Success,

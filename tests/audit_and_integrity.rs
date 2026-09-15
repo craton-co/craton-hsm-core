@@ -232,7 +232,8 @@ fn test_audit_log_with_key_id() {
         },
         AuditResult::Success,
         Some("my-aes-key-id-123".to_string()),
-    );
+    )
+    .unwrap();
     log.flush().unwrap();
     assert_eq!(log.entry_count(), 1);
 }
@@ -360,13 +361,15 @@ fn test_audit_log_export_syslog() {
         },
         AuditResult::Success,
         Some("key-123".to_string()),
-    );
+    )
+    .unwrap();
     log.record(
         42,
         AuditOperation::Login { user_type: 1 },
         AuditResult::Failure(0xA0),
         None,
-    );
+    )
+    .unwrap();
     log.flush().unwrap();
     let syslog = log.export_syslog();
     assert_eq!(syslog.len(), 2);
@@ -407,7 +410,8 @@ fn test_audit_log_verify_chain_valid() {
         },
         AuditResult::Success,
         Some("k1".into()),
-    );
+    )
+    .unwrap();
     log.flush().unwrap();
     assert_eq!(log.verify_chain(), Ok(3));
 }

@@ -1493,12 +1493,24 @@ mod tests {
         (0xC0DE_0000 | n, 0xBEEF_0000 | n)
     }
 
-    /// Generate a fresh 2048-bit RSA keypair as (priv_der, modulus, pub_exp).
+    /// Generate a 2048-bit RSA keypair as (priv_der, modulus, pub_exp).
+    ///
+    /// The keypair is generated once and cached across unit tests to avoid
+    /// running expensive prime generation repeatedly in debug mode.
+    /// Test isolation is maintained via `unique_ids()` for slot and handle IDs.
     fn fresh_rsa_keypair() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-        let (priv_der, modulus, pub_exp) =
-            crate::crypto::keygen::generate_rsa_key_pair(2048, false).unwrap();
-        (priv_der.as_bytes().to_vec(), modulus, pub_exp)
+        static KEYPAIR: std::sync::OnceLock<(Vec<u8>, Vec<u8>, Vec<u8>)> =
+            std::sync::OnceLock::new();
+        KEYPAIR
+            .get_or_init(|| {
+                let (priv_der, modulus, pub_exp) =
+                    crate::crypto::keygen::generate_rsa_key_pair(2048, false).unwrap();
+                (priv_der.as_bytes().to_vec(), modulus, pub_exp)
+            })
+            .clone()
     }
+
+    static CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     #[cfg_attr(
@@ -1508,6 +1520,7 @@ mod tests {
                   --features insecure-rustcrypto-rsa-private-ops"
     )]
     fn rsa_pkcs1v15_verify_cached_populates_pub_cache() {
+        let _lock = CACHE_TEST_LOCK.lock().unwrap();
         let (slot, handle) = unique_ids();
         let (priv_der, modulus, pub_exp) = fresh_rsa_keypair();
         let msg = b"verify hot path";
@@ -1561,6 +1574,7 @@ mod tests {
                   --features insecure-rustcrypto-rsa-private-ops"
     )]
     fn evict_cached_keys_removes_entries() {
+        let _lock = CACHE_TEST_LOCK.lock().unwrap();
         let (slot, handle) = unique_ids();
         let (der, _, _) = fresh_rsa_keypair();
         let _ = rsa_pkcs1v15_sign_cached(slot, handle, &der, b"x", Some(HashAlg::Sha256)).unwrap();
@@ -1581,6 +1595,7 @@ mod tests {
                   --features insecure-rustcrypto-rsa-private-ops"
     )]
     fn rsa_oaep_decrypt_cached_uses_handle_cache() {
+        let _lock = CACHE_TEST_LOCK.lock().unwrap();
         let (slot, handle) = unique_ids();
         let (priv_der, modulus, pub_exp) = fresh_rsa_keypair();
         let ct =
@@ -1619,6 +1634,7 @@ mod tests {
                   --features insecure-rustcrypto-rsa-private-ops"
     )]
     fn rsa_pss_verify_cached_populates_pub_cache() {
+        let _lock = CACHE_TEST_LOCK.lock().unwrap();
         let (slot, handle) = unique_ids();
         let (priv_der, modulus, pub_exp) = fresh_rsa_keypair();
         let msg = b"pss verify path";
@@ -1645,6 +1661,7 @@ mod tests {
                   --features insecure-rustcrypto-rsa-private-ops"
     )]
     fn rsa_oaep_encrypt_cached_populates_pub_cache_and_round_trips() {
+        let _lock = CACHE_TEST_LOCK.lock().unwrap();
         let (slot, handle) = unique_ids();
         let (priv_der, modulus, pub_exp) = fresh_rsa_keypair();
 
@@ -1672,6 +1689,7 @@ mod tests {
                   --features insecure-rustcrypto-rsa-private-ops"
     )]
     fn evict_cached_keys_clears_public_entry() {
+        let _lock = CACHE_TEST_LOCK.lock().unwrap();
         let (slot, handle) = unique_ids();
         let (priv_der, modulus, pub_exp) = fresh_rsa_keypair();
         let msg = b"x";
@@ -1703,6 +1721,7 @@ mod tests {
                   --features insecure-rustcrypto-rsa-private-ops"
     )]
     fn clear_for_slot_drops_only_targeted_slot() {
+        let _lock = CACHE_TEST_LOCK.lock().unwrap();
         // Populate two distinct slots in both caches; make sure clearing one
         // leaves the other untouched.
         let (slot_a, handle_a) = unique_ids();
@@ -1758,6 +1777,7 @@ mod tests {
                   --features insecure-rustcrypto-rsa-private-ops"
     )]
     fn clear_all_drops_every_entry() {
+        let _lock = CACHE_TEST_LOCK.lock().unwrap();
         // Seed both caches across two slots, then assert clear_all wipes them.
         let (slot_a, handle_a) = unique_ids();
         let (slot_b, handle_b) = unique_ids();

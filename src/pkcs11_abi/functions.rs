@@ -394,7 +394,10 @@ pub extern "C" fn C_GetInfo(p_info: CK_INFO_PTR) -> CK_RV {
             manufacturer_id: [b' '; 32],
             flags: 0,
             library_description: [b' '; 32],
-            library_version: CK_VERSION { major: 0, minor: 1 },
+            library_version: CK_VERSION {
+                major: 0,
+                minor: 10,
+            },
         };
         pad_string(&mut info.manufacturer_id, "Craton HSM Project");
         pad_string(&mut info.library_description, "Craton HSM Software HSM");
@@ -493,7 +496,10 @@ pub extern "C" fn C_GetSlotInfo(slot_id: CK_SLOT_ID, p_info: CK_SLOT_INFO_PTR) -
             manufacturer_id: [b' '; 32],
             flags: CKF_SLOT_TOKEN_PRESENT,
             hardware_version: CK_VERSION { major: 0, minor: 1 },
-            firmware_version: CK_VERSION { major: 0, minor: 1 },
+            firmware_version: CK_VERSION {
+                major: 0,
+                minor: 10,
+            },
         };
         pad_string(&mut info.slot_description, "Craton HSM Virtual Slot");
         pad_string(&mut info.manufacturer_id, "Craton HSM Project");
@@ -539,7 +545,10 @@ pub extern "C" fn C_GetTokenInfo(slot_id: CK_SLOT_ID, p_info: CK_TOKEN_INFO_PTR)
             total_private_memory: CK_UNAVAILABLE_INFORMATION,
             free_private_memory: CK_UNAVAILABLE_INFORMATION,
             hardware_version: CK_VERSION { major: 0, minor: 1 },
-            firmware_version: CK_VERSION { major: 0, minor: 1 },
+            firmware_version: CK_VERSION {
+                major: 0,
+                minor: 10,
+            },
             utc_time: [b' '; 16],
         };
         pad_string(&mut info.manufacturer_id, "Craton HSM Project");
@@ -1523,9 +1532,7 @@ pub extern "C" fn C_FindObjects(
         // ≤ caller's buffer (PKCS#11 contract) and ≤ MAX_FIND_OBJECTS_PER_CALL.
         let out = unsafe { slice::from_raw_parts_mut(ph_object, to_return) };
 
-        for i in 0..to_return {
-            out[i] = ctx.results[ctx.position + i];
-        }
+        out.copy_from_slice(&ctx.results[ctx.position..ctx.position + to_return]);
         ctx.position += to_return;
 
         unsafe {
@@ -1635,17 +1642,15 @@ pub extern "C" fn C_EncryptInit(
         // Note: AES-GCM nonces are generated internally by the backend (not
         // caller-supplied), so no zero-check is needed for GCM.
         match mechanism {
-            CKM_AES_CBC | CKM_AES_CBC_PAD => {
-                if mech_param.len() == 16 && mech_param.iter().all(|&b| b == 0) {
-                    tracing::error!("C_EncryptInit: all-zero IV rejected for AES-CBC");
-                    return CKR_MECHANISM_PARAM_INVALID;
-                }
+            CKM_AES_CBC | CKM_AES_CBC_PAD
+                if mech_param.len() == 16 && mech_param.iter().all(|&b| b == 0) =>
+            {
+                tracing::error!("C_EncryptInit: all-zero IV rejected for AES-CBC");
+                return CKR_MECHANISM_PARAM_INVALID;
             }
-            CKM_AES_CTR => {
-                if mech_param.len() >= 16 && mech_param[..16].iter().all(|&b| b == 0) {
-                    tracing::error!("C_EncryptInit: all-zero IV rejected for AES-CTR");
-                    return CKR_MECHANISM_PARAM_INVALID;
-                }
+            CKM_AES_CTR if mech_param.len() >= 16 && mech_param[..16].iter().all(|&b| b == 0) => {
+                tracing::error!("C_EncryptInit: all-zero IV rejected for AES-CTR");
+                return CKR_MECHANISM_PARAM_INVALID;
             }
             _ => {}
         }

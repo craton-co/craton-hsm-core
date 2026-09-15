@@ -654,7 +654,7 @@ fn test_digest_single_byte_updates() {
     let data: [u8; 10] = [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09];
 
     // Multi-part: one byte at a time
-    let chunks: Vec<&[u8]> = data.iter().map(|b| std::slice::from_ref(b)).collect();
+    let chunks: Vec<&[u8]> = data.iter().map(std::slice::from_ref).collect();
     let digest_mp = digest_multi_part(session, CKM_SHA256, &chunks);
 
     // Single-part: all 10 bytes at once

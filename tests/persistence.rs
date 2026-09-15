@@ -229,9 +229,8 @@ fn test_wrong_pin_cannot_load_objects() {
         // load_from_store should fail or return 0 (decrypt fails)
         let result = obj_store.load_from_store();
         // The decryption with wrong key should either error or skip the object
-        match result {
-            Ok(count) => assert_eq!(count, 0, "Wrong PIN should not load any objects"),
-            Err(_) => {} // Also acceptable - decrypt failure
+        if let Ok(count) = result {
+            assert_eq!(count, 0, "Wrong PIN should not load any objects");
         }
     }
 }

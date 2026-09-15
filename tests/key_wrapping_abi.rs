@@ -648,7 +648,7 @@ fn test_unwrap_invalid_data() {
         build_unwrap_template(&class, &key_type, &value_len, &ck_true, &ck_true);
 
     // Garbage data that is the correct length (40 bytes for a 32-byte key)
-    let garbage = vec![0xDE_u8; 40];
+    let garbage = [0xDE_u8; 40];
     let mut new_key: CK_OBJECT_HANDLE = 0;
     let rv = C_UnwrapKey(
         session,
