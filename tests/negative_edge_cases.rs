@@ -1279,7 +1279,10 @@ fn test_ec_p256_keygen_sign_verify() {
         &mut sig_len,
     );
     assert_eq!(rv, CKR_OK, "P-256 sign failed: 0x{:08X}", rv);
-    assert!(sig_len > 0);
+    assert_eq!(
+        sig_len, 64,
+        "P-256 ECDSA signature must be 64 bytes (raw r || s)"
+    );
 
     // Verify
     let rv = C_VerifyInit(session, &mut mechanism, pub_key);
@@ -1325,7 +1328,10 @@ fn test_ec_p384_keygen_sign_verify() {
         &mut sig_len,
     );
     assert_eq!(rv, CKR_OK, "P-384 sign failed: 0x{:08X}", rv);
-    assert!(sig_len > 0);
+    assert_eq!(
+        sig_len, 96,
+        "P-384 ECDSA signature must be 96 bytes (raw r || s)"
+    );
 
     // Verify
     let rv = C_VerifyInit(session, &mut mechanism, pub_key);

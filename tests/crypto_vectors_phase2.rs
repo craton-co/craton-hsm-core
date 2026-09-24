@@ -13,7 +13,11 @@ fn test_ecdsa_p256_sign_verify() {
     let message = b"ECDSA P-256 test message";
 
     let signature = sign::ecdsa_p256_sign(priv_key.as_bytes(), message).unwrap();
-    assert!(!signature.is_empty());
+    assert_eq!(
+        signature.len(),
+        64,
+        "P-256 ECDSA signature must be 64 bytes (raw r || s)"
+    );
 
     let valid = sign::ecdsa_p256_verify(&pub_key, message, &signature).unwrap();
     assert!(valid, "P-256 signature should verify");
@@ -49,7 +53,11 @@ fn test_ecdsa_p384_sign_verify() {
     let message = b"ECDSA P-384 test message";
 
     let signature = sign::ecdsa_p384_sign(priv_key.as_bytes(), message).unwrap();
-    assert!(!signature.is_empty());
+    assert_eq!(
+        signature.len(),
+        96,
+        "P-384 ECDSA signature must be 96 bytes (raw r || s)"
+    );
 
     let valid = sign::ecdsa_p384_verify(&pub_key, message, &signature).unwrap();
     assert!(valid, "P-384 signature should verify");

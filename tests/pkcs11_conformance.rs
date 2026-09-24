@@ -1029,6 +1029,10 @@ fn test_ec_p256_keygen_sign_verify_via_abi() {
         &mut sig_len,
     );
     assert_eq!(rv, CKR_OK);
+    assert_eq!(
+        sig_len, 64,
+        "P-256 ECDSA signature must be exactly 64 bytes (raw r || s)"
+    );
     signature.truncate(sig_len as usize);
 
     // Verify

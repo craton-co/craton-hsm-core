@@ -159,7 +159,9 @@ impl CryptoBackend for AwsLcBackend {
     fn ecdsa_p256_sign(&self, private_key_bytes: &[u8], data: &[u8]) -> HsmResult<Vec<u8>> {
         let pub_key = derive_ec_public_key(private_key_bytes, &agreement::ECDH_P256)?;
         let key_pair = EcdsaKeyPair::from_private_key_and_public_key(
-            &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+            // PKCS#11 §2.3.1: ECDSA signature format is raw r || s (fixed-size, no ASN.1 DER).
+            // Use FIXED_SIGNING so aws-lc-rs emits 64-byte r || s directly.
+            &signature::ECDSA_P256_SHA256_FIXED_SIGNING,
             private_key_bytes,
             &pub_key,
         )
@@ -176,17 +178,21 @@ impl CryptoBackend for AwsLcBackend {
         &self,
         public_key_sec1: &[u8],
         data: &[u8],
-        signature_der: &[u8],
+        signature: &[u8],
     ) -> HsmResult<bool> {
+        // PKCS#11 §2.3.1: ECDSA signature format is raw r || s (fixed-size, no ASN.1 DER).
+        // Use FIXED so aws-lc-rs accepts 64-byte r || s directly.
         let pub_key =
-            signature::UnparsedPublicKey::new(&signature::ECDSA_P256_SHA256_ASN1, public_key_sec1);
-        Ok(pub_key.verify(data, signature_der).is_ok())
+            signature::UnparsedPublicKey::new(&signature::ECDSA_P256_SHA256_FIXED, public_key_sec1);
+        Ok(pub_key.verify(data, signature).is_ok())
     }
 
     fn ecdsa_p384_sign(&self, private_key_bytes: &[u8], data: &[u8]) -> HsmResult<Vec<u8>> {
         let pub_key = derive_ec_public_key(private_key_bytes, &agreement::ECDH_P384)?;
         let key_pair = EcdsaKeyPair::from_private_key_and_public_key(
-            &signature::ECDSA_P384_SHA384_ASN1_SIGNING,
+            // PKCS#11 §2.3.1: ECDSA signature format is raw r || s (fixed-size, no ASN.1 DER).
+            // Use FIXED_SIGNING so aws-lc-rs emits 96-byte r || s directly.
+            &signature::ECDSA_P384_SHA384_FIXED_SIGNING,
             private_key_bytes,
             &pub_key,
         )
@@ -203,11 +209,13 @@ impl CryptoBackend for AwsLcBackend {
         &self,
         public_key_sec1: &[u8],
         data: &[u8],
-        signature_der: &[u8],
+        signature: &[u8],
     ) -> HsmResult<bool> {
+        // PKCS#11 §2.3.1: ECDSA signature format is raw r || s (fixed-size, no ASN.1 DER).
+        // Use FIXED so aws-lc-rs accepts 96-byte r || s directly.
         let pub_key =
-            signature::UnparsedPublicKey::new(&signature::ECDSA_P384_SHA384_ASN1, public_key_sec1);
-        Ok(pub_key.verify(data, signature_der).is_ok())
+            signature::UnparsedPublicKey::new(&signature::ECDSA_P384_SHA384_FIXED, public_key_sec1);
+        Ok(pub_key.verify(data, signature).is_ok())
     }
 
     fn ed25519_sign(&self, private_key_bytes: &[u8], data: &[u8]) -> HsmResult<Vec<u8>> {
@@ -385,23 +393,30 @@ impl CryptoBackend for AwsLcBackend {
         let signature: p256::ecdsa::Signature = signing_key
             .sign_prehash(digest)
             .map_err(|_| HsmError::GeneralError)?;
-        Ok(signature.to_der().to_bytes().to_vec())
+        // PKCS#11 §2.3.1: ECDSA signature format is raw r || s (fixed-size, no ASN.1 DER).
+        // P-256: 64 bytes (32-byte r + 32-byte s).
+        Ok(signature.to_bytes().to_vec())
     }
 
     fn ecdsa_p256_verify_prehashed(
         &self,
         public_key_sec1: &[u8],
         digest: &[u8],
-        signature_der: &[u8],
+        signature: &[u8],
     ) -> HsmResult<bool> {
         use p256::ecdsa::signature::hazmat::PrehashVerifier;
         use p256::ecdsa::VerifyingKey;
 
+        // PKCS#11 §2.3.1: ECDSA signature format is raw r || s (fixed-size, no ASN.1 DER).
+        // P-256: exactly 64 bytes (32-byte r + 32-byte s).
+        if signature.len() != 64 {
+            return Err(HsmError::SignatureInvalid);
+        }
         let verifying_key = VerifyingKey::from_sec1_bytes(public_key_sec1)
             .map_err(|_| HsmError::KeyHandleInvalid)?;
-        let signature = p256::ecdsa::Signature::from_der(signature_der)
+        let sig = p256::ecdsa::Signature::from_slice(signature)
             .map_err(|_| HsmError::SignatureInvalid)?;
-        Ok(verifying_key.verify_prehash(digest, &signature).is_ok())
+        Ok(verifying_key.verify_prehash(digest, &sig).is_ok())
     }
 
     fn ecdsa_p384_sign_prehashed(
@@ -417,23 +432,30 @@ impl CryptoBackend for AwsLcBackend {
         let signature: p384::ecdsa::Signature = signing_key
             .sign_prehash(digest)
             .map_err(|_| HsmError::GeneralError)?;
-        Ok(signature.to_der().to_bytes().to_vec())
+        // PKCS#11 §2.3.1: ECDSA signature format is raw r || s (fixed-size, no ASN.1 DER).
+        // P-384: 96 bytes (48-byte r + 48-byte s).
+        Ok(signature.to_bytes().to_vec())
     }
 
     fn ecdsa_p384_verify_prehashed(
         &self,
         public_key_sec1: &[u8],
         digest: &[u8],
-        signature_der: &[u8],
+        signature: &[u8],
     ) -> HsmResult<bool> {
         use p384::ecdsa::signature::hazmat::PrehashVerifier;
         use p384::ecdsa::VerifyingKey;
 
+        // PKCS#11 §2.3.1: ECDSA signature format is raw r || s (fixed-size, no ASN.1 DER).
+        // P-384: exactly 96 bytes (48-byte r + 48-byte s).
+        if signature.len() != 96 {
+            return Err(HsmError::SignatureInvalid);
+        }
         let verifying_key = VerifyingKey::from_sec1_bytes(public_key_sec1)
             .map_err(|_| HsmError::KeyHandleInvalid)?;
-        let signature = p384::ecdsa::Signature::from_der(signature_der)
+        let sig = p384::ecdsa::Signature::from_slice(signature)
             .map_err(|_| HsmError::SignatureInvalid)?;
-        Ok(verifying_key.verify_prehash(digest, &signature).is_ok())
+        Ok(verifying_key.verify_prehash(digest, &sig).is_ok())
     }
 
     // ========================================================================

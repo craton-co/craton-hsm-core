@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.10.1] - 2026-09-24
+
+### Fixed
+
+- **PKCS#11 ECDSA signatures returned ASN.1 DER instead of raw `r || s`**:
+  Per PKCS#11 v3.0 §2.3.1, ECDSA mechanisms (`CKM_ECDSA`, `CKM_ECDSA_SHA*`) require
+  the signature to be the raw concatenation of `r` and `s` as fixed-size big-endian integers
+  (e.g., 64 bytes for P-256, 96 bytes for P-384). Previously, ECDSA sign returned ASN.1 DER-encoded
+  signatures (`30 66 02 31 ...`), breaking interoperability with OpenSSL 3 and `pkcs11-provider`.
+  Signing now returns raw `r || s`, and verification accepts raw `r || s` across both RustCrypto
+  and AWS-LC backends (including single-shot and multi-part/prehashed operations).
+
 ## [0.10.0] - 2026-09-15 (Performance & Availability)
 
 ### Fixed

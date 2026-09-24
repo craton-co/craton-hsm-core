@@ -261,6 +261,10 @@ fn ecdsa_p256_keygen_with_pairwise_test() {
         &mut sig_len,
     );
     assert_eq!(rv, CKR_OK);
+    assert_eq!(
+        sig_len, 64,
+        "P-256 ECDSA signature must be 64 bytes (raw r || s)"
+    );
 
     let rv = functions::C_VerifyInit(session, &mut sign_mechanism, pub_key);
     assert_eq!(rv, CKR_OK);
@@ -355,6 +359,10 @@ fn ecdsa_p384_keygen_with_pairwise_test() {
         &mut sig_len,
     );
     assert_eq!(rv, CKR_OK);
+    assert_eq!(
+        sig_len, 96,
+        "P-384 ECDSA signature must be 96 bytes (raw r || s)"
+    );
 
     let rv = functions::C_VerifyInit(session, &mut sign_mechanism, pub_key);
     assert_eq!(rv, CKR_OK);

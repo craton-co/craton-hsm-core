@@ -904,24 +904,27 @@ pub fn ecdsa_p256_sign(private_key_bytes: &[u8], data: &[u8]) -> HsmResult<Vec<u
         SigningKey::from_slice(private_key_bytes).map_err(|_| HsmError::KeyHandleInvalid)?;
     let mut rng = DrbgRng::new()?;
     let signature: p256::ecdsa::Signature = signing_key.sign_with_rng(&mut rng, data);
-    Ok(signature.to_der().to_bytes().to_vec())
+    // PKCS#11 §2.3.1: ECDSA signature format is raw r || s (fixed-size, no ASN.1 DER).
+    // P-256: 64 bytes (32-byte r + 32-byte s).
+    Ok(signature.to_bytes().to_vec())
 }
 
 /// ECDSA P-256 verify
-pub fn ecdsa_p256_verify(
-    public_key_sec1: &[u8],
-    data: &[u8],
-    signature_der: &[u8],
-) -> HsmResult<bool> {
+pub fn ecdsa_p256_verify(public_key_sec1: &[u8], data: &[u8], signature: &[u8]) -> HsmResult<bool> {
     use p256::ecdsa::signature::Verifier;
     use p256::ecdsa::VerifyingKey;
 
     validate_data_size(data)?;
+    // PKCS#11 §2.3.1: ECDSA signature format is raw r || s (fixed-size, no ASN.1 DER).
+    // P-256: exactly 64 bytes (32-byte r + 32-byte s).
+    if signature.len() != 64 {
+        return Err(HsmError::SignatureInvalid);
+    }
     let verifying_key =
         VerifyingKey::from_sec1_bytes(public_key_sec1).map_err(|_| HsmError::KeyHandleInvalid)?;
-    let signature =
-        p256::ecdsa::Signature::from_der(signature_der).map_err(|_| HsmError::SignatureInvalid)?;
-    Ok(verifying_key.verify(data, &signature).is_ok())
+    let sig =
+        p256::ecdsa::Signature::from_slice(signature).map_err(|_| HsmError::SignatureInvalid)?;
+    Ok(verifying_key.verify(data, &sig).is_ok())
 }
 
 // ============================================================================
@@ -942,24 +945,27 @@ pub fn ecdsa_p384_sign(private_key_bytes: &[u8], data: &[u8]) -> HsmResult<Vec<u
         SigningKey::from_slice(private_key_bytes).map_err(|_| HsmError::KeyHandleInvalid)?;
     let mut rng = DrbgRng::new()?;
     let signature: p384::ecdsa::Signature = signing_key.sign_with_rng(&mut rng, data);
-    Ok(signature.to_der().to_bytes().to_vec())
+    // PKCS#11 §2.3.1: ECDSA signature format is raw r || s (fixed-size, no ASN.1 DER).
+    // P-384: 96 bytes (48-byte r + 48-byte s).
+    Ok(signature.to_bytes().to_vec())
 }
 
 /// ECDSA P-384 verify
-pub fn ecdsa_p384_verify(
-    public_key_sec1: &[u8],
-    data: &[u8],
-    signature_der: &[u8],
-) -> HsmResult<bool> {
+pub fn ecdsa_p384_verify(public_key_sec1: &[u8], data: &[u8], signature: &[u8]) -> HsmResult<bool> {
     use p384::ecdsa::signature::Verifier;
     use p384::ecdsa::VerifyingKey;
 
     validate_data_size(data)?;
+    // PKCS#11 §2.3.1: ECDSA signature format is raw r || s (fixed-size, no ASN.1 DER).
+    // P-384: exactly 96 bytes (48-byte r + 48-byte s).
+    if signature.len() != 96 {
+        return Err(HsmError::SignatureInvalid);
+    }
     let verifying_key =
         VerifyingKey::from_sec1_bytes(public_key_sec1).map_err(|_| HsmError::KeyHandleInvalid)?;
-    let signature =
-        p384::ecdsa::Signature::from_der(signature_der).map_err(|_| HsmError::SignatureInvalid)?;
-    Ok(verifying_key.verify(data, &signature).is_ok())
+    let sig =
+        p384::ecdsa::Signature::from_slice(signature).map_err(|_| HsmError::SignatureInvalid)?;
+    Ok(verifying_key.verify(data, &sig).is_ok())
 }
 
 // ============================================================================
@@ -1402,25 +1408,32 @@ pub(crate) fn ecdsa_p256_sign_prehashed(
     let signature: p256::ecdsa::Signature = signing_key
         .sign_prehash_with_rng(&mut rng, digest)
         .map_err(|_| HsmError::GeneralError)?;
-    Ok(signature.to_der().to_bytes().to_vec())
+    // PKCS#11 §2.3.1: ECDSA signature format is raw r || s (fixed-size, no ASN.1 DER).
+    // P-256: 64 bytes (32-byte r + 32-byte s).
+    Ok(signature.to_bytes().to_vec())
 }
 
 /// ECDSA P-256 verify with a pre-computed digest.
 pub(crate) fn ecdsa_p256_verify_prehashed(
     public_key_sec1: &[u8],
     digest: &[u8],
-    signature_der: &[u8],
+    signature: &[u8],
 ) -> HsmResult<bool> {
     use p256::ecdsa::signature::hazmat::PrehashVerifier;
     use p256::ecdsa::VerifyingKey;
 
     // P-256 operates on SHA-256 digests (32 bytes)
     validate_digest_length(digest, HashAlg::Sha256)?;
+    // PKCS#11 §2.3.1: ECDSA signature format is raw r || s (fixed-size, no ASN.1 DER).
+    // P-256: exactly 64 bytes (32-byte r + 32-byte s).
+    if signature.len() != 64 {
+        return Err(HsmError::SignatureInvalid);
+    }
     let verifying_key =
         VerifyingKey::from_sec1_bytes(public_key_sec1).map_err(|_| HsmError::KeyHandleInvalid)?;
-    let signature =
-        p256::ecdsa::Signature::from_der(signature_der).map_err(|_| HsmError::SignatureInvalid)?;
-    Ok(verifying_key.verify_prehash(digest, &signature).is_ok())
+    let sig =
+        p256::ecdsa::Signature::from_slice(signature).map_err(|_| HsmError::SignatureInvalid)?;
+    Ok(verifying_key.verify_prehash(digest, &sig).is_ok())
 }
 
 // ============================================================================
@@ -1447,25 +1460,32 @@ pub(crate) fn ecdsa_p384_sign_prehashed(
     let signature: p384::ecdsa::Signature = signing_key
         .sign_prehash_with_rng(&mut rng, digest)
         .map_err(|_| HsmError::GeneralError)?;
-    Ok(signature.to_der().to_bytes().to_vec())
+    // PKCS#11 §2.3.1: ECDSA signature format is raw r || s (fixed-size, no ASN.1 DER).
+    // P-384: 96 bytes (48-byte r + 48-byte s).
+    Ok(signature.to_bytes().to_vec())
 }
 
 /// ECDSA P-384 verify with a pre-computed digest.
 pub(crate) fn ecdsa_p384_verify_prehashed(
     public_key_sec1: &[u8],
     digest: &[u8],
-    signature_der: &[u8],
+    signature: &[u8],
 ) -> HsmResult<bool> {
     use p384::ecdsa::signature::hazmat::PrehashVerifier;
     use p384::ecdsa::VerifyingKey;
 
     // P-384 operates on SHA-384 digests (48 bytes)
     validate_digest_length(digest, HashAlg::Sha384)?;
+    // PKCS#11 §2.3.1: ECDSA signature format is raw r || s (fixed-size, no ASN.1 DER).
+    // P-384: exactly 96 bytes (48-byte r + 48-byte s).
+    if signature.len() != 96 {
+        return Err(HsmError::SignatureInvalid);
+    }
     let verifying_key =
         VerifyingKey::from_sec1_bytes(public_key_sec1).map_err(|_| HsmError::KeyHandleInvalid)?;
-    let signature =
-        p384::ecdsa::Signature::from_der(signature_der).map_err(|_| HsmError::SignatureInvalid)?;
-    Ok(verifying_key.verify_prehash(digest, &signature).is_ok())
+    let sig =
+        p384::ecdsa::Signature::from_slice(signature).map_err(|_| HsmError::SignatureInvalid)?;
+    Ok(verifying_key.verify_prehash(digest, &sig).is_ok())
 }
 
 // ============================================================================

@@ -126,7 +126,7 @@ pub trait CryptoBackend: Send + Sync {
         &self,
         public_key_sec1: &[u8],
         data: &[u8],
-        signature_der: &[u8],
+        signature: &[u8],
     ) -> HsmResult<bool>;
 
     fn ecdsa_p384_sign(&self, private_key_bytes: &[u8], data: &[u8]) -> HsmResult<Vec<u8>>;
@@ -135,7 +135,7 @@ pub trait CryptoBackend: Send + Sync {
         &self,
         public_key_sec1: &[u8],
         data: &[u8],
-        signature_der: &[u8],
+        signature: &[u8],
     ) -> HsmResult<bool>;
 
     fn ed25519_sign(&self, private_key_bytes: &[u8], data: &[u8]) -> HsmResult<Vec<u8>>;
@@ -249,7 +249,7 @@ pub trait CryptoBackend: Send + Sync {
         &self,
         public_key_sec1: &[u8],
         digest: &[u8],
-        signature_der: &[u8],
+        signature: &[u8],
     ) -> HsmResult<bool>;
 
     fn ecdsa_p384_sign_prehashed(
@@ -262,7 +262,7 @@ pub trait CryptoBackend: Send + Sync {
         &self,
         public_key_sec1: &[u8],
         digest: &[u8],
-        signature_der: &[u8],
+        signature: &[u8],
     ) -> HsmResult<bool>;
 
     // ========================================================================

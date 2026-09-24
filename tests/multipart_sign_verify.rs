@@ -474,6 +474,11 @@ fn test_multipart_sign_verify() {
     // ========================================================================
     println!("Test 7: ECDSA P-256 SHA-256 multi-part sign → single-shot verify");
     let sig = multi_part_sign(session, CKM_ECDSA_SHA256, ec256_priv, &chunks);
+    assert_eq!(
+        sig.len(),
+        64,
+        "P-256 multi-part signature must be 64 bytes (raw r || s)"
+    );
     let rv = single_shot_verify(session, CKM_ECDSA_SHA256, ec256_pub, message, &sig);
     assert_eq!(
         rv, CKR_OK,
@@ -485,6 +490,11 @@ fn test_multipart_sign_verify() {
     // ========================================================================
     println!("Test 8: ECDSA P-256 SHA-256 single-shot sign → multi-part verify");
     let sig = single_shot_sign(session, CKM_ECDSA_SHA256, ec256_priv, message);
+    assert_eq!(
+        sig.len(),
+        64,
+        "P-256 single-shot signature must be 64 bytes (raw r || s)"
+    );
     let rv = multi_part_verify(session, CKM_ECDSA_SHA256, ec256_pub, &chunks, &sig);
     assert_eq!(
         rv, CKR_OK,
@@ -496,6 +506,11 @@ fn test_multipart_sign_verify() {
     // ========================================================================
     println!("Test 9: ECDSA P-384 SHA-384 multi-part sign → multi-part verify");
     let sig = multi_part_sign(session, CKM_ECDSA_SHA384, ec384_priv, &chunks);
+    assert_eq!(
+        sig.len(),
+        96,
+        "P-384 multi-part signature must be 96 bytes (raw r || s)"
+    );
     let rv = multi_part_verify(session, CKM_ECDSA_SHA384, ec384_pub, &chunks, &sig);
     assert_eq!(
         rv, CKR_OK,
@@ -616,6 +631,11 @@ fn test_multipart_sign_verify() {
     // ========================================================================
     println!("Test 19: ECDSA P-256 SHA-256 large data (64KB in 4KB chunks)");
     let sig = multi_part_sign(session, CKM_ECDSA_SHA256, ec256_priv, &large_chunks);
+    assert_eq!(
+        sig.len(),
+        64,
+        "P-256 large data signature must be 64 bytes (raw r || s)"
+    );
     let rv = single_shot_verify(session, CKM_ECDSA_SHA256, ec256_pub, &large_data, &sig);
     assert_eq!(rv, CKR_OK, "ECDSA large data multi-part sign/verify failed");
 

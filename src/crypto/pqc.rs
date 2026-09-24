@@ -422,7 +422,7 @@ pub fn slh_dsa_verify(
 // ============================================================================
 
 /// Hybrid ML-DSA-65 + ECDSA-P256 signing.
-/// Format: [4-byte ML-DSA sig length (BE)] [ML-DSA-65 sig] [ECDSA-P256 DER sig]
+/// Format: [4-byte ML-DSA sig length (BE)] [ML-DSA-65 sig] [ECDSA-P256 raw r || s sig]
 pub fn hybrid_sign(
     ml_dsa_sk_seed: &[u8],
     ecdsa_sk_bytes: &[u8],
