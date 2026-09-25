@@ -836,11 +836,48 @@ impl CryptoBackend for AwsLcBackend {
             Ok(RawKeyMaterial::new(key_bytes))
         })
     }
+
+    fn ecdh_p256_shared_secret(
+        &self,
+        private_key_bytes: &[u8],
+        peer_public_key_sec1: &[u8],
+    ) -> HsmResult<RawKeyMaterial> {
+        awslc_ecdh_shared_secret(
+            &agreement::ECDH_P256,
+            private_key_bytes,
+            peer_public_key_sec1,
+        )
+    }
+
+    fn ecdh_p384_shared_secret(
+        &self,
+        private_key_bytes: &[u8],
+        peer_public_key_sec1: &[u8],
+    ) -> HsmResult<RawKeyMaterial> {
+        awslc_ecdh_shared_secret(
+            &agreement::ECDH_P384,
+            private_key_bytes,
+            peer_public_key_sec1,
+        )
+    }
 }
 
 // ============================================================================
 // Helpers
 // ============================================================================
+
+fn awslc_ecdh_shared_secret(
+    alg: &'static agreement::Algorithm,
+    private_key_bytes: &[u8],
+    peer_public_key_sec1: &[u8],
+) -> HsmResult<RawKeyMaterial> {
+    let my_private = agreement::PrivateKey::from_private_key(alg, private_key_bytes)
+        .map_err(|_| HsmError::KeyHandleInvalid)?;
+    let peer_public = agreement::UnparsedPublicKey::new(alg, peer_public_key_sec1);
+    agreement::agree(&my_private, peer_public, HsmError::ArgumentsBad, |shared| {
+        Ok(RawKeyMaterial::new(shared.to_vec()))
+    })
+}
 
 fn oaep_hash_to_algorithm(hash_alg: &OaepHash) -> &'static awslc_rsa::OaepAlgorithm {
     match hash_alg {

@@ -237,6 +237,130 @@ fn parse_oaep_hash(mech_param: &[u8]) -> Result<crate::crypto::sign::OaepHash, C
     }
 }
 
+/// Parsed `CKM_ECDH1_DERIVE` / `CKM_ECDH1_COFACTOR_DERIVE` parameters.
+struct EcdhDeriveParams {
+    /// KDF from `CK_ECDH1_DERIVE_PARAMS`, or `None` for the legacy form in
+    /// which the mechanism parameter is the bare peer public key. The legacy
+    /// form keeps the backend-specific derivation of earlier releases so
+    /// that existing callers keep deriving the same keys.
+    kdf: Option<CK_EC_KDF_TYPE>,
+    shared_data: Vec<u8>,
+    /// Peer public key as a raw SEC1 point (DER wrapper, if any, removed).
+    public_data: Vec<u8>,
+}
+
+/// Parse the ECDH mechanism parameter.
+///
+/// A parameter whose length is exactly `sizeof(CK_ECDH1_DERIVE_PARAMS)` is
+/// read as that struct, per PKCS#11. Any other length is treated as the
+/// legacy bare peer point. The two cannot collide: the struct is 20, 28 or
+/// 40 bytes depending on platform, and no raw or DER-wrapped P-256/P-384
+/// point has one of those lengths.
+///
+/// SAFETY: caller must ensure `p_mechanism` is a valid, non-null pointer.
+fn parse_ecdh1_derive_params(p_mechanism: CK_MECHANISM_PTR) -> Result<EcdhDeriveParams, CK_RV> {
+    let mech = unsafe { &*p_mechanism };
+    let (kdf, shared_data, public_data) = if !mech.p_parameter.is_null()
+        && mech.parameter_len as usize == std::mem::size_of::<CK_ECDH1_DERIVE_PARAMS>()
+    {
+        // The caller's buffer carries no alignment guarantee.
+        let params =
+            unsafe { std::ptr::read_unaligned(mech.p_parameter as *const CK_ECDH1_DERIVE_PARAMS) };
+        let shared_data = copy_param_buffer(params.p_shared_data, params.shared_data_len)?;
+        let public_data = copy_param_buffer(params.p_public_data, params.public_data_len)?;
+        (Some(params.kdf), shared_data, public_data)
+    } else {
+        (None, Vec::new(), extract_mechanism_param(p_mechanism))
+    };
+    if public_data.is_empty() {
+        return Err(CKR_MECHANISM_PARAM_INVALID);
+    }
+    // PKCS#11 allows the peer public key as either a raw point or the
+    // DER-encoded ECPoint read from another token's CKA_EC_POINT.
+    let public_data = crate::store::ec_point::decode(&public_data).to_vec();
+    Ok(EcdhDeriveParams {
+        kdf,
+        shared_data,
+        public_data,
+    })
+}
+
+/// Copy a caller-owned `(pointer, length)` buffer out of a mechanism
+/// parameter struct.
+fn copy_param_buffer(ptr: CK_BYTE_PTR, len: CK_ULONG) -> Result<Vec<u8>, CK_RV> {
+    let len = len as usize;
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    if ptr.is_null() || len > MAX_SINGLE_BUFFER {
+        return Err(CKR_MECHANISM_PARAM_INVALID);
+    }
+    // SAFETY: non-null and bounded; validity of the caller's buffer for
+    // `len` bytes is the caller's PKCS#11 contract.
+    Ok(unsafe { slice::from_raw_parts(ptr as *const u8, len) }.to_vec())
+}
+
+/// Apply a PKCS#11 EC KDF to the raw ECDH shared secret `z`.
+///
+/// - `CKD_NULL`: the key is `z` itself, truncated to `key_len` by keeping
+///   the rightmost bytes (as SoftHSM does). Refused in FIPS-approved mode,
+///   where SP 800-56C forbids using `Z` as a key directly.
+/// - `CKD_SHA256_KDF` / `CKD_SHA384_KDF` / `CKD_SHA512_KDF`: the ANSI X9.63
+///   KDF, `Hash(Z || counter || SharedInfo)` with a 32-bit big-endian
+///   counter starting at 1.
+///
+/// `CKD_SHA1_KDF` is refused (SHA-1 is not offered for new key material),
+/// as is `CKD_SHA224_KDF` (no SHA-224 digest is implemented).
+fn ecdh_apply_kdf(
+    backend: &dyn CryptoBackend,
+    kdf: CK_EC_KDF_TYPE,
+    z: &RawKeyMaterial,
+    shared_data: &[u8],
+    key_len: usize,
+    fips_mode: bool,
+) -> Result<RawKeyMaterial, CK_RV> {
+    let hash_mech = match kdf {
+        CKD_NULL => {
+            if fips_mode {
+                tracing::error!(
+                    "ECDH with CKD_NULL is not permitted in FIPS-approved mode; use a SHA-2 KDF"
+                );
+                return Err(CKR_MECHANISM_PARAM_INVALID);
+            }
+            if !shared_data.is_empty() {
+                return Err(CKR_MECHANISM_PARAM_INVALID);
+            }
+            let z = z.as_bytes();
+            if key_len > z.len() {
+                return Err(CKR_KEY_SIZE_RANGE);
+            }
+            return Ok(RawKeyMaterial::new(z[z.len() - key_len..].to_vec()));
+        }
+        CKD_SHA256_KDF => CKM_SHA256,
+        CKD_SHA384_KDF => CKM_SHA384,
+        CKD_SHA512_KDF => CKM_SHA512,
+        _ => return Err(CKR_MECHANISM_PARAM_INVALID),
+    };
+
+    let mut okm = Zeroizing::new(Vec::with_capacity(key_len + 64));
+    let mut counter: u32 = 1;
+    while okm.len() < key_len {
+        let mut input = Zeroizing::new(Vec::with_capacity(z.len() + 4 + shared_data.len()));
+        input.extend_from_slice(z.as_bytes());
+        input.extend_from_slice(&counter.to_be_bytes());
+        input.extend_from_slice(shared_data);
+        let block = Zeroizing::new(
+            backend
+                .compute_digest(hash_mech, &input)
+                .map_err(err_to_rv)?,
+        );
+        okm.extend_from_slice(&block);
+        counter += 1;
+    }
+    okm.truncate(key_len);
+    Ok(RawKeyMaterial::new(std::mem::take(&mut *okm)))
+}
+
 // ============================================================================
 // Core library functions
 // ============================================================================
@@ -5731,17 +5855,24 @@ pub extern "C" fn C_DeriveKey(
         let bk_sensitive = bk_obj.sensitive;
         drop(bk_obj);
 
-        // The mechanism parameter contains the peer public key (ECDH) or ciphertext (KEM)
-        let mech_param = extract_mechanism_param(p_mechanism);
-        if mech_param.is_empty() {
-            return CKR_MECHANISM_PARAM_INVALID;
-        }
-        // PKCS#11 allows the ECDH peer public key as either a raw point or
-        // the DER-encoded ECPoint read from another token's CKA_EC_POINT.
-        let mech_param = if pqc::mechanism_to_ml_kem_variant(mechanism).is_none() {
-            crate::store::ec_point::decode(&mech_param).to_vec()
+        // The mechanism parameter carries the ML-KEM ciphertext, or the
+        // CK_ECDH1_DERIVE_PARAMS (peer public key + KDF) for ECDH.
+        let kem_ciphertext = if pqc::mechanism_to_ml_kem_variant(mechanism).is_some() {
+            let ct = extract_mechanism_param(p_mechanism);
+            if ct.is_empty() {
+                return CKR_MECHANISM_PARAM_INVALID;
+            }
+            Some(ct)
         } else {
-            mech_param
+            None
+        };
+        let ecdh_params = if kem_ciphertext.is_none() {
+            match parse_ecdh1_derive_params(p_mechanism) {
+                Ok(p) => Some(p),
+                Err(rv) => return rv,
+            }
+        } else {
+            None
         };
 
         let template = if p_template.is_null() {
@@ -5764,31 +5895,54 @@ pub extern "C" fn C_DeriveKey(
             }
         }
 
-        let shared_secret = if let Some(variant) = pqc::mechanism_to_ml_kem_variant(mechanism) {
-            // ML-KEM decapsulation: base key is dk seed, param is ciphertext
-            match hsm
-                .crypto_backend
-                .ml_kem_decapsulate(&bk_bytes, &mech_param, variant)
-            {
-                Ok(ss) => RawKeyMaterial::new(ss),
-                Err(e) => return err_to_rv(e),
+        let backend = hsm.crypto_backend.as_ref();
+        let is_p384 = is_p384_params(&ec_params);
+        let derived = match (kem_ciphertext, ecdh_params) {
+            (Some(ct), _) => {
+                // ML-KEM decapsulation: base key is dk seed, param is ciphertext
+                let variant = match pqc::mechanism_to_ml_kem_variant(mechanism) {
+                    Some(v) => v,
+                    None => return CKR_MECHANISM_INVALID,
+                };
+                backend
+                    .ml_kem_decapsulate(&bk_bytes, &ct, variant)
+                    .map(RawKeyMaterial::new)
+                    .map_err(err_to_rv)
             }
-        } else if is_p384_params(&ec_params) {
-            match hsm
-                .crypto_backend
-                .ecdh_p384(&bk_bytes, &mech_param, requested_len)
-            {
-                Ok(s) => s,
-                Err(e) => return err_to_rv(e),
-            }
-        } else {
-            match hsm
-                .crypto_backend
-                .ecdh_p256(&bk_bytes, &mech_param, requested_len)
-            {
-                Ok(s) => s,
-                Err(e) => return err_to_rv(e),
-            }
+            (None, Some(params)) => match params.kdf {
+                Some(kdf) => {
+                    let z = if is_p384 {
+                        backend.ecdh_p384_shared_secret(&bk_bytes, &params.public_data)
+                    } else {
+                        backend.ecdh_p256_shared_secret(&bk_bytes, &params.public_data)
+                    };
+                    match z {
+                        Ok(z) => ecdh_apply_kdf(
+                            backend,
+                            kdf,
+                            &z,
+                            &params.shared_data,
+                            requested_len.unwrap_or(32),
+                            hsm.algorithm_config.fips_approved_only,
+                        ),
+                        // An unparseable or off-curve peer point is a bad
+                        // mechanism parameter, not a bad function argument.
+                        Err(HsmError::ArgumentsBad) => Err(CKR_MECHANISM_PARAM_INVALID),
+                        Err(e) => Err(err_to_rv(e)),
+                    }
+                }
+                None if is_p384 => backend
+                    .ecdh_p384(&bk_bytes, &params.public_data, requested_len)
+                    .map_err(err_to_rv),
+                None => backend
+                    .ecdh_p256(&bk_bytes, &params.public_data, requested_len)
+                    .map_err(err_to_rv),
+            },
+            (None, None) => Err(CKR_MECHANISM_PARAM_INVALID),
+        };
+        let shared_secret = match derived {
+            Ok(s) => s,
+            Err(rv) => return rv,
         };
 
         // Validate the derived secret is a valid AES key size
@@ -6052,4 +6206,97 @@ fn parse_template(
         result.push((attr.attr_type, value));
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod ecdh_kdf_tests {
+    use super::*;
+    use crate::crypto::rustcrypto_backend::RustCryptoBackend;
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    fn kdf(kdf: CK_EC_KDF_TYPE, z: &str, shared: &str, len: usize) -> Result<Vec<u8>, CK_RV> {
+        let z = RawKeyMaterial::new(hex(z));
+        ecdh_apply_kdf(&RustCryptoBackend, kdf, &z, &hex(shared), len, false)
+            .map(|k| k.as_bytes().to_vec())
+    }
+
+    // NIST CAVS ANSI X9.63 KDF (ansx963_2001.rsp), SHA-256, no SharedInfo.
+    #[test]
+    fn x963_sha256_known_answer() {
+        let out = kdf(
+            CKD_SHA256_KDF,
+            "96c05619d56c328ab95fe84b18264b08725b85e33fd34f08",
+            "",
+            16,
+        )
+        .unwrap();
+        assert_eq!(out, hex("443024c3dae66b95e6f5670601558f71"));
+    }
+
+    // NIST CAVS ANSI X9.63 KDF, SHA-256 with SharedInfo, multi-block output.
+    #[test]
+    fn x963_sha256_shared_info_multi_block() {
+        let out = kdf(
+            CKD_SHA256_KDF,
+            "22518b10e70f2a3f243810ae3254139efbee04aa57c7af7d",
+            "75eef81aa3041e33b80971203d2c0c52",
+            128,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            hex(concat!(
+                "c498af77161cc59f2962b9a713e2b215152d139766ce34a776df11866a69bf2e",
+                "52a13d9c7c6fc878c50c5ea0bc7b00e0da2447cfd874f6cf92f30d0097111485",
+                "500c90c3af8b487872d04685d14c8d1dc8d7fa08beb0ce0ababc11f0bd496269",
+                "142d43525a78e5bc79a17f59676a5706dc54d54d4d1f0bd7e386128ec26afc21",
+            ))
+        );
+    }
+
+    #[test]
+    fn ckd_null_keeps_rightmost_bytes() {
+        let z = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        assert_eq!(
+            kdf(CKD_NULL, z, "", 16).unwrap(),
+            hex("101112131415161718191a1b1c1d1e1f")
+        );
+        assert_eq!(kdf(CKD_NULL, z, "", 32).unwrap(), hex(z));
+        assert_eq!(kdf(CKD_NULL, z, "", 33), Err(CKR_KEY_SIZE_RANGE));
+    }
+
+    #[test]
+    fn ckd_null_rejects_shared_data() {
+        assert_eq!(
+            kdf(CKD_NULL, "00112233", "aa", 4),
+            Err(CKR_MECHANISM_PARAM_INVALID)
+        );
+    }
+
+    #[test]
+    fn ckd_null_refused_in_fips_mode() {
+        let z = RawKeyMaterial::new(vec![7u8; 32]);
+        assert_eq!(
+            ecdh_apply_kdf(&RustCryptoBackend, CKD_NULL, &z, &[], 32, true).err(),
+            Some(CKR_MECHANISM_PARAM_INVALID)
+        );
+        assert!(ecdh_apply_kdf(&RustCryptoBackend, CKD_SHA256_KDF, &z, &[], 32, true).is_ok());
+    }
+
+    #[test]
+    fn unsupported_kdfs_rejected() {
+        for k in [CKD_SHA1_KDF, CKD_SHA224_KDF, 0, 0xdead] {
+            assert_eq!(
+                kdf(k, "00112233", "", 4),
+                Err(CKR_MECHANISM_PARAM_INVALID),
+                "kdf {k:#x}"
+            );
+        }
+    }
 }

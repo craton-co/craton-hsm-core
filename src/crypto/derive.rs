@@ -115,6 +115,36 @@ pub fn ecdh_p384(
     Ok(RawKeyMaterial::new(okm))
 }
 
+/// Raw ECDH shared secret `Z` for P-256 (32 bytes), with no KDF applied.
+pub fn ecdh_p256_shared_secret(
+    private_key_bytes: &[u8],
+    peer_public_key_sec1: &[u8],
+) -> HsmResult<RawKeyMaterial> {
+    let secret_key =
+        P256SecretKey::from_slice(private_key_bytes).map_err(|_| HsmError::KeyHandleInvalid)?;
+    let peer_public =
+        P256PublicKey::from_sec1_bytes(peer_public_key_sec1).map_err(|_| HsmError::ArgumentsBad)?;
+    let shared_secret = p256_dh(secret_key.to_nonzero_scalar(), peer_public.as_affine());
+    Ok(RawKeyMaterial::new(
+        shared_secret.raw_secret_bytes().to_vec(),
+    ))
+}
+
+/// Raw ECDH shared secret `Z` for P-384 (48 bytes), with no KDF applied.
+pub fn ecdh_p384_shared_secret(
+    private_key_bytes: &[u8],
+    peer_public_key_sec1: &[u8],
+) -> HsmResult<RawKeyMaterial> {
+    let secret_key =
+        P384SecretKey::from_slice(private_key_bytes).map_err(|_| HsmError::KeyHandleInvalid)?;
+    let peer_public =
+        P384PublicKey::from_sec1_bytes(peer_public_key_sec1).map_err(|_| HsmError::ArgumentsBad)?;
+    let shared_secret = p384_dh(secret_key.to_nonzero_scalar(), peer_public.as_affine());
+    Ok(RawKeyMaterial::new(
+        shared_secret.raw_secret_bytes().to_vec(),
+    ))
+}
+
 /// Validate the requested output key material length.
 fn validate_okm_len(len: usize) -> HsmResult<()> {
     if len == 0 || len > MAX_OKM_LEN {
