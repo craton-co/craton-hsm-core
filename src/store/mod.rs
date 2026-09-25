@@ -8,6 +8,7 @@
 
 pub mod attributes;
 pub mod backup;
+pub mod ec_point;
 pub mod encrypted_store;
 pub mod key_material;
 pub mod lifecycle;

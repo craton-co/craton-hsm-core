@@ -196,6 +196,10 @@ impl StoredObject {
                     (_, None) => 0,
                 },
                 CKA_LABEL => ct_bytes_eq(value, &self.label),
+                CKA_EC_POINT => match &self.ec_point {
+                    Some(point) => ct_bytes_eq(crate::store::ec_point::decode(value), point),
+                    None => 0,
+                },
                 CKA_ID => ct_bytes_eq(value, &self.id),
                 CKA_TOKEN => {
                     if !value.is_empty() {

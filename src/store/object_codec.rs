@@ -140,7 +140,11 @@ pub(crate) fn decode(data: &[u8]) -> HsmResult<StoredObject> {
     let modulus_bits = opt_u64_to_ulong(reader.take_opt_u64()?)?;
     let public_exponent = reader.take_opt_vec()?;
     let ec_params = reader.take_opt_vec()?;
-    let ec_point = reader.take_opt_vec()?;
+    // Objects imported by earlier versions may have persisted the DER
+    // OCTET STRING form; normalise to the raw point used internally.
+    let ec_point = reader
+        .take_opt_vec()?
+        .map(|p| crate::store::ec_point::decode(&p).to_vec());
     let value_len = opt_u64_to_ulong(reader.take_opt_u64()?)?;
     let attribute_count = reader.take_u32()? as usize;
     if attribute_count > MAX_ATTRIBUTES {

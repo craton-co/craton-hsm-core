@@ -697,7 +697,9 @@ pub fn apply_attribute(
             obj.ec_params = Some(value.to_vec());
         }
         CKA_EC_POINT => {
-            obj.ec_point = Some(value.to_vec());
+            // Callers supply the DER OCTET STRING form (or, for
+            // compatibility, a bare point); store the raw point.
+            obj.ec_point = Some(crate::store::ec_point::decode(value).to_vec());
         }
         CKA_VALUE_LEN => {
             obj.value_len = Some(read_ck_ulong(value).ok_or(HsmError::AttributeValueInvalid)?);
@@ -807,7 +809,12 @@ pub fn read_attribute(
         CKA_MODULUS_BITS => Ok(obj.modulus_bits.map(ck_ulong_to_bytes)),
         CKA_PUBLIC_EXPONENT => Ok(obj.public_exponent.clone()),
         CKA_EC_PARAMS => Ok(obj.ec_params.clone()),
-        CKA_EC_POINT => Ok(obj.ec_point.clone()),
+        // PKCS#11: CKA_EC_POINT is the DER encoding of the ECPoint
+        // (an OCTET STRING around the SEC1 / RFC 8032 public key).
+        CKA_EC_POINT => Ok(obj
+            .ec_point
+            .as_deref()
+            .map(crate::store::ec_point::encode_der)),
         CKA_VALUE_LEN => Ok(obj.value_len.map(ck_ulong_to_bytes)),
         CKA_START_DATE => Ok(obj.start_date.map(|d| d.to_vec())),
         CKA_END_DATE => Ok(obj.end_date.map(|d| d.to_vec())),
