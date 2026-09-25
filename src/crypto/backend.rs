@@ -399,6 +399,21 @@ pub trait CryptoBackend: Send + Sync {
         okm_len: Option<usize>,
     ) -> HsmResult<RawKeyMaterial>;
 
+    /// Raw ECDH shared secret `Z` (the x-coordinate, field-size big-endian
+    /// bytes) with no KDF applied. Used by the standard
+    /// `CK_ECDH1_DERIVE_PARAMS` path, which applies the caller-selected
+    /// PKCS#11 KDF itself so every backend derives identical keys.
+    fn ecdh_p256_shared_secret(
+        &self,
+        private_key_bytes: &[u8],
+        peer_public_key_sec1: &[u8],
+    ) -> HsmResult<RawKeyMaterial>;
+    fn ecdh_p384_shared_secret(
+        &self,
+        private_key_bytes: &[u8],
+        peer_public_key_sec1: &[u8],
+    ) -> HsmResult<RawKeyMaterial>;
+
     // ========================================================================
     // Post-Quantum: ML-KEM (FIPS 203) — Key Encapsulation
     // ========================================================================

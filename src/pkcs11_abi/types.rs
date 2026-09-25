@@ -158,6 +158,23 @@ pub struct CK_MECHANISM {
 }
 pub type CK_MECHANISM_PTR = *mut CK_MECHANISM;
 
+// --- CK_ECDH1_DERIVE_PARAMS ---
+
+pub type CK_EC_KDF_TYPE = CK_ULONG;
+
+/// Mechanism parameter for `CKM_ECDH1_DERIVE` / `CKM_ECDH1_COFACTOR_DERIVE`.
+#[cfg_attr(target_os = "windows", repr(C, packed))]
+#[cfg_attr(not(target_os = "windows"), repr(C))]
+#[derive(Debug, Clone, Copy)]
+pub struct CK_ECDH1_DERIVE_PARAMS {
+    pub kdf: CK_EC_KDF_TYPE,
+    pub shared_data_len: CK_ULONG,
+    pub p_shared_data: CK_BYTE_PTR,
+    pub public_data_len: CK_ULONG,
+    pub p_public_data: CK_BYTE_PTR,
+}
+pub type CK_ECDH1_DERIVE_PARAMS_PTR = *mut CK_ECDH1_DERIVE_PARAMS;
+
 // --- CK_MECHANISM_INFO ---
 
 #[cfg_attr(target_os = "windows", repr(C, packed))]

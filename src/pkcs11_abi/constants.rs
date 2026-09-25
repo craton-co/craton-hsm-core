@@ -298,6 +298,15 @@ pub const CKF_WRAP_FLAG: CK_ULONG = 0x00020000;
 pub const CKF_UNWRAP_FLAG: CK_ULONG = 0x00040000;
 pub const CKF_DERIVE_FLAG: CK_ULONG = 0x00080000;
 
+// --- EC key derivation functions (CKD_*, CK_EC_KDF_TYPE) ---
+
+pub const CKD_NULL: CK_ULONG = 0x00000001;
+pub const CKD_SHA1_KDF: CK_ULONG = 0x00000002;
+pub const CKD_SHA224_KDF: CK_ULONG = 0x00000005;
+pub const CKD_SHA256_KDF: CK_ULONG = 0x00000006;
+pub const CKD_SHA384_KDF: CK_ULONG = 0x00000007;
+pub const CKD_SHA512_KDF: CK_ULONG = 0x00000008;
+
 // --- Unavailable information sentinel ---
 
 pub const CK_UNAVAILABLE_INFORMATION: CK_ULONG = CK_ULONG::MAX;

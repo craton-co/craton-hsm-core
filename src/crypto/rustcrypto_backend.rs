@@ -489,4 +489,20 @@ impl CryptoBackend for RustCryptoBackend {
     ) -> HsmResult<RawKeyMaterial> {
         super::derive::ecdh_p384(private_key_bytes, peer_public_key_sec1, okm_len)
     }
+
+    fn ecdh_p256_shared_secret(
+        &self,
+        private_key_bytes: &[u8],
+        peer_public_key_sec1: &[u8],
+    ) -> HsmResult<RawKeyMaterial> {
+        super::derive::ecdh_p256_shared_secret(private_key_bytes, peer_public_key_sec1)
+    }
+
+    fn ecdh_p384_shared_secret(
+        &self,
+        private_key_bytes: &[u8],
+        peer_public_key_sec1: &[u8],
+    ) -> HsmResult<RawKeyMaterial> {
+        super::derive::ecdh_p384_shared_secret(private_key_bytes, peer_public_key_sec1)
+    }
 }

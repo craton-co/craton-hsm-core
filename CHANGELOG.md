@@ -16,6 +16,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `C_GetAttributeValue` now returns the DER form for EC and Edwards keys. Supplied values
   (`C_CreateObject`, `C_FindObjects` templates, `CKM_ECDH1_DERIVE` peer keys) are accepted in
   either DER or raw form, and objects persisted by earlier versions in either form keep working.
+- **`CKM_ECDH1_DERIVE` did not accept the standard `CK_ECDH1_DERIVE_PARAMS`**: the mechanism
+  parameter was read as the bare peer public key, so standard PKCS#11 callers (OpenSSL
+  `pkcs11-provider`, OpenSC, Java SunPKCS11) that pass `CK_ECDH1_DERIVE_PARAMS` could not
+  derive. `C_DeriveKey` now parses the struct and applies the requested KDF:
+  - `CKD_NULL`: the key is the raw shared secret `Z`, truncated to `CKA_VALUE_LEN` by keeping the
+    rightmost bytes (as SoftHSM does). Refused in FIPS-approved mode (SP 800-56C forbids using
+    `Z` as a key directly).
+  - `CKD_SHA256_KDF`, `CKD_SHA384_KDF`, `CKD_SHA512_KDF`: ANSI X9.63 KDF with optional
+    `pSharedData`.
+  - `CKD_SHA1_KDF` and `CKD_SHA224_KDF` return `CKR_MECHANISM_PARAM_INVALID`.
+
+  The KDF runs above the crypto backend, so RustCrypto and AWS-LC now derive identical keys
+  (previously RustCrypto applied an internal HKDF while AWS-LC truncated `Z`). `pPublicData` may
+  be a raw or DER-encoded point. Callers that still pass the bare peer point as the parameter
+  keep the previous backend-specific behaviour, so existing derived keys are unaffected; that
+  legacy form is deprecated.
 
 ## [0.10.1] - 2026-09-24
 

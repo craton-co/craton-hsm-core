@@ -1139,3 +1139,288 @@ fn test_derive_get_object_size() {
     assert_eq!(rv, CKR_OK, "GetObjectSize on derived key should succeed");
     assert!(size > 0, "Derived key size should be > 0");
 }
+
+// ============================================================================
+// Standard CK_ECDH1_DERIVE_PARAMS mechanism parameter
+// ============================================================================
+
+/// Generate an EC key pair whose private key is non-sensitive, so tests can
+/// read CKA_VALUE and cross-check the token's derivation independently.
+fn generate_exportable_ec_keypair(
+    session: CK_SESSION_HANDLE,
+    oid: &[u8],
+) -> (CK_OBJECT_HANDLE, CK_OBJECT_HANDLE) {
+    let mut mechanism = CK_MECHANISM {
+        mechanism: CKM_EC_KEY_PAIR_GEN,
+        p_parameter: ptr::null_mut(),
+        parameter_len: 0,
+    };
+    let ck_true: CK_BBOOL = CK_TRUE;
+    let ck_false: CK_BBOOL = CK_FALSE;
+    let mut pub_template = vec![CK_ATTRIBUTE {
+        attr_type: CKA_EC_PARAMS,
+        p_value: oid.as_ptr() as CK_VOID_PTR,
+        value_len: oid.len() as CK_ULONG,
+    }];
+    let mut priv_template = vec![
+        CK_ATTRIBUTE {
+            attr_type: CKA_DERIVE,
+            p_value: &ck_true as *const _ as CK_VOID_PTR,
+            value_len: 1,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_SENSITIVE,
+            p_value: &ck_false as *const _ as CK_VOID_PTR,
+            value_len: 1,
+        },
+    ];
+    let mut pub_key: CK_OBJECT_HANDLE = 0;
+    let mut priv_key: CK_OBJECT_HANDLE = 0;
+    let rv = C_GenerateKeyPair(
+        session,
+        &mut mechanism,
+        pub_template.as_mut_ptr(),
+        pub_template.len() as CK_ULONG,
+        priv_template.as_mut_ptr(),
+        priv_template.len() as CK_ULONG,
+        &mut pub_key,
+        &mut priv_key,
+    );
+    assert_eq!(rv, CKR_OK, "EC keygen failed: 0x{:08X}", rv);
+    (pub_key, priv_key)
+}
+
+fn read_attr(
+    session: CK_SESSION_HANDLE,
+    object: CK_OBJECT_HANDLE,
+    attr_type: CK_ATTRIBUTE_TYPE,
+) -> Vec<u8> {
+    let mut template = [CK_ATTRIBUTE {
+        attr_type,
+        p_value: ptr::null_mut(),
+        value_len: 0,
+    }];
+    let rv = C_GetAttributeValue(session, object, template.as_mut_ptr(), 1);
+    assert_eq!(rv, CKR_OK, "GetAttributeValue size failed: 0x{:08X}", rv);
+    let mut buf = vec![0u8; template[0].value_len as usize];
+    template[0].p_value = buf.as_mut_ptr() as CK_VOID_PTR;
+    let rv = C_GetAttributeValue(session, object, template.as_mut_ptr(), 1);
+    assert_eq!(rv, CKR_OK, "GetAttributeValue data failed: 0x{:08X}", rv);
+    buf.truncate(template[0].value_len as usize);
+    buf
+}
+
+/// C_DeriveKey with a standard CK_ECDH1_DERIVE_PARAMS. The derived AES key
+/// is non-sensitive when the base key is, so its value can be read back.
+fn derive_with_params(
+    session: CK_SESSION_HANDLE,
+    base_key: CK_OBJECT_HANDLE,
+    kdf: CK_ULONG,
+    shared_data: &[u8],
+    public_data: &[u8],
+    key_len: CK_ULONG,
+) -> Result<CK_OBJECT_HANDLE, CK_RV> {
+    let mut params = CK_ECDH1_DERIVE_PARAMS {
+        kdf,
+        shared_data_len: shared_data.len() as CK_ULONG,
+        p_shared_data: if shared_data.is_empty() {
+            ptr::null_mut()
+        } else {
+            shared_data.as_ptr() as CK_BYTE_PTR
+        },
+        public_data_len: public_data.len() as CK_ULONG,
+        p_public_data: if public_data.is_empty() {
+            ptr::null_mut()
+        } else {
+            public_data.as_ptr() as CK_BYTE_PTR
+        },
+    };
+    let mut mechanism = CK_MECHANISM {
+        mechanism: CKM_ECDH1_DERIVE,
+        p_parameter: &mut params as *mut _ as CK_VOID_PTR,
+        parameter_len: std::mem::size_of::<CK_ECDH1_DERIVE_PARAMS>() as CK_ULONG,
+    };
+    let ck_false: CK_BBOOL = CK_FALSE;
+    let key_len_bytes = ck_ulong_bytes(key_len);
+    let class_bytes = ck_ulong_bytes(CKO_SECRET_KEY);
+    let key_type_bytes = ck_ulong_bytes(CKK_AES);
+    let mut template = vec![
+        CK_ATTRIBUTE {
+            attr_type: CKA_CLASS,
+            p_value: class_bytes.as_ptr() as CK_VOID_PTR,
+            value_len: class_bytes.len() as CK_ULONG,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_KEY_TYPE,
+            p_value: key_type_bytes.as_ptr() as CK_VOID_PTR,
+            value_len: key_type_bytes.len() as CK_ULONG,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_VALUE_LEN,
+            p_value: key_len_bytes.as_ptr() as CK_VOID_PTR,
+            value_len: key_len_bytes.len() as CK_ULONG,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_SENSITIVE,
+            p_value: &ck_false as *const _ as CK_VOID_PTR,
+            value_len: 1,
+        },
+    ];
+    let mut derived: CK_OBJECT_HANDLE = 0;
+    let rv = C_DeriveKey(
+        session,
+        &mut mechanism,
+        base_key,
+        template.as_mut_ptr(),
+        template.len() as CK_ULONG,
+        &mut derived,
+    );
+    if rv == CKR_OK {
+        Ok(derived)
+    } else {
+        Err(rv)
+    }
+}
+
+fn x963_kdf<D: sha2::Digest>(z: &[u8], shared_info: &[u8], len: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut counter: u32 = 1;
+    while out.len() < len {
+        let mut h = D::new();
+        h.update(z);
+        h.update(counter.to_be_bytes());
+        h.update(shared_info);
+        out.extend_from_slice(&h.finalize());
+        counter += 1;
+    }
+    out.truncate(len);
+    out
+}
+
+#[test]
+fn test_ecdh_params_ckd_null_p256_matches_raw_shared_secret() {
+    let session = setup_user_session();
+    let (_pub_a, priv_a) = generate_exportable_ec_keypair(session, &P256_OID);
+    let (pub_b, _priv_b) = generate_ec_keypair(session, &P256_OID);
+
+    let peer_point = read_ec_point(session, pub_b);
+    let derived = derive_with_params(session, priv_a, CKD_NULL, &[], &peer_point, 32)
+        .expect("CKD_NULL derive failed");
+    let token_key = read_attr(session, derived, CKA_VALUE);
+
+    let sk = p256::SecretKey::from_slice(&read_attr(session, priv_a, CKA_VALUE)).unwrap();
+    let pk = p256::PublicKey::from_sec1_bytes(&peer_point[2..]).unwrap();
+    let z = p256::ecdh::diffie_hellman(sk.to_nonzero_scalar(), pk.as_affine());
+    assert_eq!(token_key, z.raw_secret_bytes().to_vec());
+}
+
+#[test]
+fn test_ecdh_params_ckd_null_p384_truncates_to_rightmost_bytes() {
+    let session = setup_user_session();
+    let (_pub_a, priv_a) = generate_exportable_ec_keypair(session, &P384_OID);
+    let (pub_b, _priv_b) = generate_ec_keypair(session, &P384_OID);
+
+    let peer_point = read_ec_point(session, pub_b);
+    let derived = derive_with_params(session, priv_a, CKD_NULL, &[], &peer_point, 32)
+        .expect("CKD_NULL derive failed");
+    let token_key = read_attr(session, derived, CKA_VALUE);
+
+    let sk = p384::SecretKey::from_slice(&read_attr(session, priv_a, CKA_VALUE)).unwrap();
+    let pk = p384::PublicKey::from_sec1_bytes(&peer_point[2..]).unwrap();
+    let z = p384::ecdh::diffie_hellman(sk.to_nonzero_scalar(), pk.as_affine());
+    assert_eq!(token_key, z.raw_secret_bytes()[48 - 32..].to_vec());
+}
+
+#[test]
+fn test_ecdh_params_sha384_kdf_with_shared_data_matches_x963() {
+    let session = setup_user_session();
+    let (_pub_a, priv_a) = generate_exportable_ec_keypair(session, &P384_OID);
+    let (pub_b, _priv_b) = generate_ec_keypair(session, &P384_OID);
+
+    let peer_point = read_ec_point(session, pub_b);
+    let shared_info = b"craton ecdh shared info";
+    let derived = derive_with_params(
+        session,
+        priv_a,
+        CKD_SHA384_KDF,
+        shared_info,
+        &peer_point,
+        24,
+    )
+    .expect("CKD_SHA384_KDF derive failed");
+    let token_key = read_attr(session, derived, CKA_VALUE);
+
+    let sk = p384::SecretKey::from_slice(&read_attr(session, priv_a, CKA_VALUE)).unwrap();
+    let pk = p384::PublicKey::from_sec1_bytes(&peer_point[2..]).unwrap();
+    let z = p384::ecdh::diffie_hellman(sk.to_nonzero_scalar(), pk.as_affine());
+    let expected = x963_kdf::<sha2::Sha384>(z.raw_secret_bytes(), shared_info, 24);
+    assert_eq!(token_key, expected);
+}
+
+#[test]
+fn test_ecdh_params_both_parties_agree() {
+    let session = setup_user_session();
+    let (pub_a, priv_a) = generate_exportable_ec_keypair(session, &P256_OID);
+    let (pub_b, priv_b) = generate_exportable_ec_keypair(session, &P256_OID);
+    let point_a = read_ec_point(session, pub_a);
+    let point_b = read_ec_point(session, pub_b);
+
+    for kdf in [CKD_NULL, CKD_SHA256_KDF, CKD_SHA512_KDF] {
+        let ab = derive_with_params(session, priv_a, kdf, &[], &point_b, 32).unwrap();
+        let ba = derive_with_params(session, priv_b, kdf, &[], &point_a, 32).unwrap();
+        assert_eq!(
+            read_attr(session, ab, CKA_VALUE),
+            read_attr(session, ba, CKA_VALUE),
+            "kdf {kdf:#x}: both sides must derive the same key"
+        );
+    }
+}
+
+#[test]
+fn test_ecdh_params_accepts_raw_public_data() {
+    let session = setup_user_session();
+    let (_pub_a, priv_a) = generate_exportable_ec_keypair(session, &P256_OID);
+    let (pub_b, _priv_b) = generate_ec_keypair(session, &P256_OID);
+    let der_point = read_ec_point(session, pub_b);
+
+    let from_der = derive_with_params(session, priv_a, CKD_NULL, &[], &der_point, 32).unwrap();
+    let from_raw = derive_with_params(session, priv_a, CKD_NULL, &[], &der_point[2..], 32).unwrap();
+    assert_eq!(
+        read_attr(session, from_der, CKA_VALUE),
+        read_attr(session, from_raw, CKA_VALUE)
+    );
+}
+
+#[test]
+fn test_ecdh_params_rejects_invalid_parameters() {
+    let session = setup_user_session();
+    let (_pub_a, priv_a) = generate_ec_keypair(session, &P256_OID);
+    let (pub_b, _priv_b) = generate_ec_keypair(session, &P256_OID);
+    let point = read_ec_point(session, pub_b);
+
+    // CKD_NULL does not take shared data.
+    assert_eq!(
+        derive_with_params(session, priv_a, CKD_NULL, b"info", &point, 32),
+        Err(CKR_MECHANISM_PARAM_INVALID)
+    );
+    // SHA-1 and unknown KDFs are refused.
+    for kdf in [CKD_SHA1_KDF, 0x7777] {
+        assert_eq!(
+            derive_with_params(session, priv_a, kdf, &[], &point, 32),
+            Err(CKR_MECHANISM_PARAM_INVALID),
+            "kdf {kdf:#x}"
+        );
+    }
+    // Missing public data.
+    assert_eq!(
+        derive_with_params(session, priv_a, CKD_NULL, &[], &[], 32),
+        Err(CKR_MECHANISM_PARAM_INVALID)
+    );
+    // A point that is not on the curve.
+    let mut bogus = point[2..].to_vec();
+    bogus[10] ^= 0xff;
+    assert_eq!(
+        derive_with_params(session, priv_a, CKD_NULL, &[], &bogus, 32),
+        Err(CKR_MECHANISM_PARAM_INVALID)
+    );
+}
