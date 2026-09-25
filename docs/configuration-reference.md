@@ -55,6 +55,24 @@ The following validation rules are enforced on load:
 | `enable_pqc` | bool | `true` | Enable post-quantum mechanisms (ML-KEM, ML-DSA, SLH-DSA) |
 | `allow_weak_rsa` | bool | `false` | Allow RSA key sizes below 2048 bits |
 | `allow_sha1_signing` | bool | `false` | Allow SHA-1 in signing contexts (deprecated per SP 800-131A) |
+| `derived_keys_extractable_by_default` | bool | `false` | Derived keys whose template omits `CKA_SENSITIVE` / `CKA_EXTRACTABLE` are non-sensitive and extractable (see below). Not allowed with `fips_approved_only` |
+
+### Derived key defaults
+
+`C_DeriveKey` (and the daemon `DeriveKey` RPC) honour `CKA_SENSITIVE` and `CKA_EXTRACTABLE`
+in the derivation template. When the template leaves them unset, derived keys are sensitive and
+non-extractable, so their value cannot be read back.
+
+Some callers read the derived secret without asking for a readable key. Java SunPKCS11's ECDH
+`KeyAgreement` is the common case. Either enable `derived_keys_extractable_by_default`, or keep
+the secure default and add this to the SunPKCS11 configuration:
+
+```
+attributes(generate, CKO_SECRET_KEY, CKK_GENERIC_SECRET) = {
+  CKA_SENSITIVE = false
+  CKA_EXTRACTABLE = true
+}
+```
 
 ### FIPS Approved Mode
 

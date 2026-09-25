@@ -32,6 +32,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   be a raw or DER-encoded point. Callers that still pass the bare peer point as the parameter
   keep the previous backend-specific behaviour, so existing derived keys are unaffected; that
   legacy form is deprecated.
+- **Derived keys could not be made readable, and were always 256-bit AES**: `C_DeriveKey`
+  forced a derived key to be sensitive whenever the base key was, and rejected
+  `CKA_EXTRACTABLE=true`. PKCS#11 has no such rule (only `CKA_ALWAYS_SENSITIVE` /
+  `CKA_NEVER_EXTRACTABLE` propagate), and it made ECDH unusable for callers that read the agreed
+  secret back, such as Java SunPKCS11 `KeyAgreement`. The template's `CKA_SENSITIVE` and
+  `CKA_EXTRACTABLE` are now honoured. Derived keys may also be `CKK_GENERIC_SECRET` (up to 64
+  bytes); a generic secret with no `CKA_VALUE_LEN` is the full shared secret (48 bytes for
+  P-384) instead of being truncated to 32. Other key types return `CKR_TEMPLATE_INCONSISTENT`.
+- **gRPC `DeriveKey` only accepted the bare peer key**: `DeriveKeyRequest` gains an
+  `ecdh_params` field mirroring `CK_ECDH1_DERIVE_PARAMS`, with the same KDFs, key types and
+  sensitivity handling as `C_DeriveKey`; the peer key may be raw or DER-encoded. Requests without
+  it keep the previous behaviour. A template can now also mark the derived key non-sensitive,
+  which the RPC previously refused.
+
+### Added
+
+- **`algorithms.derived_keys_extractable_by_default`** (default `false`): when enabled, derived
+  keys whose template leaves `CKA_SENSITIVE` / `CKA_EXTRACTABLE` unset are non-sensitive and
+  extractable, so SunPKCS11 ECDH works without extra configuration. Rejected together with
+  `fips_approved_only`. With the default, SunPKCS11 users instead add
+  `attributes(generate, CKO_SECRET_KEY, CKK_GENERIC_SECRET) = { CKA_SENSITIVE = false
+  CKA_EXTRACTABLE = true }` to their SunPKCS11 configuration.
 
 ## [0.10.1] - 2026-09-24
 

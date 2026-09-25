@@ -53,7 +53,7 @@ use std::sync::Arc;
 use crate::audit::log::{AuditOperation, AuditResult};
 use crate::core::HsmCore;
 use crate::crypto::backend::CryptoBackend;
-use crate::crypto::{approved_services, mechanisms, pairwise_test, pqc, sign};
+use crate::crypto::{approved_services, derive, mechanisms, pairwise_test, pqc, sign};
 use crate::error::{HsmError, HsmResult};
 use crate::pkcs11_abi::constants::*;
 use crate::pkcs11_abi::types::*;
@@ -298,67 +298,6 @@ fn copy_param_buffer(ptr: CK_BYTE_PTR, len: CK_ULONG) -> Result<Vec<u8>, CK_RV> 
     // SAFETY: non-null and bounded; validity of the caller's buffer for
     // `len` bytes is the caller's PKCS#11 contract.
     Ok(unsafe { slice::from_raw_parts(ptr as *const u8, len) }.to_vec())
-}
-
-/// Apply a PKCS#11 EC KDF to the raw ECDH shared secret `z`.
-///
-/// - `CKD_NULL`: the key is `z` itself, truncated to `key_len` by keeping
-///   the rightmost bytes (as SoftHSM does). Refused in FIPS-approved mode,
-///   where SP 800-56C forbids using `Z` as a key directly.
-/// - `CKD_SHA256_KDF` / `CKD_SHA384_KDF` / `CKD_SHA512_KDF`: the ANSI X9.63
-///   KDF, `Hash(Z || counter || SharedInfo)` with a 32-bit big-endian
-///   counter starting at 1.
-///
-/// `CKD_SHA1_KDF` is refused (SHA-1 is not offered for new key material),
-/// as is `CKD_SHA224_KDF` (no SHA-224 digest is implemented).
-fn ecdh_apply_kdf(
-    backend: &dyn CryptoBackend,
-    kdf: CK_EC_KDF_TYPE,
-    z: &RawKeyMaterial,
-    shared_data: &[u8],
-    key_len: usize,
-    fips_mode: bool,
-) -> Result<RawKeyMaterial, CK_RV> {
-    let hash_mech = match kdf {
-        CKD_NULL => {
-            if fips_mode {
-                tracing::error!(
-                    "ECDH with CKD_NULL is not permitted in FIPS-approved mode; use a SHA-2 KDF"
-                );
-                return Err(CKR_MECHANISM_PARAM_INVALID);
-            }
-            if !shared_data.is_empty() {
-                return Err(CKR_MECHANISM_PARAM_INVALID);
-            }
-            let z = z.as_bytes();
-            if key_len > z.len() {
-                return Err(CKR_KEY_SIZE_RANGE);
-            }
-            return Ok(RawKeyMaterial::new(z[z.len() - key_len..].to_vec()));
-        }
-        CKD_SHA256_KDF => CKM_SHA256,
-        CKD_SHA384_KDF => CKM_SHA384,
-        CKD_SHA512_KDF => CKM_SHA512,
-        _ => return Err(CKR_MECHANISM_PARAM_INVALID),
-    };
-
-    let mut okm = Zeroizing::new(Vec::with_capacity(key_len + 64));
-    let mut counter: u32 = 1;
-    while okm.len() < key_len {
-        let mut input = Zeroizing::new(Vec::with_capacity(z.len() + 4 + shared_data.len()));
-        input.extend_from_slice(z.as_bytes());
-        input.extend_from_slice(&counter.to_be_bytes());
-        input.extend_from_slice(shared_data);
-        let block = Zeroizing::new(
-            backend
-                .compute_digest(hash_mech, &input)
-                .map_err(err_to_rv)?,
-        );
-        okm.extend_from_slice(&block);
-        counter += 1;
-    }
-    okm.truncate(key_len);
-    Ok(RawKeyMaterial::new(std::mem::take(&mut *okm)))
 }
 
 // ============================================================================
@@ -5852,7 +5791,6 @@ pub extern "C" fn C_DeriveKey(
             None => return CKR_KEY_HANDLE_INVALID,
         };
         let ec_params = bk_obj.ec_params.as_deref().unwrap_or(&[]).to_vec();
-        let bk_sensitive = bk_obj.sensitive;
         drop(bk_obj);
 
         // The mechanism parameter carries the ML-KEM ciphertext, or the
@@ -5884,16 +5822,14 @@ pub extern "C" fn C_DeriveKey(
             }
         };
 
-        // Parse CKA_VALUE_LEN early so ECDH can derive exactly the right length
-        // via HKDF, avoiding unnecessary truncation of the derived secret.
-        let requested_len = read_ulong_attr(&template, CKA_VALUE_LEN).map(|v| v as usize);
-
-        // Validate requested length is a valid AES key size
-        if let Some(req_len) = requested_len {
-            if req_len != 16 && req_len != 24 && req_len != 32 {
-                return CKR_KEY_SIZE_RANGE;
-            }
-        }
+        // Key type (AES unless the template asks for CKK_GENERIC_SECRET),
+        // requested length and protection of the derived key.
+        let derived_tpl =
+            match derive::DerivedKeyTemplate::resolve(&template, CKK_AES, &hsm.algorithm_config) {
+                Ok(t) => t,
+                Err(e) => return err_to_rv(e),
+            };
+        let is_aes = derived_tpl.key_type == CKK_AES;
 
         let backend = hsm.crypto_backend.as_ref();
         let is_p384 = is_p384_params(&ec_params);
@@ -5907,7 +5843,6 @@ pub extern "C" fn C_DeriveKey(
                 backend
                     .ml_kem_decapsulate(&bk_bytes, &ct, variant)
                     .map(RawKeyMaterial::new)
-                    .map_err(err_to_rv)
             }
             (None, Some(params)) => match params.kdf {
                 Some(kdf) => {
@@ -5917,42 +5852,52 @@ pub extern "C" fn C_DeriveKey(
                         backend.ecdh_p256_shared_secret(&bk_bytes, &params.public_data)
                     };
                     match z {
-                        Ok(z) => ecdh_apply_kdf(
-                            backend,
-                            kdf,
-                            &z,
-                            &params.shared_data,
-                            requested_len.unwrap_or(32),
-                            hsm.algorithm_config.fips_approved_only,
-                        ),
+                        Ok(z) => {
+                            // An AES key defaults to 256 bits; a generic
+                            // secret defaults to the full shared secret, which
+                            // is what callers such as SunPKCS11 expect.
+                            let key_len =
+                                derived_tpl
+                                    .value_len
+                                    .unwrap_or(if is_aes { 32 } else { z.len() });
+                            derive::apply_ec_kdf(
+                                backend,
+                                kdf,
+                                &z,
+                                &params.shared_data,
+                                key_len,
+                                hsm.algorithm_config.fips_approved_only,
+                            )
+                        }
                         // An unparseable or off-curve peer point is a bad
                         // mechanism parameter, not a bad function argument.
-                        Err(HsmError::ArgumentsBad) => Err(CKR_MECHANISM_PARAM_INVALID),
-                        Err(e) => Err(err_to_rv(e)),
+                        Err(HsmError::ArgumentsBad) => Err(HsmError::MechanismParamInvalid),
+                        Err(e) => Err(e),
                     }
                 }
-                None if is_p384 => backend
-                    .ecdh_p384(&bk_bytes, &params.public_data, requested_len)
-                    .map_err(err_to_rv),
-                None => backend
-                    .ecdh_p256(&bk_bytes, &params.public_data, requested_len)
-                    .map_err(err_to_rv),
+                None => {
+                    // Legacy bare-point parameter: the backend's own derivation.
+                    let okm_len = if is_aes {
+                        Some(derived_tpl.value_len.unwrap_or(32))
+                    } else {
+                        derived_tpl.value_len
+                    };
+                    if is_p384 {
+                        backend.ecdh_p384(&bk_bytes, &params.public_data, okm_len)
+                    } else {
+                        backend.ecdh_p256(&bk_bytes, &params.public_data, okm_len)
+                    }
+                }
             },
-            (None, None) => Err(CKR_MECHANISM_PARAM_INVALID),
+            (None, None) => Err(HsmError::MechanismParamInvalid),
         };
         let shared_secret = match derived {
             Ok(s) => s,
-            Err(rv) => return rv,
+            Err(e) => return err_to_rv(e),
         };
-
-        // Validate the derived secret is a valid AES key size
-        let shared_secret = {
-            let slen = shared_secret.len();
-            if slen != 16 && slen != 24 && slen != 32 {
-                return CKR_KEY_SIZE_RANGE;
-            }
-            shared_secret
-        };
+        if let Err(e) = derived_tpl.check_len(shared_secret.len()) {
+            return err_to_rv(e);
+        }
 
         let handle = match hsm.object_store.next_handle() {
             Ok(h) => h,
@@ -5960,13 +5905,15 @@ pub extern "C" fn C_DeriveKey(
         };
         let secret_len = shared_secret.len();
         let mut obj = StoredObject::new(handle, CKO_SECRET_KEY);
-        obj.key_type = Some(CKK_AES);
+        obj.key_type = Some(derived_tpl.key_type);
         obj.key_material = Some(shared_secret);
         obj.value_len = Some(secret_len as CK_ULONG);
-        obj.sensitive = true;
-        obj.extractable = false;
-        obj.can_encrypt = true;
-        obj.can_decrypt = true;
+        // PKCS#11 lets the template choose the derived key's protection; the
+        // base key's CKA_SENSITIVE does not constrain it.
+        obj.sensitive = derived_tpl.sensitive;
+        obj.extractable = derived_tpl.extractable;
+        obj.can_encrypt = is_aes;
+        obj.can_decrypt = is_aes;
 
         for (attr_type, value) in &template {
             match *attr_type {
@@ -5977,28 +5924,6 @@ pub extern "C" fn C_DeriveKey(
                         Ok(v) => v,
                         Err(rv) => return rv,
                     }
-                }
-                CKA_SENSITIVE => {
-                    let requested = match parse_ck_bbool(value) {
-                        Ok(v) => v,
-                        Err(rv) => return rv,
-                    };
-                    // PKCS#11: if the base key is sensitive, the derived key
-                    // must also be sensitive (inherited constraint).
-                    if bk_sensitive && !requested {
-                        return CKR_TEMPLATE_INCONSISTENT;
-                    }
-                    obj.sensitive = requested;
-                }
-                CKA_EXTRACTABLE => {
-                    let requested = match parse_ck_bbool(value) {
-                        Ok(v) => v,
-                        Err(rv) => return rv,
-                    };
-                    if !obj.extractable && requested {
-                        return CKR_TEMPLATE_INCONSISTENT;
-                    }
-                    obj.extractable = requested;
                 }
                 _ => {}
             }
@@ -6206,97 +6131,4 @@ fn parse_template(
         result.push((attr.attr_type, value));
     }
     Ok(result)
-}
-
-#[cfg(test)]
-mod ecdh_kdf_tests {
-    use super::*;
-    use crate::crypto::rustcrypto_backend::RustCryptoBackend;
-
-    fn hex(s: &str) -> Vec<u8> {
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-            .collect()
-    }
-
-    fn kdf(kdf: CK_EC_KDF_TYPE, z: &str, shared: &str, len: usize) -> Result<Vec<u8>, CK_RV> {
-        let z = RawKeyMaterial::new(hex(z));
-        ecdh_apply_kdf(&RustCryptoBackend, kdf, &z, &hex(shared), len, false)
-            .map(|k| k.as_bytes().to_vec())
-    }
-
-    // NIST CAVS ANSI X9.63 KDF (ansx963_2001.rsp), SHA-256, no SharedInfo.
-    #[test]
-    fn x963_sha256_known_answer() {
-        let out = kdf(
-            CKD_SHA256_KDF,
-            "96c05619d56c328ab95fe84b18264b08725b85e33fd34f08",
-            "",
-            16,
-        )
-        .unwrap();
-        assert_eq!(out, hex("443024c3dae66b95e6f5670601558f71"));
-    }
-
-    // NIST CAVS ANSI X9.63 KDF, SHA-256 with SharedInfo, multi-block output.
-    #[test]
-    fn x963_sha256_shared_info_multi_block() {
-        let out = kdf(
-            CKD_SHA256_KDF,
-            "22518b10e70f2a3f243810ae3254139efbee04aa57c7af7d",
-            "75eef81aa3041e33b80971203d2c0c52",
-            128,
-        )
-        .unwrap();
-        assert_eq!(
-            out,
-            hex(concat!(
-                "c498af77161cc59f2962b9a713e2b215152d139766ce34a776df11866a69bf2e",
-                "52a13d9c7c6fc878c50c5ea0bc7b00e0da2447cfd874f6cf92f30d0097111485",
-                "500c90c3af8b487872d04685d14c8d1dc8d7fa08beb0ce0ababc11f0bd496269",
-                "142d43525a78e5bc79a17f59676a5706dc54d54d4d1f0bd7e386128ec26afc21",
-            ))
-        );
-    }
-
-    #[test]
-    fn ckd_null_keeps_rightmost_bytes() {
-        let z = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
-        assert_eq!(
-            kdf(CKD_NULL, z, "", 16).unwrap(),
-            hex("101112131415161718191a1b1c1d1e1f")
-        );
-        assert_eq!(kdf(CKD_NULL, z, "", 32).unwrap(), hex(z));
-        assert_eq!(kdf(CKD_NULL, z, "", 33), Err(CKR_KEY_SIZE_RANGE));
-    }
-
-    #[test]
-    fn ckd_null_rejects_shared_data() {
-        assert_eq!(
-            kdf(CKD_NULL, "00112233", "aa", 4),
-            Err(CKR_MECHANISM_PARAM_INVALID)
-        );
-    }
-
-    #[test]
-    fn ckd_null_refused_in_fips_mode() {
-        let z = RawKeyMaterial::new(vec![7u8; 32]);
-        assert_eq!(
-            ecdh_apply_kdf(&RustCryptoBackend, CKD_NULL, &z, &[], 32, true).err(),
-            Some(CKR_MECHANISM_PARAM_INVALID)
-        );
-        assert!(ecdh_apply_kdf(&RustCryptoBackend, CKD_SHA256_KDF, &z, &[], 32, true).is_ok());
-    }
-
-    #[test]
-    fn unsupported_kdfs_rejected() {
-        for k in [CKD_SHA1_KDF, CKD_SHA224_KDF, 0, 0xdead] {
-            assert_eq!(
-                kdf(k, "00112233", "", 4),
-                Err(CKR_MECHANISM_PARAM_INVALID),
-                "kdf {k:#x}"
-            );
-        }
-    }
 }
