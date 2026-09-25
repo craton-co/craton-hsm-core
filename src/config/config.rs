@@ -124,6 +124,24 @@ pub struct AlgorithmConfig {
     /// PQC mechanisms are also blocked (not yet FIPS-approved).
     #[serde(default)]
     pub fips_approved_only: bool,
+    /// When true, secret keys produced by key derivation (`C_DeriveKey`,
+    /// the daemon `DeriveKey` RPC) whose template leaves `CKA_SENSITIVE` /
+    /// `CKA_EXTRACTABLE` unset default to non-sensitive and extractable, so
+    /// callers that read the derived secret back without asking for it
+    /// (e.g. Java SunPKCS11 `KeyAgreement`) work without extra configuration.
+    ///
+    /// Default false: derived keys are sensitive and non-extractable unless
+    /// the template says otherwise. Not permitted with `fips_approved_only`.
+    #[serde(default)]
+    pub derived_keys_extractable_by_default: bool,
+}
+
+impl AlgorithmConfig {
+    /// Effective default for derived keys: extractable (and non-sensitive)
+    /// only when enabled and the token is not in FIPS-approved mode.
+    pub fn derived_keys_default_extractable(&self) -> bool {
+        self.derived_keys_extractable_by_default && !self.fips_approved_only
+    }
 }
 
 impl Default for TokenConfig {
@@ -169,6 +187,7 @@ impl Default for AlgorithmConfig {
             enable_pqc: true,
             crypto_backend: default_crypto_backend(),
             fips_approved_only: false,
+            derived_keys_extractable_by_default: false,
         }
     }
 }
@@ -864,6 +883,12 @@ impl HsmConfig {
             if !self.audit.enabled {
                 errors.push("audit must be enabled when fips_approved_only is active".to_string());
             }
+            if self.algorithms.derived_keys_extractable_by_default {
+                errors.push(
+                    "derived_keys_extractable_by_default cannot be true when fips_approved_only is enabled"
+                        .to_string(),
+                );
+            }
         }
 
         if errors.is_empty() {
@@ -880,6 +905,19 @@ impl HsmConfig {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn derived_keys_extractable_by_default_rejected_in_fips_mode() {
+        let mut config = HsmConfig::default();
+        config.algorithms.derived_keys_extractable_by_default = true;
+        assert!(config.validate().is_ok());
+        assert!(config.algorithms.derived_keys_default_extractable());
+
+        config.algorithms.fips_approved_only = true;
+        assert!(config.validate().is_err());
+        // Even if validation were bypassed, FIPS mode forces it off.
+        assert!(!config.algorithms.derived_keys_default_extractable());
+    }
 
     /// Build a unique tempdir path so concurrent tests do not collide.
     ///

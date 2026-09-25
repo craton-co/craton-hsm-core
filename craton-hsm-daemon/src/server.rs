@@ -2171,46 +2171,87 @@ impl HsmService for HsmServiceImpl {
                 .ok_or_else(|| Status::internal("Base key has no material"))?
                 .as_bytes();
 
-            // The mechanism parameter carries the peer public key for ECDH
-            let peer_public_key = &mech.parameter;
-            if peer_public_key.is_empty() {
+            // Key type (generic secret unless the template asks for AES),
+            // requested length and protection of the derived key.
+            let template = proto_attrs_to_template(&req.template)?;
+            let derived_tpl = craton_hsm::crypto::derive::DerivedKeyTemplate::resolve(
+                &template,
+                CKK_GENERIC_SECRET,
+                self.hsm.algorithm_config(),
+            )
+            .map_err(hsm_err_to_status)?;
+            let is_aes = derived_tpl.key_type == CKK_AES;
+
+            let ec_params = base_key.ec_params.as_deref().unwrap_or(&[]);
+            let is_p384 = is_p384_ec_params(ec_params);
+            if !is_p384 && !is_p256_ec_params(ec_params) {
                 return Err(Status::invalid_argument(
-                    "Mechanism parameter must contain the peer public key",
+                    "Unsupported EC parameters — only P-256 and P-384 are supported",
                 ));
             }
+            if !matches!(mech_type, CKM_ECDH1_DERIVE | CKM_ECDH1_COFACTOR_DERIVE) {
+                return Err(Status::invalid_argument("Unsupported derivation mechanism"));
+            }
 
-            // Parse CKA_VALUE_LEN from template for desired derived key length
-            let template = proto_attrs_to_template(&req.template)?;
-            let derived_len = template
-                .iter()
-                .find(|(t, _)| *t == CKA_VALUE_LEN)
-                .and_then(|(_, v)| craton_hsm::store::attributes::read_ck_ulong(v));
-
-            let derived_material = match mech_type {
-                CKM_ECDH1_DERIVE | CKM_ECDH1_COFACTOR_DERIVE => {
-                    let ec_params = base_key.ec_params.as_deref().unwrap_or(&[]);
-                    if is_p384_ec_params(ec_params) {
-                        craton_hsm::crypto::derive::ecdh_p384(
-                            base_material,
-                            peer_public_key,
-                            derived_len.map(|v| v as usize),
-                        )
-                        .map_err(hsm_err_to_status)?
-                    } else if is_p256_ec_params(ec_params) {
-                        craton_hsm::crypto::derive::ecdh_p256(
-                            base_material,
-                            peer_public_key,
-                            derived_len.map(|v| v as usize),
-                        )
-                        .map_err(hsm_err_to_status)?
-                    } else {
-                        return Err(Status::invalid_argument(
-                            "Unsupported EC parameters — only P-256 and P-384 are supported",
-                        ));
-                    }
+            let derived_material = if let Some(params) = &req.ecdh_params {
+                // Standard CK_ECDH1_DERIVE_PARAMS: raw shared secret from the
+                // configured backend, then the requested PKCS#11 KDF.
+                let kdf = to_ck_ulong(params.kdf, "ecdh_params.kdf")?;
+                let peer = craton_hsm::store::ec_point::decode(&params.public_data);
+                if peer.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "ecdh_params.public_data must contain the peer public key",
+                    ));
                 }
-                _ => return Err(Status::invalid_argument("Unsupported derivation mechanism")),
+                let backend = self.hsm.crypto_backend();
+                let z = if is_p384 {
+                    backend.ecdh_p384_shared_secret(base_material, peer)
+                } else {
+                    backend.ecdh_p256_shared_secret(base_material, peer)
+                }
+                .map_err(|e| match e {
+                    craton_hsm::error::HsmError::ArgumentsBad => {
+                        Status::invalid_argument("Invalid peer public key")
+                    }
+                    e => hsm_err_to_status(e),
+                })?;
+                // AES defaults to 256 bits; a generic secret defaults to the
+                // full shared secret.
+                let key_len = derived_tpl
+                    .value_len
+                    .unwrap_or(if is_aes { 32 } else { z.len() });
+                craton_hsm::crypto::derive::apply_ec_kdf(
+                    backend.as_ref(),
+                    kdf,
+                    &z,
+                    &params.shared_data,
+                    key_len,
+                    self.hsm.algorithm_config().fips_approved_only,
+                )
+                .map_err(hsm_err_to_status)?
+            } else {
+                // Legacy form: the mechanism parameter is the peer public key.
+                let peer = craton_hsm::store::ec_point::decode(&mech.parameter);
+                if peer.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "Mechanism parameter must contain the peer public key",
+                    ));
+                }
+                let okm_len = if is_aes {
+                    Some(derived_tpl.value_len.unwrap_or(32))
+                } else {
+                    derived_tpl.value_len
+                };
+                if is_p384 {
+                    craton_hsm::crypto::derive::ecdh_p384(base_material, peer, okm_len)
+                } else {
+                    craton_hsm::crypto::derive::ecdh_p256(base_material, peer, okm_len)
+                }
+                .map_err(hsm_err_to_status)?
             };
+            derived_tpl
+                .check_len(derived_material.as_bytes().len())
+                .map_err(hsm_err_to_status)?;
 
             drop(base_key);
 
@@ -2224,15 +2265,20 @@ impl HsmService for HsmServiceImpl {
             let derived_len_actual = derived_material.as_bytes().len();
             let mut obj = craton_hsm::store::object::StoredObject::new(handle, CKO_SECRET_KEY);
             obj.slot_id = slot_id;
-            obj.key_type = Some(CKK_GENERIC_SECRET);
+            obj.key_type = Some(derived_tpl.key_type);
             obj.value_len = Some(derived_len_actual as CK_ULONG);
             obj.key_material = Some(derived_material);
-            obj.sensitive = true;
-            obj.extractable = false;
+            // PKCS#11 lets the template choose the derived key's protection;
+            // `DerivedKeyTemplate` has already applied it (and the defaults).
+            obj.sensitive = derived_tpl.sensitive;
+            obj.extractable = derived_tpl.extractable;
 
-            // Apply template attributes (label, CKA_ENCRYPT, etc.)
+            // Apply the remaining template attributes (label, CKA_ENCRYPT, etc.)
             for (attr_type, value) in &template {
-                if *attr_type == CKA_VALUE_LEN {
+                if matches!(
+                    *attr_type,
+                    CKA_VALUE_LEN | CKA_KEY_TYPE | CKA_SENSITIVE | CKA_EXTRACTABLE
+                ) {
                     continue; // already handled
                 }
                 craton_hsm::store::attributes::apply_attribute(&mut obj, *attr_type, value)
@@ -2708,5 +2754,273 @@ mod tests {
             !body.fips_mode,
             "fips_mode must be false when fips_approved_only is false"
         );
+    }
+
+    // ── DeriveKey (ECDH) ────────────────────────────────────────────────────
+
+    const P384_OID: &[u8] = &[0x06, 0x05, 0x2B, 0x81, 0x04, 0x00, 0x22];
+
+    fn ulong(v: CK_ULONG) -> Vec<u8> {
+        v.to_ne_bytes().to_vec()
+    }
+
+    fn attr(attr_type: CK_ULONG, value: Vec<u8>) -> Attribute {
+        Attribute {
+            attr_type: attr_type as u64,
+            value,
+        }
+    }
+
+    fn make_derive_service(derived_keys_extractable_by_default: bool) -> HsmServiceImpl {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+        let mut config = HsmConfig::default();
+        config.audit.enabled = false;
+        // A private storage dir per service: tests run in parallel and would
+        // otherwise race on the shared lockout-state file.
+        config.token.storage_path = std::env::temp_dir().join(format!(
+            "craton-hsm-daemon-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        config.security.pbkdf2_iterations = 1_000;
+        config.algorithms.derived_keys_extractable_by_default = derived_keys_extractable_by_default;
+        HsmServiceImpl::new(Arc::new(HsmCore::new(&config)), 1024, 1024, 0, 0)
+    }
+
+    async fn user_session(service: &HsmServiceImpl) -> u64 {
+        service
+            .init_token(Request::new(InitTokenRequest {
+                slot_id: 0,
+                so_pin: b"sopin123".to_vec(),
+                label: "DeriveTest".into(),
+            }))
+            .await
+            .expect("init_token");
+        let session = service
+            .open_session(Request::new(OpenSessionRequest {
+                slot_id: 0,
+                read_write: true,
+            }))
+            .await
+            .expect("open_session")
+            .into_inner()
+            .session_handle;
+        let login = |user_type: CK_ULONG, pin: &[u8]| {
+            Request::new(LoginRequest {
+                session_handle: session,
+                user_type: user_type as u64,
+                pin: pin.to_vec(),
+            })
+        };
+        service
+            .login(login(CKU_SO, b"sopin123"))
+            .await
+            .expect("SO login");
+        // The InitPIN RPC cannot be used here: the Login RPC does not update
+        // session state, so InitPIN never sees an SO session. Initialise the
+        // user PIN on the token directly instead.
+        service
+            .hsm
+            .slot_manager()
+            .get_token(0)
+            .expect("token")
+            .init_pin(b"userpin1")
+            .expect("init_pin");
+        service
+            .logout(Request::new(LogoutRequest {
+                session_handle: session,
+            }))
+            .await
+            .expect("logout");
+        service
+            .login(login(CKU_USER, b"userpin1"))
+            .await
+            .expect("user login");
+        session
+    }
+
+    /// Generate a P-384 key pair with default (sensitive) private key.
+    async fn p384_key_pair(service: &HsmServiceImpl, session: u64) -> (u64, u64) {
+        let resp = service
+            .generate_key_pair(Request::new(GenerateKeyPairRequest {
+                session_handle: session,
+                mechanism: Some(Mechanism {
+                    mechanism_type: CKM_EC_KEY_PAIR_GEN as u64,
+                    parameter: Vec::new(),
+                }),
+                public_template: vec![attr(CKA_EC_PARAMS, P384_OID.to_vec())],
+                private_template: vec![attr(CKA_DERIVE, vec![1])],
+            }))
+            .await
+            .expect("generate_key_pair")
+            .into_inner();
+        (resp.public_key_handle, resp.private_key_handle)
+    }
+
+    async fn read_attr(
+        service: &HsmServiceImpl,
+        session: u64,
+        object: u64,
+        t: CK_ULONG,
+    ) -> Vec<u8> {
+        service
+            .get_attribute_value(Request::new(GetAttributeValueRequest {
+                session_handle: session,
+                object_handle: object,
+                attribute_types: vec![t as u64],
+            }))
+            .await
+            .expect("get_attribute_value")
+            .into_inner()
+            .attributes
+            .remove(0)
+            .value
+    }
+
+    /// SunPKCS11-style derivation: CKD_NULL, CKK_GENERIC_SECRET, no length.
+    async fn derive_generic(
+        service: &HsmServiceImpl,
+        session: u64,
+        base: u64,
+        peer_point: Vec<u8>,
+        extra_template: Vec<Attribute>,
+    ) -> Result<u64, Status> {
+        let mut template = vec![
+            attr(CKA_CLASS, ulong(CKO_SECRET_KEY)),
+            attr(CKA_KEY_TYPE, ulong(CKK_GENERIC_SECRET)),
+        ];
+        template.extend(extra_template);
+        service
+            .derive_key(Request::new(DeriveKeyRequest {
+                session_handle: session,
+                mechanism: Some(Mechanism {
+                    mechanism_type: CKM_ECDH1_DERIVE as u64,
+                    parameter: Vec::new(),
+                }),
+                base_key_handle: base,
+                template,
+                ecdh_params: Some(EcdhDeriveParams {
+                    kdf: CKD_NULL as u64,
+                    shared_data: Vec::new(),
+                    public_data: peer_point,
+                }),
+            }))
+            .await
+            .map(|r| r.into_inner().key_handle)
+    }
+
+    #[tokio::test]
+    async fn derive_key_ecdh_params_readable_with_config_flag() {
+        let service = make_derive_service(true);
+        let session = user_session(&service).await;
+        let (pub_a, priv_a) = p384_key_pair(&service, session).await;
+        let (pub_b, priv_b) = p384_key_pair(&service, session).await;
+        let point_a = read_attr(&service, session, pub_a, CKA_EC_POINT).await;
+        let point_b = read_attr(&service, session, pub_b, CKA_EC_POINT).await;
+        assert_eq!(&point_a[..3], &[0x04, 0x61, 0x04], "EC_POINT is DER");
+
+        let ab = derive_generic(&service, session, priv_a, point_b, vec![])
+            .await
+            .expect("derive A");
+        let ba = derive_generic(&service, session, priv_b, point_a, vec![])
+            .await
+            .expect("derive B");
+        let secret_ab = read_attr(&service, session, ab, CKA_VALUE).await;
+        let secret_ba = read_attr(&service, session, ba, CKA_VALUE).await;
+        assert_eq!(secret_ab.len(), 48, "full P-384 shared secret by default");
+        assert_eq!(secret_ab, secret_ba, "both parties derive the same secret");
+    }
+
+    #[tokio::test]
+    async fn derive_key_is_sensitive_by_default_unless_template_says_otherwise() {
+        let service = make_derive_service(false);
+        let session = user_session(&service).await;
+        let (_pub_a, priv_a) = p384_key_pair(&service, session).await;
+        let (pub_b, _priv_b) = p384_key_pair(&service, session).await;
+        let point_b = read_attr(&service, session, pub_b, CKA_EC_POINT).await;
+
+        let default_key = derive_generic(&service, session, priv_a, point_b.clone(), vec![])
+            .await
+            .expect("derive with defaults");
+        assert!(
+            read_attr(&service, session, default_key, CKA_VALUE)
+                .await
+                .is_empty(),
+            "derived key must be sensitive by default"
+        );
+
+        // The base key is sensitive, but the template may still ask for a
+        // readable derived key, as PKCS#11 permits.
+        let readable = derive_generic(
+            &service,
+            session,
+            priv_a,
+            point_b,
+            vec![attr(CKA_SENSITIVE, vec![0]), attr(CKA_EXTRACTABLE, vec![1])],
+        )
+        .await
+        .expect("derive non-sensitive");
+        assert_eq!(
+            read_attr(&service, session, readable, CKA_VALUE)
+                .await
+                .len(),
+            48
+        );
+    }
+
+    #[tokio::test]
+    async fn derive_key_legacy_parameter_still_supported() {
+        let service = make_derive_service(false);
+        let session = user_session(&service).await;
+        let (_pub_a, priv_a) = p384_key_pair(&service, session).await;
+        let (pub_b, _priv_b) = p384_key_pair(&service, session).await;
+        let point_b = read_attr(&service, session, pub_b, CKA_EC_POINT).await;
+
+        let handle = service
+            .derive_key(Request::new(DeriveKeyRequest {
+                session_handle: session,
+                mechanism: Some(Mechanism {
+                    mechanism_type: CKM_ECDH1_DERIVE as u64,
+                    parameter: point_b,
+                }),
+                base_key_handle: priv_a,
+                template: vec![attr(CKA_VALUE_LEN, ulong(32))],
+                ecdh_params: None,
+            }))
+            .await
+            .expect("legacy derive")
+            .into_inner()
+            .key_handle;
+        assert_ne!(handle, 0);
+    }
+
+    #[tokio::test]
+    async fn derive_key_rejects_ckd_null_with_shared_data() {
+        let service = make_derive_service(false);
+        let session = user_session(&service).await;
+        let (_pub_a, priv_a) = p384_key_pair(&service, session).await;
+        let (pub_b, _priv_b) = p384_key_pair(&service, session).await;
+        let point_b = read_attr(&service, session, pub_b, CKA_EC_POINT).await;
+
+        let err = service
+            .derive_key(Request::new(DeriveKeyRequest {
+                session_handle: session,
+                mechanism: Some(Mechanism {
+                    mechanism_type: CKM_ECDH1_DERIVE as u64,
+                    parameter: Vec::new(),
+                }),
+                base_key_handle: priv_a,
+                template: vec![],
+                ecdh_params: Some(EcdhDeriveParams {
+                    kdf: CKD_NULL as u64,
+                    shared_data: b"info".to_vec(),
+                    public_data: point_b,
+                }),
+            }))
+            .await
+            .expect_err("CKD_NULL with shared data must fail");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 }

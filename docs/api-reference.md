@@ -131,7 +131,7 @@ lib.load("/path/to/libcraton_hsm.so")
 
 | Function | Description |
 |----------|-------------|
-| `C_DeriveKey` | Derive a new key (ECDH with internal HKDF-SHA256 per SP 800-56C) |
+| `C_DeriveKey` | Derive an AES or generic secret key: ECDH via `CK_ECDH1_DERIVE_PARAMS` (`CKD_NULL`, `CKD_SHA256/384/512_KDF`; legacy bare-point parameter uses internal HKDF-SHA256), or ML-KEM decapsulation |
 
 #### Random Number Generation
 
@@ -220,7 +220,7 @@ Sub-modules:
 - `crypto::sign` — signing (RSA PKCS#1/PSS, ECDSA, EdDSA)
 - `crypto::encrypt` — encryption (AES-GCM/CBC/CTR, RSA-OAEP)
 - `crypto::digest` — hashing (SHA-1/2/3)
-- `crypto::derive` — key derivation (ECDH with internal HKDF-SHA256)
+- `crypto::derive` — key derivation (ECDH shared secret, PKCS#11 EC KDFs, legacy HKDF-SHA256, derived-key template policy)
 - `crypto::wrap` — key wrapping (AES-KW, RFC 3394)
 - `crypto::pqc` — post-quantum (ML-KEM, ML-DSA, SLH-DSA)
 - `crypto::drbg` — SP 800-90A HMAC_DRBG

@@ -191,9 +191,24 @@ message UnwrapKeyResponse {
 
 message DeriveKeyRequest {
   uint64 session_handle = 1;
+  // For CKM_ECDH1_DERIVE without `ecdh_params`, `mechanism.parameter` is the
+  // peer public key (legacy form, kept for existing clients).
   Mechanism mechanism = 2;
   uint64 base_key_handle = 3;
   repeated Attribute template = 4;
+  // PKCS#11 CK_ECDH1_DERIVE_PARAMS for CKM_ECDH1_DERIVE /
+  // CKM_ECDH1_COFACTOR_DERIVE. When set, `mechanism.parameter` is ignored.
+  EcdhDeriveParams ecdh_params = 5;
+}
+
+// Mirrors PKCS#11 CK_ECDH1_DERIVE_PARAMS.
+message EcdhDeriveParams {
+  // CKD_NULL (1), CKD_SHA256_KDF (6), CKD_SHA384_KDF (7) or CKD_SHA512_KDF (8).
+  uint64 kdf = 1;
+  // X9.63 SharedInfo; must be empty for CKD_NULL.
+  bytes shared_data = 2;
+  // Peer public key: raw SEC1 point or DER-encoded ECPoint (CKA_EC_POINT).
+  bytes public_data = 3;
 }
 
 message DeriveKeyResponse {

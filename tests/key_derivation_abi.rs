@@ -1424,3 +1424,162 @@ fn test_ecdh_params_rejects_invalid_parameters() {
         Err(CKR_MECHANISM_PARAM_INVALID)
     );
 }
+
+// ============================================================================
+// Derived key type, length and protection (SunPKCS11-style callers)
+// ============================================================================
+
+/// C_DeriveKey with CKD_NULL and an arbitrary template.
+fn derive_ckd_null_with_template(
+    session: CK_SESSION_HANDLE,
+    base_key: CK_OBJECT_HANDLE,
+    public_data: &[u8],
+    template: &[(CK_ATTRIBUTE_TYPE, Vec<u8>)],
+) -> Result<CK_OBJECT_HANDLE, CK_RV> {
+    let mut params = CK_ECDH1_DERIVE_PARAMS {
+        kdf: CKD_NULL,
+        shared_data_len: 0,
+        p_shared_data: ptr::null_mut(),
+        public_data_len: public_data.len() as CK_ULONG,
+        p_public_data: public_data.as_ptr() as CK_BYTE_PTR,
+    };
+    let mut mechanism = CK_MECHANISM {
+        mechanism: CKM_ECDH1_DERIVE,
+        p_parameter: &mut params as *mut _ as CK_VOID_PTR,
+        parameter_len: std::mem::size_of::<CK_ECDH1_DERIVE_PARAMS>() as CK_ULONG,
+    };
+    let mut attrs: Vec<CK_ATTRIBUTE> = template
+        .iter()
+        .map(|(t, v)| CK_ATTRIBUTE {
+            attr_type: *t,
+            p_value: v.as_ptr() as CK_VOID_PTR,
+            value_len: v.len() as CK_ULONG,
+        })
+        .collect();
+    let mut derived: CK_OBJECT_HANDLE = 0;
+    let rv = C_DeriveKey(
+        session,
+        &mut mechanism,
+        base_key,
+        attrs.as_mut_ptr(),
+        attrs.len() as CK_ULONG,
+        &mut derived,
+    );
+    if rv == CKR_OK {
+        Ok(derived)
+    } else {
+        Err(rv)
+    }
+}
+
+fn try_read_attr(
+    session: CK_SESSION_HANDLE,
+    object: CK_OBJECT_HANDLE,
+    attr_type: CK_ATTRIBUTE_TYPE,
+) -> Result<Vec<u8>, CK_RV> {
+    let mut template = [CK_ATTRIBUTE {
+        attr_type,
+        p_value: ptr::null_mut(),
+        value_len: 0,
+    }];
+    let rv = C_GetAttributeValue(session, object, template.as_mut_ptr(), 1);
+    if rv != CKR_OK {
+        return Err(rv);
+    }
+    let mut buf = vec![0u8; template[0].value_len as usize];
+    template[0].p_value = buf.as_mut_ptr() as CK_VOID_PTR;
+    let rv = C_GetAttributeValue(session, object, template.as_mut_ptr(), 1);
+    if rv != CKR_OK {
+        return Err(rv);
+    }
+    buf.truncate(template[0].value_len as usize);
+    Ok(buf)
+}
+
+/// Template SunPKCS11's ECDH KeyAgreement sends: class + generic secret only.
+fn sunpkcs11_template() -> Vec<(CK_ATTRIBUTE_TYPE, Vec<u8>)> {
+    vec![
+        (CKA_CLASS, ck_ulong_bytes(CKO_SECRET_KEY)),
+        (CKA_KEY_TYPE, ck_ulong_bytes(CKK_GENERIC_SECRET)),
+    ]
+}
+
+#[test]
+fn test_derived_generic_secret_defaults_to_full_shared_secret_and_is_sensitive() {
+    let session = setup_user_session();
+    // Default key pairs: the private keys are sensitive.
+    let (_pub_a, priv_a) = generate_ec_keypair(session, &P384_OID);
+    let (pub_b, _priv_b) = generate_ec_keypair(session, &P384_OID);
+    let point_b = read_ec_point(session, pub_b);
+
+    let derived = derive_ckd_null_with_template(session, priv_a, &point_b, &sunpkcs11_template())
+        .expect("generic-secret derive failed");
+    assert_eq!(
+        read_attr(session, derived, CKA_KEY_TYPE),
+        ck_ulong_bytes(CKK_GENERIC_SECRET)
+    );
+    assert_eq!(
+        read_attr(session, derived, CKA_VALUE_LEN),
+        ck_ulong_bytes(48),
+        "no CKA_VALUE_LEN: generic secret is the full P-384 shared secret"
+    );
+    assert_eq!(
+        try_read_attr(session, derived, CKA_VALUE),
+        Err(CKR_ATTRIBUTE_SENSITIVE),
+        "derived keys are sensitive by default"
+    );
+}
+
+#[test]
+fn test_sensitive_base_key_can_derive_readable_secret() {
+    let session = setup_user_session();
+    let (pub_a, priv_a) = generate_ec_keypair(session, &P384_OID);
+    let (pub_b, priv_b) = generate_ec_keypair(session, &P384_OID);
+    let point_a = read_ec_point(session, pub_a);
+    let point_b = read_ec_point(session, pub_b);
+
+    let mut template = sunpkcs11_template();
+    template.push((CKA_SENSITIVE, vec![CK_FALSE]));
+    template.push((CKA_EXTRACTABLE, vec![CK_TRUE]));
+
+    let ab = derive_ckd_null_with_template(session, priv_a, &point_b, &template)
+        .expect("non-sensitive derive from a sensitive base key must be allowed");
+    let ba = derive_ckd_null_with_template(session, priv_b, &point_a, &template).unwrap();
+    let secret_ab = read_attr(session, ab, CKA_VALUE);
+    assert_eq!(secret_ab.len(), 48);
+    assert_eq!(secret_ab, read_attr(session, ba, CKA_VALUE));
+    assert_eq!(read_attr(session, ab, CKA_EXTRACTABLE), vec![CK_TRUE]);
+}
+
+#[test]
+fn test_derived_key_type_and_length_validation() {
+    let session = setup_user_session();
+    let (_pub_a, priv_a) = generate_ec_keypair(session, &P384_OID);
+    let (pub_b, _priv_b) = generate_ec_keypair(session, &P384_OID);
+    let point_b = read_ec_point(session, pub_b);
+
+    // AES keys must be 16/24/32 bytes.
+    let aes48 = vec![
+        (CKA_KEY_TYPE, ck_ulong_bytes(CKK_AES)),
+        (CKA_VALUE_LEN, ck_ulong_bytes(48)),
+    ];
+    assert_eq!(
+        derive_ckd_null_with_template(session, priv_a, &point_b, &aes48),
+        Err(CKR_KEY_SIZE_RANGE)
+    );
+
+    // A generic secret can be any length up to the shared secret (CKD_NULL).
+    let generic20 = vec![
+        (CKA_KEY_TYPE, ck_ulong_bytes(CKK_GENERIC_SECRET)),
+        (CKA_VALUE_LEN, ck_ulong_bytes(20)),
+    ];
+    let h = derive_ckd_null_with_template(session, priv_a, &point_b, &generic20).unwrap();
+    assert_eq!(read_attr(session, h, CKA_VALUE_LEN), ck_ulong_bytes(20));
+
+    // Only AES and generic secrets can be derived.
+    let des3 = vec![(CKA_KEY_TYPE, ck_ulong_bytes(0x15))]; // CKK_DES3
+    assert_eq!(
+        derive_ckd_null_with_template(session, priv_a, &point_b, &des3),
+        Err(CKR_TEMPLATE_INCONSISTENT)
+    );
+}
