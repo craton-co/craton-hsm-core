@@ -1436,7 +1436,8 @@ pub extern "C" fn C_SetAttributeValue(
                 // CKA_EC_POINT. The hybrid sign/verify paths look this up in
                 // `extra_attributes`, so allow it to be set on ML-DSA keys.
                 CKA_EC_POINT if obj.key_type == Some(CKK_ML_DSA) => {
-                    obj.extra_attributes.insert(CKA_EC_POINT, value.clone());
+                    obj.extra_attributes
+                        .insert(CKA_EC_POINT, crate::store::ec_point::decode(value).to_vec());
                 }
                 // Reject all other attributes as read-only
                 _ => {
@@ -5735,6 +5736,13 @@ pub extern "C" fn C_DeriveKey(
         if mech_param.is_empty() {
             return CKR_MECHANISM_PARAM_INVALID;
         }
+        // PKCS#11 allows the ECDH peer public key as either a raw point or
+        // the DER-encoded ECPoint read from another token's CKA_EC_POINT.
+        let mech_param = if pqc::mechanism_to_ml_kem_variant(mechanism).is_none() {
+            crate::store::ec_point::decode(&mech_param).to_vec()
+        } else {
+            mech_param
+        };
 
         let template = if p_template.is_null() {
             vec![]

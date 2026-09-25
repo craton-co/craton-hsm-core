@@ -337,6 +337,88 @@ fn test_ecdh_p256_both_sides_derive_same() {
 }
 
 // ============================================================================
+// CKA_EC_POINT encoding (PKCS#11: DER OCTET STRING around the X9.62 point)
+// ============================================================================
+
+#[test]
+fn test_ec_point_p256_is_der_octet_string() {
+    let session = setup_user_session();
+    let (pub_key, _priv_key) = generate_ec_keypair(session, &P256_OID);
+    let ec_point = read_ec_point(session, pub_key);
+    assert_eq!(ec_point.len(), 2 + 65, "P-256 EC_POINT must be 67 bytes");
+    assert_eq!(
+        &ec_point[..3],
+        &[0x04, 0x41, 0x04],
+        "P-256 EC_POINT must be OCTET STRING(65) wrapping an uncompressed point"
+    );
+}
+
+#[test]
+fn test_ec_point_p384_is_der_octet_string() {
+    let session = setup_user_session();
+    let (pub_key, _priv_key) = generate_ec_keypair(session, &P384_OID);
+    let ec_point = read_ec_point(session, pub_key);
+    assert_eq!(ec_point.len(), 2 + 97, "P-384 EC_POINT must be 99 bytes");
+    assert_eq!(
+        &ec_point[..3],
+        &[0x04, 0x61, 0x04],
+        "P-384 EC_POINT must be OCTET STRING(97) wrapping an uncompressed point"
+    );
+}
+
+#[test]
+fn test_ecdh_accepts_raw_and_der_peer_point() {
+    let session = setup_user_session();
+    let (_pub_a, priv_a) = generate_ec_keypair(session, &P256_OID);
+    let (pub_b, _priv_b) = generate_ec_keypair(session, &P256_OID);
+
+    let der_point = read_ec_point(session, pub_b);
+    let raw_point = &der_point[2..];
+
+    let from_der = do_ecdh_derive(session, priv_a, &der_point);
+    let from_raw = do_ecdh_derive(session, priv_a, raw_point);
+
+    // Both encodings of the same peer key must yield the same secret:
+    // encrypt under one derived key, decrypt under the other.
+    let plaintext = b"ecdh raw/der equivalence";
+    let iv = [0u8; 12];
+    let mut mech = CK_MECHANISM {
+        mechanism: CKM_AES_GCM,
+        p_parameter: iv.as_ptr() as CK_VOID_PTR,
+        parameter_len: iv.len() as CK_ULONG,
+    };
+    let rv = C_EncryptInit(session, &mut mech, from_der);
+    assert_eq!(rv, CKR_OK);
+    let mut ciphertext = vec![0u8; 256];
+    let mut ct_len: CK_ULONG = ciphertext.len() as CK_ULONG;
+    let rv = C_Encrypt(
+        session,
+        plaintext.as_ptr() as *mut _,
+        plaintext.len() as CK_ULONG,
+        ciphertext.as_mut_ptr(),
+        &mut ct_len,
+    );
+    assert_eq!(rv, CKR_OK);
+
+    let rv = C_DecryptInit(session, &mut mech, from_raw);
+    assert_eq!(rv, CKR_OK);
+    let mut recovered = vec![0u8; 256];
+    let mut rec_len: CK_ULONG = recovered.len() as CK_ULONG;
+    let rv = C_Decrypt(
+        session,
+        ciphertext.as_mut_ptr(),
+        ct_len,
+        recovered.as_mut_ptr(),
+        &mut rec_len,
+    );
+    assert_eq!(
+        rv, CKR_OK,
+        "raw and DER peer points must derive the same key"
+    );
+    assert_eq!(&recovered[..rec_len as usize], plaintext);
+}
+
+// ============================================================================
 // ECDH P-384 derivation
 // ============================================================================
 

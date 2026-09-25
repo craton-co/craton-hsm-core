@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **PKCS#11 `CKA_EC_POINT` returned the raw point instead of the DER-encoded `ECPoint`**:
+  PKCS#11 defines `CKA_EC_POINT` as the DER encoding of the ANSI X9.62 `ECPoint`, i.e. an
+  `OCTET STRING` wrapping the SEC1 point (`04 61 04 ...` for P-384). The token returned the bare
+  `04 || X || Y`, so OpenSC `pkcs11-tool --read-object` failed with "cannot obtain and parse
+  EC_POINT" and OpenSSL `pkcs11-provider` failed with `ASN1_get_object: header too long`.
+  `C_GetAttributeValue` now returns the DER form for EC and Edwards keys. Supplied values
+  (`C_CreateObject`, `C_FindObjects` templates, `CKM_ECDH1_DERIVE` peer keys) are accepted in
+  either DER or raw form, and objects persisted by earlier versions in either form keep working.
+
 ## [0.10.1] - 2026-09-24
 
 ### Fixed
