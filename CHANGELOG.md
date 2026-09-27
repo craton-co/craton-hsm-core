@@ -45,6 +45,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   sensitivity handling as `C_DeriveKey`; the peer key may be raw or DER-encoded. Requests without
   it keep the previous behaviour. A template can now also mark the derived key non-sensitive,
   which the RPC previously refused.
+- **gRPC `Login` / `Logout` did not update session state**: the RPCs changed only the token's
+  login state, so sessions stayed public after `Login` and `InitPIN` always failed with "requires
+  SO login". They now update every session on the slot as `C_Login` / `C_Logout` do: `Login`
+  logs all sessions in, `Logout` resets them and zeroizes in-flight operations, and SO login is
+  refused (`FAILED_PRECONDITION`) while a read-only session is open.
 
 ### Added
 
