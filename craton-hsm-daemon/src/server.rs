@@ -611,6 +611,15 @@ impl HsmService for HsmServiceImpl {
                 .get_token(slot_id)
                 .map_err(hsm_err_to_status)?;
 
+            // PKCS#11 (as C_Login): SO login is not allowed while a
+            // read-only session is open on the slot.
+            if user_type_ck == CKU_SO && self.hsm.session_manager().has_ro_sessions(slot_id) {
+                req.pin.zeroize();
+                return Err(hsm_err_to_status(
+                    craton_hsm::error::HsmError::SessionReadOnlyExists,
+                ));
+            }
+
             // (#2) PIN is now `bytes` in proto — use directly, then zeroize
             let result = token.login(user_type_ck, &req.pin);
 
@@ -619,6 +628,12 @@ impl HsmService for HsmServiceImpl {
 
             match result {
                 Ok(()) => {
+                    // Move every session on this slot to the logged-in state,
+                    // as C_Login does. Without this the token is logged in
+                    // but session-level checks (e.g. InitPIN's SO check) still
+                    // see a public session.
+                    let _ = self.hsm.session_manager().login_all(slot_id, user_type_ck);
+
                     // (#5) Clear failed attempts on success
                     self.clear_login_attempts(&throttle_key);
 
@@ -682,6 +697,11 @@ impl HsmService for HsmServiceImpl {
                 .map_err(hsm_err_to_status)?;
 
             token.logout().map_err(hsm_err_to_status)?;
+
+            // As C_Logout: reset every session on this slot to the public
+            // state and zeroize any in-flight operation or find context, so
+            // nothing authenticated outlives the token-level logout.
+            self.hsm.session_manager().cancel_sessions_for_slot(slot_id);
 
             // (#18) Audit logout
             self.audit(
@@ -2756,6 +2776,147 @@ mod tests {
         );
     }
 
+    // ── Login / Logout session state ────────────────────────────────────────
+
+    fn session_state(service: &HsmServiceImpl, session: u64) -> (bool, bool) {
+        let s = service
+            .hsm
+            .session_manager()
+            .get_session(session as CK_ULONG)
+            .expect("session");
+        let s = s.read();
+        (s.state.is_logged_in(), s.state.is_so())
+    }
+
+    async fn open(service: &HsmServiceImpl, read_write: bool) -> u64 {
+        service
+            .open_session(Request::new(OpenSessionRequest {
+                slot_id: 0,
+                read_write,
+            }))
+            .await
+            .expect("open_session")
+            .into_inner()
+            .session_handle
+    }
+
+    async fn login_rpc(
+        service: &HsmServiceImpl,
+        session: u64,
+        user_type: CK_ULONG,
+        pin: &[u8],
+    ) -> Result<Response<LoginResponse>, Status> {
+        service
+            .login(Request::new(LoginRequest {
+                session_handle: session,
+                user_type: user_type as u64,
+                pin: pin.to_vec(),
+            }))
+            .await
+    }
+
+    async fn init_token(service: &HsmServiceImpl) {
+        service
+            .init_token(Request::new(InitTokenRequest {
+                slot_id: 0,
+                so_pin: b"sopin123".to_vec(),
+                label: "LoginTest".into(),
+            }))
+            .await
+            .expect("init_token");
+    }
+
+    #[tokio::test]
+    async fn login_so_init_pin_logout_login_user() {
+        let service = make_derive_service(false);
+        init_token(&service).await;
+        let session = open(&service, true).await;
+        assert_eq!(session_state(&service, session), (false, false));
+
+        login_rpc(&service, session, CKU_SO, b"sopin123")
+            .await
+            .expect("SO login");
+        assert_eq!(session_state(&service, session), (true, true));
+
+        service
+            .init_pin(Request::new(InitPinRequest {
+                session_handle: session,
+                pin: b"userpin1".to_vec(),
+            }))
+            .await
+            .expect("InitPIN must succeed after an SO Login RPC");
+
+        service
+            .logout(Request::new(LogoutRequest {
+                session_handle: session,
+            }))
+            .await
+            .expect("logout");
+        assert_eq!(
+            session_state(&service, session),
+            (false, false),
+            "logout must reset session state"
+        );
+        let err = service
+            .init_pin(Request::new(InitPinRequest {
+                session_handle: session,
+                pin: b"userpin2".to_vec(),
+            }))
+            .await
+            .expect_err("InitPIN must fail after logout");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        login_rpc(&service, session, CKU_USER, b"userpin1")
+            .await
+            .expect("user login");
+        assert_eq!(session_state(&service, session), (true, false));
+    }
+
+    #[tokio::test]
+    async fn login_updates_every_session_on_the_slot() {
+        let service = make_derive_service(false);
+        init_token(&service).await;
+        let first = open(&service, true).await;
+        let second = open(&service, true).await;
+
+        login_rpc(&service, first, CKU_SO, b"sopin123")
+            .await
+            .expect("SO login");
+        assert_eq!(session_state(&service, second), (true, true));
+
+        service
+            .logout(Request::new(LogoutRequest {
+                session_handle: second,
+            }))
+            .await
+            .expect("logout");
+        assert_eq!(session_state(&service, first), (false, false));
+    }
+
+    #[tokio::test]
+    async fn so_login_rejected_while_read_only_session_open() {
+        let service = make_derive_service(false);
+        init_token(&service).await;
+        let _ro = open(&service, false).await;
+        let rw = open(&service, true).await;
+
+        let err = login_rpc(&service, rw, CKU_SO, b"sopin123")
+            .await
+            .expect_err("SO login must be refused while an RO session exists");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(session_state(&service, rw), (false, false));
+        assert_ne!(
+            service
+                .hsm
+                .slot_manager()
+                .get_token(0)
+                .expect("token")
+                .login_state(),
+            LoginState::SoLoggedIn,
+            "the token must not be logged in either"
+        );
+    }
+
     // ── DeriveKey (ECDH) ────────────────────────────────────────────────────
 
     const P384_OID: &[u8] = &[0x06, 0x05, 0x2B, 0x81, 0x04, 0x00, 0x22];
@@ -2818,15 +2979,12 @@ mod tests {
             .login(login(CKU_SO, b"sopin123"))
             .await
             .expect("SO login");
-        // The InitPIN RPC cannot be used here: the Login RPC does not update
-        // session state, so InitPIN never sees an SO session. Initialise the
-        // user PIN on the token directly instead.
         service
-            .hsm
-            .slot_manager()
-            .get_token(0)
-            .expect("token")
-            .init_pin(b"userpin1")
+            .init_pin(Request::new(InitPinRequest {
+                session_handle: session,
+                pin: b"userpin1".to_vec(),
+            }))
+            .await
             .expect("init_pin");
         service
             .logout(Request::new(LogoutRequest {
