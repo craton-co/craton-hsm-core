@@ -4,6 +4,47 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.10.3] - 2026-09-29
+
+### Fixed
+
+- **`CKM_AES_GCM` ignored `CK_GCM_PARAMS`, breaking OpenBao PKCS#11 auto-unseal**: the IV,
+  AAD and tag length in `CK_GCM_PARAMS` were ignored; the token generated its own nonce and
+  returned `nonce || ciphertext || tag`. Callers that choose the IV and store it next to the
+  ciphertext (OpenBao, and any standard PKCS#11 client) could not decrypt: OpenBao's unseal failed
+  with `CKR_ENCRYPTED_DATA_INVALID`. `pkcs11-tool` round trips appeared to work only because it
+  fed the whole output back. When the mechanism parameter is a `CK_GCM_PARAMS` (current or
+  pre-errata v2.40 layout), `C_Encrypt` / `C_Decrypt` now use the caller's IV and AAD and the
+  ciphertext is `ciphertext || tag`, per PKCS#11. Only a 96-bit IV and 128-bit tag are
+  supported (`CKR_MECHANISM_PARAM_INVALID` otherwise); an all-zero IV, or an IV already used with
+  the same key, is refused. Callers that pass no `CK_GCM_PARAMS` keep the previous token-generated
+  nonce layout, so existing ciphertexts still decrypt.
+- **ML-DSA keys could not be used through OpenSSL `pkcs11-provider`**: post-quantum keys used
+  vendor-defined key types (`CKA_KEY_TYPE` = 0x80000002 for ML-DSA) and had no
+  `CKA_PARAMETER_SET`, so the provider rejected them with "Unsupported key type (2147483650)".
+  Keys now use the PKCS#11 v3.2 representation:
+  - `CKK_ML_KEM` (0x49), `CKK_ML_DSA` (0x4A), `CKK_SLH_DSA` (0x4B). Keys stored by earlier
+    versions are mapped on load, and templates that still name the old values match.
+  - `CKA_PARAMETER_SET` (`CKP_ML_DSA_44/65/87`, `CKP_ML_KEM_512/768/1024`,
+    `CKP_SLH_DSA_SHA2_128S/256S`), readable and searchable, including on existing keys.
+  - `CKA_VALUE` of an ML-KEM / ML-DSA / SLH-DSA public key returns the encoded public key.
+  - New mechanisms `CKM_ML_DSA_KEY_PAIR_GEN`, `CKM_ML_DSA`, `CKM_ML_KEM_KEY_PAIR_GEN`,
+    `CKM_SLH_DSA_KEY_PAIR_GEN` and `CKM_SLH_DSA`, taking the parameter set from
+    `CKA_PARAMETER_SET`. `CKM_ML_DSA` / `CKM_SLH_DSA` accept an optional
+    `CK_SIGN_ADDITIONAL_CONTEXT`; signing is deterministic with an empty context, so
+    `CKH_HEDGE_REQUIRED` or a non-empty context returns `CKR_MECHANISM_PARAM_INVALID`.
+
+  The vendor-defined mechanisms (`CKM_ML_DSA_87`, ...) are still accepted.
+- **`C_GetFunctionList` reported version 3.0 for a v2.40 function table**: callers that trust the
+  version (pkcs11-provider) cast it to `CK_FUNCTION_LIST_3_0` and read `C_GetInterface` past the
+  end of the table. It now reports 2.40. `C_GetInfo` still reports Cryptoki 3.0.
+- **Panic at process exit under OpenSSL `pkcs11-provider`**: the provider calls `C_Finalize`
+  from OpenSSL's exit-time cleanup, after the calling thread's thread-locals are destroyed, and
+  the per-thread HSM and session caches then panicked ("cannot access a Thread Local Storage
+  value during or after destruction"). The caches now fall back to the uncached path.
+- `CKA_COPYABLE` could not be read (`CKR_ATTRIBUTE_TYPE_INVALID`).
+- `craton-hsm-admin` showed wrong key-type names for Ed25519, generic secret and PQC keys.
+
 ## [0.10.2] - 2026-09-27
 
 ### Fixed

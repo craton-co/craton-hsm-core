@@ -1089,6 +1089,20 @@ All 41 cryptographic mechanisms supported by the module:
 | `CKM_SHA3_384` | 0x000002C0 | Digest | Yes | 48 bytes |
 | `CKM_SHA3_512` | 0x000002D0 | Digest | Yes | 64 bytes |
 
+**Post-Quantum Mechanisms (PKCS#11 v3.2, not FIPS-approved):**
+
+The parameter set comes from the key's `CKA_PARAMETER_SET`. Keys use the v3.2 key types
+`CKK_ML_KEM` (0x49), `CKK_ML_DSA` (0x4A) and `CKK_SLH_DSA` (0x4B); the vendor-defined key types
+0x80000001–0x80000003 used before v0.10.3 are mapped to these on load and in templates.
+
+| Mechanism | CKM Value | Operations | Standard |
+|-----------|-----------|------------|----------|
+| `CKM_ML_KEM_KEY_PAIR_GEN` | 0x0000000F | Keygen | FIPS 203 |
+| `CKM_ML_DSA_KEY_PAIR_GEN` | 0x0000001C | Keygen | FIPS 204 |
+| `CKM_ML_DSA` | 0x0000001D | Sign, Verify (pure, deterministic, empty context) | FIPS 204 |
+| `CKM_SLH_DSA_KEY_PAIR_GEN` | 0x0000002D | Keygen (SHA2-128s, SHA2-256s) | FIPS 205 |
+| `CKM_SLH_DSA` | 0x0000002E | Sign, Verify | FIPS 205 |
+
 **Post-Quantum Mechanisms (vendor-defined, not FIPS-approved):**
 
 | Mechanism | CKM Value | Operations | Standard |

@@ -26,9 +26,11 @@ pub fn is_sign_mechanism(mechanism: CK_MECHANISM_TYPE) -> bool {
             | CKM_ECDSA_SHA384
             | CKM_ECDSA_SHA512
             | CKM_EDDSA
+            | CKM_ML_DSA
             | CKM_ML_DSA_44
             | CKM_ML_DSA_65
             | CKM_ML_DSA_87
+            | CKM_SLH_DSA
             | CKM_SLH_DSA_SHA2_128S
             | CKM_SLH_DSA_SHA2_256S
             | CKM_HYBRID_ML_DSA_ECDSA
@@ -55,6 +57,9 @@ pub fn is_keypair_gen_mechanism(mechanism: CK_MECHANISM_TYPE) -> bool {
         CKM_RSA_PKCS_KEY_PAIR_GEN
             | CKM_EC_KEY_PAIR_GEN
             | CKM_EDDSA
+            | CKM_ML_KEM_KEY_PAIR_GEN
+            | CKM_ML_DSA_KEY_PAIR_GEN
+            | CKM_SLH_DSA_KEY_PAIR_GEN
             | CKM_ML_KEM_512
             | CKM_ML_KEM_768
             | CKM_ML_KEM_1024
@@ -136,6 +141,12 @@ pub fn supported_mechanisms() -> Vec<CK_MECHANISM_TYPE> {
         CKM_SHA3_256,
         CKM_SHA3_384,
         CKM_SHA3_512,
+        // Post-Quantum (PKCS#11 v3.2)
+        CKM_ML_KEM_KEY_PAIR_GEN,
+        CKM_ML_DSA_KEY_PAIR_GEN,
+        CKM_ML_DSA,
+        CKM_SLH_DSA_KEY_PAIR_GEN,
+        CKM_SLH_DSA,
         // Post-Quantum (vendor-defined)
         CKM_ML_KEM_512,
         CKM_ML_KEM_768,
@@ -215,7 +226,12 @@ pub fn is_fips_approved(mechanism: CK_MECHANISM_TYPE) -> bool {
 fn is_pqc_mechanism(mechanism: CK_MECHANISM_TYPE) -> bool {
     matches!(
         mechanism,
-        CKM_ML_KEM_512
+        CKM_ML_KEM_KEY_PAIR_GEN
+            | CKM_ML_DSA_KEY_PAIR_GEN
+            | CKM_ML_DSA
+            | CKM_SLH_DSA_KEY_PAIR_GEN
+            | CKM_SLH_DSA
+            | CKM_ML_KEM_512
             | CKM_ML_KEM_768
             | CKM_ML_KEM_1024
             | CKM_ML_DSA_44

@@ -621,7 +621,8 @@ pub fn apply_attribute(
             obj.class = read_ck_ulong(value).ok_or(HsmError::AttributeValueInvalid)?;
         }
         CKA_KEY_TYPE => {
-            obj.key_type = Some(read_ck_ulong(value).ok_or(HsmError::AttributeValueInvalid)?);
+            let key_type = read_ck_ulong(value).ok_or(HsmError::AttributeValueInvalid)?;
+            obj.key_type = Some(normalize_key_type(key_type));
         }
         CKA_LABEL => {
             obj.label = value.to_vec();
@@ -783,6 +784,7 @@ pub fn read_attribute(
         CKA_EXTRACTABLE => Ok(Some(vec![if obj.extractable { 1 } else { 0 }])),
         CKA_MODIFIABLE => Ok(Some(vec![if obj.modifiable { 1 } else { 0 }])),
         CKA_DESTROYABLE => Ok(Some(vec![if obj.destroyable { 1 } else { 0 }])),
+        CKA_COPYABLE => Ok(Some(vec![if obj.copyable { 1 } else { 0 }])),
         CKA_ENCRYPT => Ok(Some(vec![if obj.can_encrypt { 1 } else { 0 }])),
         CKA_DECRYPT => Ok(Some(vec![if obj.can_decrypt { 1 } else { 0 }])),
         CKA_SIGN => Ok(Some(vec![if obj.can_sign { 1 } else { 0 }])),
@@ -803,8 +805,15 @@ pub fn read_attribute(
             if obj.sensitive && !obj.extractable {
                 return Err(HsmError::AttributeSensitive);
             }
+            // PKCS#11 v3.2: CKA_VALUE of an ML-KEM / ML-DSA / SLH-DSA public
+            // key is the encoded public key. Generated key pairs keep it in
+            // `public_key_data`, not `key_material`.
+            if obj.class == CKO_PUBLIC_KEY && obj.key_material.is_none() && obj.is_pqc_key() {
+                return Ok(obj.public_key_data.clone());
+            }
             Ok(obj.key_material.as_ref().map(|km| km.as_bytes().to_vec()))
         }
+        CKA_PARAMETER_SET => Ok(obj.parameter_set().map(ck_ulong_to_bytes)),
         CKA_MODULUS => Ok(obj.modulus.clone()),
         CKA_MODULUS_BITS => Ok(obj.modulus_bits.map(ck_ulong_to_bytes)),
         CKA_PUBLIC_EXPONENT => Ok(obj.public_exponent.clone()),

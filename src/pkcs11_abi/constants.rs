@@ -132,7 +132,17 @@ pub const CKM_SHA3_256: CK_ULONG = 0x000002B0;
 pub const CKM_SHA3_384: CK_ULONG = 0x000002C0;
 pub const CKM_SHA3_512: CK_ULONG = 0x000002D0;
 
+// --- Post-Quantum Mechanisms (PKCS#11 v3.2) ---
+// The parameter set (ML-DSA-44/65/87, ...) comes from the key's
+// CKA_PARAMETER_SET rather than from the mechanism.
+pub const CKM_ML_KEM_KEY_PAIR_GEN: CK_ULONG = 0x0000000F;
+pub const CKM_ML_DSA_KEY_PAIR_GEN: CK_ULONG = 0x0000001C;
+pub const CKM_ML_DSA: CK_ULONG = 0x0000001D;
+pub const CKM_SLH_DSA_KEY_PAIR_GEN: CK_ULONG = 0x0000002D;
+pub const CKM_SLH_DSA: CK_ULONG = 0x0000002E;
+
 // --- Post-Quantum Mechanisms (vendor-defined range) ---
+// Predate PKCS#11 v3.2; each names one parameter set. Still accepted.
 pub const CKM_ML_KEM_512: CK_ULONG = 0x80000001;
 pub const CKM_ML_KEM_768: CK_ULONG = 0x80000002;
 pub const CKM_ML_KEM_1024: CK_ULONG = 0x80000003;
@@ -165,10 +175,45 @@ pub const CKK_AES: CK_ULONG = 0x0000001F;
 pub const CKK_SHA256_HMAC: CK_ULONG = 0x0000002B;
 pub const CKK_EC_EDWARDS: CK_ULONG = 0x00000040;
 pub const CKK_EC_MONTGOMERY: CK_ULONG = 0x00000041;
+pub const CKK_ML_KEM: CK_ULONG = 0x00000049;
+pub const CKK_ML_DSA: CK_ULONG = 0x0000004A;
+pub const CKK_SLH_DSA: CK_ULONG = 0x0000004B;
 pub const CKK_VENDOR_DEFINED: CK_ULONG = 0x80000000;
-pub const CKK_ML_KEM: CK_ULONG = 0x80000001;
-pub const CKK_ML_DSA: CK_ULONG = 0x80000002;
-pub const CKK_SLH_DSA: CK_ULONG = 0x80000003;
+
+/// Vendor-defined PQC key types used before the PKCS#11 v3.2 values above.
+/// Objects persisted with them, and templates that still name them, are
+/// mapped to the standard values by [`normalize_key_type`].
+pub const CKK_VENDOR_ML_KEM_LEGACY: CK_ULONG = 0x80000001;
+pub const CKK_VENDOR_ML_DSA_LEGACY: CK_ULONG = 0x80000002;
+pub const CKK_VENDOR_SLH_DSA_LEGACY: CK_ULONG = 0x80000003;
+
+/// Map a legacy vendor-defined PQC key type to its PKCS#11 v3.2 value.
+/// Other key types are returned unchanged.
+pub const fn normalize_key_type(key_type: CK_ULONG) -> CK_ULONG {
+    match key_type {
+        CKK_VENDOR_ML_KEM_LEGACY => CKK_ML_KEM,
+        CKK_VENDOR_ML_DSA_LEGACY => CKK_ML_DSA,
+        CKK_VENDOR_SLH_DSA_LEGACY => CKK_SLH_DSA,
+        other => other,
+    }
+}
+
+// --- Parameter Sets (CKP_*, PKCS#11 v3.2) ---
+
+pub const CKP_ML_DSA_44: CK_ULONG = 0x00000001;
+pub const CKP_ML_DSA_65: CK_ULONG = 0x00000002;
+pub const CKP_ML_DSA_87: CK_ULONG = 0x00000003;
+pub const CKP_ML_KEM_512: CK_ULONG = 0x00000001;
+pub const CKP_ML_KEM_768: CK_ULONG = 0x00000002;
+pub const CKP_ML_KEM_1024: CK_ULONG = 0x00000003;
+pub const CKP_SLH_DSA_SHA2_128S: CK_ULONG = 0x00000001;
+pub const CKP_SLH_DSA_SHA2_256S: CK_ULONG = 0x00000009;
+
+// --- Hedging variants for CK_SIGN_ADDITIONAL_CONTEXT (PKCS#11 v3.2) ---
+
+pub const CKH_HEDGE_PREFERRED: CK_ULONG = 0x00000000;
+pub const CKH_HEDGE_REQUIRED: CK_ULONG = 0x00000001;
+pub const CKH_DETERMINISTIC_REQUIRED: CK_ULONG = 0x00000002;
 
 // --- Attribute Types (CKA_*) ---
 
@@ -218,6 +263,7 @@ pub const CKA_MODIFIABLE: CK_ULONG = 0x00000170;
 pub const CKA_COPYABLE: CK_ULONG = 0x00000171;
 pub const CKA_DESTROYABLE: CK_ULONG = 0x00000172;
 pub const CKA_WRAP_WITH_TRUSTED: CK_ULONG = 0x00000210;
+pub const CKA_PARAMETER_SET: CK_ULONG = 0x0000061D;
 pub const CKA_TRUSTED: CK_ULONG = 0x00000086;
 pub const CKA_VENDOR_DEFINED: CK_ULONG = 0x80000000;
 

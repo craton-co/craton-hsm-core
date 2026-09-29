@@ -173,6 +173,34 @@ impl StoredObject {
         Self::new(1, 0)
     }
 
+    /// PKCS#11 v3.2 `CKA_PARAMETER_SET` of a post-quantum key, derived from
+    /// the length of its public key (FIPS 203 / 204 / 205). Deriving it keeps
+    /// it correct for keys generated before the attribute existed.
+    pub fn parameter_set(&self) -> Option<CK_ULONG> {
+        let public_key = match (&self.public_key_data, &self.key_material) {
+            (Some(pk), _) => pk.as_slice(),
+            // A public key imported with C_CreateObject keeps CKA_VALUE here.
+            (None, Some(km)) if self.class == CKO_PUBLIC_KEY => km.as_bytes(),
+            _ => return None,
+        };
+        match (self.key_type?, public_key.len()) {
+            (CKK_ML_DSA, 1312) => Some(CKP_ML_DSA_44),
+            (CKK_ML_DSA, 1952) => Some(CKP_ML_DSA_65),
+            (CKK_ML_DSA, 2592) => Some(CKP_ML_DSA_87),
+            (CKK_ML_KEM, 800) => Some(CKP_ML_KEM_512),
+            (CKK_ML_KEM, 1184) => Some(CKP_ML_KEM_768),
+            (CKK_ML_KEM, 1568) => Some(CKP_ML_KEM_1024),
+            (CKK_SLH_DSA, 32) => Some(CKP_SLH_DSA_SHA2_128S),
+            (CKK_SLH_DSA, 64) => Some(CKP_SLH_DSA_SHA2_256S),
+            _ => None,
+        }
+    }
+
+    /// Whether this is a post-quantum (ML-KEM / ML-DSA / SLH-DSA) key.
+    pub fn is_pqc_key(&self) -> bool {
+        matches!(self.key_type, Some(CKK_ML_KEM | CKK_ML_DSA | CKK_SLH_DSA))
+    }
+
     /// Check if a template matches this object (partial template matching per PKCS#11).
     ///
     /// Uses a bitwise u8 accumulator instead of early returns or boolean
@@ -191,9 +219,13 @@ impl StoredObject {
                     None => 0,
                 },
                 CKA_KEY_TYPE => match (self.key_type, read_ck_ulong(value)) {
-                    (Some(kt), Some(v)) => (v == kt) as u8,
+                    (Some(kt), Some(v)) => (normalize_key_type(v) == kt) as u8,
                     (None, _) => 0,
                     (_, None) => 0,
+                },
+                CKA_PARAMETER_SET => match (self.parameter_set(), read_ck_ulong(value)) {
+                    (Some(ps), Some(v)) => (v == ps) as u8,
+                    _ => 0,
                 },
                 CKA_LABEL => ct_bytes_eq(value, &self.label),
                 CKA_EC_POINT => match &self.ec_point {

@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use zeroize::Zeroizing;
 
 use crate::error::{HsmError, HsmResult};
+use crate::pkcs11_abi::constants::normalize_key_type;
 use crate::pkcs11_abi::types::CK_ULONG;
 use crate::store::key_material::RawKeyMaterial;
 use crate::store::object::{KeyLifecycleState, StoredObject};
@@ -117,7 +118,9 @@ pub(crate) fn decode(data: &[u8]) -> HsmResult<StoredObject> {
     let handle = u64_to_ulong(reader.take_u64()?)?;
     let slot_id = u64_to_ulong(reader.take_u64()?)?;
     let class = u64_to_ulong(reader.take_u64()?)?;
-    let key_type = opt_u64_to_ulong(reader.take_opt_u64()?)?;
+    // Objects persisted before PKCS#11 v3.2 support carry the vendor-defined
+    // PQC key types; map them to the standard values.
+    let key_type = opt_u64_to_ulong(reader.take_opt_u64()?)?.map(normalize_key_type);
     let label = reader.take_vec()?;
     let id = reader.take_vec()?;
     let token_object = reader.take_bool()?;
@@ -384,6 +387,20 @@ mod tests {
         let encoded = encode(&object).expect("encode");
         let decoded = decode(&encoded).expect("decode");
         assert_eq!(decoded.handle, CK_ULONG::MAX);
+    }
+
+    #[test]
+    fn legacy_vendor_pqc_key_type_loads_as_standard() {
+        use crate::pkcs11_abi::constants::{
+            CKK_ML_DSA, CKK_VENDOR_ML_DSA_LEGACY, CKO_PRIVATE_KEY, CKP_ML_DSA_87,
+        };
+        let mut object = StoredObject::new(7, CKO_PRIVATE_KEY);
+        object.key_type = Some(CKK_VENDOR_ML_DSA_LEGACY);
+        object.key_material = Some(RawKeyMaterial::new(vec![0x11; 32]));
+        object.public_key_data = Some(vec![0x22; 2592]);
+        let decoded = decode(&encode(&object).expect("encode")).expect("decode");
+        assert_eq!(decoded.key_type, Some(CKK_ML_DSA));
+        assert_eq!(decoded.parameter_set(), Some(CKP_ML_DSA_87));
     }
 
     #[test]

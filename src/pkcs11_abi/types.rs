@@ -175,6 +175,18 @@ pub struct CK_ECDH1_DERIVE_PARAMS {
 }
 pub type CK_ECDH1_DERIVE_PARAMS_PTR = *mut CK_ECDH1_DERIVE_PARAMS;
 
+// --- CK_SIGN_ADDITIONAL_CONTEXT ---
+
+/// Optional mechanism parameter for `CKM_ML_DSA` / `CKM_SLH_DSA` (PKCS#11 v3.2).
+#[cfg_attr(target_os = "windows", repr(C, packed))]
+#[cfg_attr(not(target_os = "windows"), repr(C))]
+#[derive(Debug, Clone, Copy)]
+pub struct CK_SIGN_ADDITIONAL_CONTEXT {
+    pub hedge_variant: CK_ULONG,
+    pub p_context: CK_BYTE_PTR,
+    pub context_len: CK_ULONG,
+}
+
 // --- CK_GCM_PARAMS ---
 
 /// Mechanism parameter for `CKM_AES_GCM` (PKCS#11 v2.40 errata / v3.x layout).
