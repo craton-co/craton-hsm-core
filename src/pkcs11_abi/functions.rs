@@ -157,7 +157,7 @@ fn get_hsm() -> Result<Arc<HsmCore>, CK_RV> {
     // PKCS#11 §5.10: the child must call C_Initialize before using the library.
     let init_pid = INIT_PID.load(Ordering::Acquire);
     if init_pid != 0 && init_pid != current_pid() {
-        CACHED_HSM.with(|c| *c.borrow_mut() = None);
+        let _ = CACHED_HSM.try_with(|c| *c.borrow_mut() = None);
         tracing::error!(
             "Fork detected: initialized in PID {} but running in PID {}. \
              The child process must call C_Initialize.",
@@ -168,16 +168,24 @@ fn get_hsm() -> Result<Arc<HsmCore>, CK_RV> {
     }
 
     // Fast path: check thread-local cache (avoids mutex lock on every C_* call).
+    //
+    // `try_with`, not `with`: pkcs11-provider calls C_Finalize (and other
+    // C_* functions) from OpenSSL exit-time cleanup, after this thread's
+    // thread-locals are destroyed. `with` would panic there; the cache is
+    // only an optimisation, so fall through to the slow path instead.
     let current_gen = HSM_GENERATION.load(Ordering::Acquire);
-    let cached = CACHED_HSM.with(|c| {
-        let borrow = c.borrow();
-        if let Some((ref arc, gen)) = *borrow {
-            if gen == current_gen {
-                return Some(arc.clone());
+    let cached = CACHED_HSM
+        .try_with(|c| {
+            let borrow = c.borrow();
+            if let Some((ref arc, gen)) = *borrow {
+                if gen == current_gen {
+                    return Some(arc.clone());
+                }
             }
-        }
-        None
-    });
+            None
+        })
+        .ok()
+        .flatten();
     if let Some(hsm) = cached {
         return Ok(hsm);
     }
@@ -188,7 +196,7 @@ fn get_hsm() -> Result<Arc<HsmCore>, CK_RV> {
         .as_ref()
         .cloned()
         .ok_or(CKR_CRYPTOKI_NOT_INITIALIZED)?;
-    CACHED_HSM.with(|c| {
+    let _ = CACHED_HSM.try_with(|c| {
         *c.borrow_mut() = Some((hsm.clone(), current_gen));
     });
     Ok(hsm)
@@ -331,6 +339,74 @@ fn parse_gcm_params(p_mechanism: CK_MECHANISM_PTR) -> Result<Vec<u8>, CK_RV> {
     let mut encoded = copy_param_buffer(p_iv, iv_len)?;
     encoded.extend_from_slice(&copy_param_buffer(p_aad, aad_len)?);
     Ok(encoded)
+}
+
+/// Resolve a PKCS#11 v3.2 PQC key-pair-generation mechanism
+/// (`CKM_ML_DSA_KEY_PAIR_GEN`, ...) to the vendor mechanism for the
+/// `CKA_PARAMETER_SET` given in the public (or private) key template. Other
+/// mechanisms are returned unchanged.
+fn resolve_pqc_keypair_gen_mechanism(
+    mechanism: CK_MECHANISM_TYPE,
+    pub_template: &[(CK_ATTRIBUTE_TYPE, Vec<u8>)],
+    priv_template: &[(CK_ATTRIBUTE_TYPE, Vec<u8>)],
+) -> Result<CK_MECHANISM_TYPE, CK_RV> {
+    if !matches!(
+        mechanism,
+        CKM_ML_KEM_KEY_PAIR_GEN | CKM_ML_DSA_KEY_PAIR_GEN | CKM_SLH_DSA_KEY_PAIR_GEN
+    ) {
+        return Ok(mechanism);
+    }
+    let parameter_set = read_ulong_attr(pub_template, CKA_PARAMETER_SET)
+        .or_else(|| read_ulong_attr(priv_template, CKA_PARAMETER_SET))
+        .ok_or(CKR_TEMPLATE_INCOMPLETE)?;
+    pqc::mechanism_for_parameter_set(mechanism, parameter_set).ok_or(CKR_ATTRIBUTE_VALUE_INVALID)
+}
+
+/// Resolve `CKM_ML_DSA` / `CKM_SLH_DSA` (PKCS#11 v3.2) to the vendor
+/// mechanism for the parameter set of `key`, after validating the optional
+/// `CK_SIGN_ADDITIONAL_CONTEXT`. Other mechanisms are returned unchanged.
+///
+/// Signing is deterministic with an empty context string, so a non-empty
+/// context or `CKH_HEDGE_REQUIRED` is refused rather than silently ignored.
+///
+/// SAFETY: caller must ensure `p_mechanism` is a valid, non-null pointer.
+fn resolve_pqc_sign_mechanism(
+    hsm: &HsmCore,
+    p_mechanism: CK_MECHANISM_PTR,
+    key: CK_OBJECT_HANDLE,
+) -> Result<CK_MECHANISM_TYPE, CK_RV> {
+    let mech = unsafe { &*p_mechanism };
+    let expected_key_type = match mech.mechanism {
+        CKM_ML_DSA => CKK_ML_DSA,
+        CKM_SLH_DSA => CKK_SLH_DSA,
+        other => return Ok(other),
+    };
+    if !mech.p_parameter.is_null() && mech.parameter_len != 0 {
+        if mech.parameter_len as usize != std::mem::size_of::<CK_SIGN_ADDITIONAL_CONTEXT>() {
+            return Err(CKR_MECHANISM_PARAM_INVALID);
+        }
+        // The caller's buffer carries no alignment guarantee.
+        let params = unsafe {
+            std::ptr::read_unaligned(mech.p_parameter as *const CK_SIGN_ADDITIONAL_CONTEXT)
+        };
+        if params.hedge_variant == CKH_HEDGE_REQUIRED
+            || params.hedge_variant > CKH_DETERMINISTIC_REQUIRED
+            || params.context_len != 0
+        {
+            return Err(CKR_MECHANISM_PARAM_INVALID);
+        }
+    }
+    let obj = hsm
+        .object_store
+        .get_object(key)
+        .map_err(|_| CKR_KEY_HANDLE_INVALID)?;
+    let obj = obj.read();
+    if obj.key_type != Some(expected_key_type) {
+        return Err(CKR_KEY_TYPE_INCONSISTENT);
+    }
+    obj.parameter_set()
+        .and_then(|ps| pqc::mechanism_for_parameter_set(mech.mechanism, ps))
+        .ok_or(CKR_KEY_TYPE_INCONSISTENT)
 }
 
 /// Copy a caller-owned `(pointer, length)` buffer out of a mechanism
@@ -481,7 +557,7 @@ pub extern "C" fn C_Finalize(p_reserved: CK_VOID_PTR) -> CK_RV {
         INIT_PID.store(0, Ordering::Release);
         // Invalidate all thread-local HSM caches.
         HSM_GENERATION.fetch_add(1, Ordering::Release);
-        CACHED_HSM.with(|c| *c.borrow_mut() = None);
+        let _ = CACHED_HSM.try_with(|c| *c.borrow_mut() = None);
         // Drop every backend handle-cache entry. The process is winding down
         // its Cryptoki state; the next C_Initialize gets a clean cache.
         crate::crypto::sign::clear_all();
@@ -943,6 +1019,33 @@ pub extern "C" fn C_GetMechanismInfo(
                 min_key_size: 0 as CK_ULONG,
                 max_key_size: 0 as CK_ULONG,
                 flags: CKF_DIGEST_FLAG,
+            },
+            // Post-Quantum, PKCS#11 v3.2: the key sizes are the range of
+            // supported CKA_PARAMETER_SET values.
+            CKM_ML_KEM_KEY_PAIR_GEN => CK_MECHANISM_INFO {
+                min_key_size: CKP_ML_KEM_512,
+                max_key_size: CKP_ML_KEM_1024,
+                flags: CKF_GENERATE_KEY_PAIR_FLAG,
+            },
+            CKM_ML_DSA_KEY_PAIR_GEN => CK_MECHANISM_INFO {
+                min_key_size: CKP_ML_DSA_44,
+                max_key_size: CKP_ML_DSA_87,
+                flags: CKF_GENERATE_KEY_PAIR_FLAG,
+            },
+            CKM_ML_DSA => CK_MECHANISM_INFO {
+                min_key_size: CKP_ML_DSA_44,
+                max_key_size: CKP_ML_DSA_87,
+                flags: CKF_SIGN_FLAG | CKF_VERIFY_FLAG,
+            },
+            CKM_SLH_DSA_KEY_PAIR_GEN => CK_MECHANISM_INFO {
+                min_key_size: CKP_SLH_DSA_SHA2_128S,
+                max_key_size: CKP_SLH_DSA_SHA2_256S,
+                flags: CKF_GENERATE_KEY_PAIR_FLAG,
+            },
+            CKM_SLH_DSA => CK_MECHANISM_INFO {
+                min_key_size: CKP_SLH_DSA_SHA2_128S,
+                max_key_size: CKP_SLH_DSA_SHA2_256S,
+                flags: CKF_SIGN_FLAG | CKF_VERIFY_FLAG,
             },
             // Post-Quantum: ML-KEM (Key Encapsulation)
             CKM_ML_KEM_512 | CKM_ML_KEM_768 | CKM_ML_KEM_1024 => CK_MECHANISM_INFO {
@@ -2299,7 +2402,11 @@ pub extern "C" fn C_SignInit(
             return CKR_OPERATION_ACTIVE;
         }
 
-        let mechanism = unsafe { (*p_mechanism).mechanism };
+        // CKM_ML_DSA / CKM_SLH_DSA take the parameter set from the key.
+        let mechanism = match resolve_pqc_sign_mechanism(&hsm, p_mechanism, key) {
+            Ok(m) => m,
+            Err(rv) => return rv,
+        };
 
         // Explicit SHA-1 rejection: CKM_SHA1_RSA_PKCS is deprecated per
         // NIST SP 800-131A Rev.2.  Block it at the ABI boundary regardless
@@ -2743,7 +2850,11 @@ pub extern "C" fn C_VerifyInit(
             return CKR_OPERATION_ACTIVE;
         }
 
-        let mechanism = unsafe { (*p_mechanism).mechanism };
+        // CKM_ML_DSA / CKM_SLH_DSA take the parameter set from the key.
+        let mechanism = match resolve_pqc_sign_mechanism(&hsm, p_mechanism, key) {
+            Ok(m) => m,
+            Err(rv) => return rv,
+        };
         if !mechanisms::is_sign_mechanism(mechanism) {
             return CKR_MECHANISM_INVALID;
         }
@@ -3149,6 +3260,12 @@ pub extern "C" fn C_GenerateKeyPair(
                 Err(rv) => return rv,
             }
         };
+
+        let mechanism =
+            match resolve_pqc_keypair_gen_mechanism(mechanism, &pub_template, &priv_template) {
+                Ok(m) => m,
+                Err(rv) => return rv,
+            };
 
         // FIPS approved-services key-size enforcement.  Only RSA carries a
         // caller-supplied bit size (CKA_MODULUS_BITS); for EC / PQC the curve
@@ -6048,8 +6165,14 @@ pub extern "C" fn C_WaitForSlotEvent(
 // Static function list
 // ============================================================================
 
+// `CK_FUNCTION_LIST` is the v2.40 table. It must report 2.40: a caller that
+// sees 3.x casts it to `CK_FUNCTION_LIST_3_0` and reads `C_GetInterface` and
+// the other 3.0 entries past the end of this struct (pkcs11-provider does).
 static FUNCTION_LIST: CK_FUNCTION_LIST = CK_FUNCTION_LIST {
-    version: CK_VERSION { major: 3, minor: 0 },
+    version: CK_VERSION {
+        major: 2,
+        minor: 40,
+    },
     C_Initialize,
     C_Finalize,
     C_GetInfo,

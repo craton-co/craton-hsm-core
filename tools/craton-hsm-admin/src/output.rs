@@ -46,11 +46,13 @@ pub fn key_type_name(kt: u64) -> &'static str {
         0x00 => "RSA",
         0x03 => "EC",
         0x1F => "AES",
-        0x04 => "GENERIC_SECRET",
-        0x80000001 => "ED25519",
-        0x80000010 => "ML-DSA",
-        0x80000011 => "ML-KEM",
-        0x80000012 => "SLH-DSA",
+        0x10 => "GENERIC_SECRET",
+        0x40 => "ED25519",
+        0x41 => "X25519",
+        // PKCS#11 v3.2 values, and the vendor values used before them.
+        0x49 | 0x80000001 => "ML-KEM",
+        0x4A | 0x80000002 => "ML-DSA",
+        0x4B | 0x80000003 => "SLH-DSA",
         _ => "Unknown",
     }
 }

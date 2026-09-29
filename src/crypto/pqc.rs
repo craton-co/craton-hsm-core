@@ -673,6 +673,41 @@ pub fn is_hybrid_kem_mechanism(mechanism: crate::pkcs11_abi::types::CK_MECHANISM
 // Helpers
 // ============================================================================
 
+/// Map a PKCS#11 v3.2 mechanism, which leaves the parameter set to the key's
+/// `CKA_PARAMETER_SET`, to the vendor mechanism naming that parameter set.
+///
+/// Returns `Some(mechanism)` unchanged for any other mechanism, and `None`
+/// when the parameter set is not supported for that mechanism.
+pub fn mechanism_for_parameter_set(
+    mechanism: crate::pkcs11_abi::types::CK_MECHANISM_TYPE,
+    parameter_set: crate::pkcs11_abi::types::CK_ULONG,
+) -> Option<crate::pkcs11_abi::types::CK_MECHANISM_TYPE> {
+    use crate::pkcs11_abi::constants::*;
+    match (mechanism, parameter_set) {
+        (CKM_ML_DSA_KEY_PAIR_GEN | CKM_ML_DSA, CKP_ML_DSA_44) => Some(CKM_ML_DSA_44),
+        (CKM_ML_DSA_KEY_PAIR_GEN | CKM_ML_DSA, CKP_ML_DSA_65) => Some(CKM_ML_DSA_65),
+        (CKM_ML_DSA_KEY_PAIR_GEN | CKM_ML_DSA, CKP_ML_DSA_87) => Some(CKM_ML_DSA_87),
+        (CKM_ML_KEM_KEY_PAIR_GEN, CKP_ML_KEM_512) => Some(CKM_ML_KEM_512),
+        (CKM_ML_KEM_KEY_PAIR_GEN, CKP_ML_KEM_768) => Some(CKM_ML_KEM_768),
+        (CKM_ML_KEM_KEY_PAIR_GEN, CKP_ML_KEM_1024) => Some(CKM_ML_KEM_1024),
+        (CKM_SLH_DSA_KEY_PAIR_GEN | CKM_SLH_DSA, CKP_SLH_DSA_SHA2_128S) => {
+            Some(CKM_SLH_DSA_SHA2_128S)
+        }
+        (CKM_SLH_DSA_KEY_PAIR_GEN | CKM_SLH_DSA, CKP_SLH_DSA_SHA2_256S) => {
+            Some(CKM_SLH_DSA_SHA2_256S)
+        }
+        (
+            CKM_ML_DSA_KEY_PAIR_GEN
+            | CKM_ML_DSA
+            | CKM_ML_KEM_KEY_PAIR_GEN
+            | CKM_SLH_DSA_KEY_PAIR_GEN
+            | CKM_SLH_DSA,
+            _,
+        ) => None,
+        (other, _) => Some(other),
+    }
+}
+
 pub fn mechanism_to_ml_kem_variant(
     mechanism: crate::pkcs11_abi::types::CK_MECHANISM_TYPE,
 ) -> Option<MlKemVariant> {

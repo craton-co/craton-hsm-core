@@ -83,9 +83,15 @@ pub fn approval_status(mechanism: CK_MECHANISM_TYPE) -> ApprovalStatus {
         CKM_ECDH1_DERIVE => ApprovalStatus::Approved,
 
         // === APPROVED: Post-Quantum (FIPS 203/204/205) ===
-        CKM_ML_KEM_512 | CKM_ML_KEM_768 | CKM_ML_KEM_1024 => ApprovalStatus::Approved,
-        CKM_ML_DSA_44 | CKM_ML_DSA_65 | CKM_ML_DSA_87 => ApprovalStatus::Approved,
-        CKM_SLH_DSA_SHA2_128S | CKM_SLH_DSA_SHA2_256S => ApprovalStatus::Approved,
+        CKM_ML_KEM_KEY_PAIR_GEN | CKM_ML_KEM_512 | CKM_ML_KEM_768 | CKM_ML_KEM_1024 => {
+            ApprovalStatus::Approved
+        }
+        CKM_ML_DSA_KEY_PAIR_GEN | CKM_ML_DSA | CKM_ML_DSA_44 | CKM_ML_DSA_65 | CKM_ML_DSA_87 => {
+            ApprovalStatus::Approved
+        }
+        CKM_SLH_DSA_KEY_PAIR_GEN | CKM_SLH_DSA | CKM_SLH_DSA_SHA2_128S | CKM_SLH_DSA_SHA2_256S => {
+            ApprovalStatus::Approved
+        }
 
         // === NON-APPROVED: Hybrid (not standardized by NIST yet) ===
         CKM_HYBRID_ML_DSA_ECDSA => ApprovalStatus::NonApproved,

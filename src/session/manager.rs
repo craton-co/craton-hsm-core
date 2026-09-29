@@ -226,16 +226,20 @@ impl SessionManager {
     pub fn get_session_cached(&self, handle: CK_SESSION_HANDLE) -> HsmResult<Arc<RwLock<Session>>> {
         let current_gen = self.generation.load(Ordering::Acquire);
 
-        // Check TLS cache first
-        let cached = TLS_SESSION_CACHE.with(|cache| {
-            let borrow = cache.borrow();
-            if let Some((cached_handle, cached_gen, ref session)) = *borrow {
-                if cached_handle == handle && cached_gen == current_gen {
-                    return Some(Arc::clone(session));
+        // Check TLS cache first. `try_with`: C_* calls can arrive from
+        // exit-time cleanup after thread-locals are destroyed (see get_hsm).
+        let cached = TLS_SESSION_CACHE
+            .try_with(|cache| {
+                let borrow = cache.borrow();
+                if let Some((cached_handle, cached_gen, ref session)) = *borrow {
+                    if cached_handle == handle && cached_gen == current_gen {
+                        return Some(Arc::clone(session));
+                    }
                 }
-            }
-            None
-        });
+                None
+            })
+            .ok()
+            .flatten();
 
         if let Some(session) = cached {
             return Ok(session);
@@ -245,7 +249,7 @@ impl SessionManager {
         let session = self.get_session(handle)?;
 
         // Update TLS cache with current generation
-        TLS_SESSION_CACHE.with(|cache| {
+        let _ = TLS_SESSION_CACHE.try_with(|cache| {
             *cache.borrow_mut() = Some((handle, current_gen, Arc::clone(&session)));
         });
 
@@ -255,7 +259,7 @@ impl SessionManager {
     /// Invalidate the TLS session cache for a specific handle.
     /// Called when a session is closed or its state changes significantly.
     pub fn invalidate_session_cache(handle: CK_SESSION_HANDLE) {
-        TLS_SESSION_CACHE.with(|cache| {
+        let _ = TLS_SESSION_CACHE.try_with(|cache| {
             let mut borrow = cache.borrow_mut();
             if let Some((cached_handle, _, _)) = &*borrow {
                 if *cached_handle == handle {
@@ -267,7 +271,7 @@ impl SessionManager {
 
     /// Invalidate all TLS session caches.
     pub fn invalidate_all_session_caches() {
-        TLS_SESSION_CACHE.with(|cache| {
+        let _ = TLS_SESSION_CACHE.try_with(|cache| {
             *cache.borrow_mut() = None;
         });
     }
