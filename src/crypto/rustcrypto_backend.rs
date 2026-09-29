@@ -333,6 +333,26 @@ impl CryptoBackend for RustCryptoBackend {
         super::encrypt::aes_256_gcm_decrypt(key, data)
     }
 
+    fn aes_256_gcm_encrypt_with_iv(
+        &self,
+        key: &[u8],
+        iv: &[u8],
+        aad: &[u8],
+        plaintext: &[u8],
+    ) -> HsmResult<Vec<u8>> {
+        super::encrypt::aes_256_gcm_encrypt_with_iv(key, iv, aad, plaintext)
+    }
+
+    fn aes_256_gcm_decrypt_with_iv(
+        &self,
+        key: &[u8],
+        iv: &[u8],
+        aad: &[u8],
+        data: &[u8],
+    ) -> HsmResult<Vec<u8>> {
+        super::encrypt::aes_256_gcm_decrypt_with_iv(key, iv, aad, data)
+    }
+
     fn aes_cbc_encrypt(&self, key: &[u8], iv: &[u8], plaintext: &[u8]) -> HsmResult<Vec<u8>> {
         super::encrypt::aes_cbc_encrypt(key, iv, plaintext)
     }

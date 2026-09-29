@@ -76,6 +76,7 @@ pub fn remove_gcm_counter(key: &[u8]) {
     GCM_NONCE_PREFIXES.remove(&kid);
     // Also remove IV tracking for this key
     CBC_CTR_IV_TRACKER.remove(&kid);
+    GCM_IV_TRACKER.remove(&kid);
 }
 
 /// Force-reset all GCM counters and nonce prefixes. Only called during
@@ -84,6 +85,7 @@ pub fn remove_gcm_counter(key: &[u8]) {
 pub fn force_reset_all_counters() {
     GCM_ENCRYPT_COUNTERS.clear();
     GCM_NONCE_PREFIXES.clear();
+    GCM_IV_TRACKER.clear();
     reset_iv_trackers();
     tracing::info!(
         "All GCM counters, nonce prefixes, and IV trackers cleared (token re-initialized)."
@@ -159,26 +161,46 @@ const MAX_TRACKED_IVS_PER_KEY: usize = 100_000;
 /// reached, new keys are rejected until existing keys are destroyed.
 const MAX_TRACKED_KEYS: usize = 10_000;
 
+/// Per-key set of caller-supplied AES-GCM IVs (see
+/// [`aes_256_gcm_encrypt_with_iv`]). GCM IV reuse under one key breaks both
+/// confidentiality and authenticity, so a repeated IV is refused. Like the
+/// GCM counters, and unlike the CBC/CTR tracker, this survives
+/// C_Initialize/C_Finalize and is cleared only when the key is destroyed or
+/// the token is re-initialized.
+static GCM_IV_TRACKER: std::sync::LazyLock<
+    dashmap::DashMap<[u8; 32], Mutex<HashSet<[u8; GCM_IV_LEN]>>>,
+> = std::sync::LazyLock::new(dashmap::DashMap::new);
+
 /// Check if an IV has been used before with this key. Returns error on reuse.
 /// Tracks the IV for future reuse detection.
 fn check_iv_reuse(key: &[u8], iv: &[u8; 16], mode: &str) -> HsmResult<()> {
-    use sha2::{Digest, Sha256};
-    let key_hash: [u8; 32] = Sha256::digest(key).into();
+    check_iv_reuse_in(&CBC_CTR_IV_TRACKER, key, iv, mode)
+}
+
+/// Record `iv` for `key` in `tracker`, failing if it was already used.
+/// Shared by the CBC/CTR tracker and the caller-supplied GCM IV tracker.
+fn check_iv_reuse_in<const N: usize>(
+    tracker: &dashmap::DashMap<[u8; 32], Mutex<HashSet<[u8; N]>>>,
+    key: &[u8],
+    iv: &[u8; N],
+    mode: &str,
+) -> HsmResult<()> {
+    let key_hash = gcm_key_id(key);
 
     // Guard against unbounded key growth in the IV tracker. An attacker who
     // can create many keys and encrypt once with each would grow this map
     // indefinitely without this cap.
-    if !CBC_CTR_IV_TRACKER.contains_key(&key_hash) && CBC_CTR_IV_TRACKER.len() >= MAX_TRACKED_KEYS {
+    if !tracker.contains_key(&key_hash) && tracker.len() >= MAX_TRACKED_KEYS {
         tracing::error!(
             "{}: IV tracker key limit reached ({} keys) — destroy unused keys \
-             before creating new ones, or use AES-GCM instead.",
+             before creating new ones.",
             mode,
             MAX_TRACKED_KEYS
         );
         return Err(HsmError::GeneralError);
     }
 
-    let entry = CBC_CTR_IV_TRACKER
+    let entry = tracker
         .entry(key_hash)
         .or_insert_with(|| Mutex::new(HashSet::new()));
     let mut iv_set = entry.value().lock().map_err(|_| {
@@ -438,6 +460,105 @@ pub fn aes_256_gcm_decrypt_with_aad(key: &[u8], data: &[u8], aad: &[u8]) -> HsmR
     };
     cipher
         .decrypt(nonce, payload)
+        .map_err(|_| HsmError::EncryptedDataInvalid)
+}
+
+/// IV length accepted for caller-supplied AES-GCM IVs (SP 800-38D §5.2.1.1
+/// recommends 96 bits; it is also the only length both backends support).
+pub const GCM_IV_LEN: usize = 12;
+
+/// AES-GCM authentication tag length. Only full-length tags are supported.
+pub const GCM_TAG_LEN: usize = 16;
+
+/// Validate a caller-supplied AES-GCM IV before an encryption and reserve an
+/// invocation against the per-key limit.
+///
+/// This is the PKCS#11 `CK_GCM_PARAMS` path, where the application (e.g.
+/// OpenBao, pkcs11-tool) chooses the IV and later supplies the same IV to
+/// decrypt. Refuses an all-zero IV and any IV already used with this key,
+/// and counts the encryption against the same per-key limit as the
+/// internally generated nonces.
+pub fn check_gcm_caller_iv(key: &[u8], iv: &[u8]) -> HsmResult<()> {
+    let iv: &[u8; GCM_IV_LEN] = iv.try_into().map_err(|_| HsmError::MechanismParamInvalid)?;
+    if iv.iter().all(|&b| b == 0) {
+        tracing::error!("AES-GCM: all-zero IV rejected");
+        return Err(HsmError::MechanismParamInvalid);
+    }
+
+    check_iv_reuse_in(&GCM_IV_TRACKER, key, iv, "AES-GCM")?;
+
+    let counter = GCM_ENCRYPT_COUNTERS
+        .entry(gcm_key_id(key))
+        .or_insert_with(|| AtomicU64::new(0));
+    counter
+        .value()
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
+            (c < GCM_MAX_RANDOM_NONCE_ENCRYPTIONS).then_some(c + 1)
+        })
+        .map_err(|current| {
+            tracing::error!(
+                "AES-GCM per-key encryption limit reached ({} operations) — re-key required.",
+                current
+            );
+            HsmError::GeneralError
+        })?;
+    Ok(())
+}
+
+/// AES-256-GCM encrypt with a caller-supplied IV, as specified for
+/// `CKM_AES_GCM` with `CK_GCM_PARAMS`. Returns ciphertext || tag.
+///
+/// Callers must run [`check_gcm_caller_iv`] first.
+pub fn aes_256_gcm_encrypt_with_iv(
+    key: &[u8],
+    iv: &[u8],
+    aad: &[u8],
+    plaintext: &[u8],
+) -> HsmResult<Vec<u8>> {
+    use aes_gcm::aead::Payload;
+
+    if key.len() != 32 {
+        return Err(HsmError::KeySizeRange);
+    }
+    if iv.len() != GCM_IV_LEN {
+        return Err(HsmError::MechanismParamInvalid);
+    }
+    if plaintext.len() > AES_GCM_MAX_PLAINTEXT {
+        return Err(HsmError::DataLenRange);
+    }
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    cipher
+        .encrypt(
+            Nonce::from_slice(iv),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .map_err(|_| HsmError::GeneralError)
+}
+
+/// AES-256-GCM decrypt with a caller-supplied IV. Input is ciphertext || tag.
+pub fn aes_256_gcm_decrypt_with_iv(
+    key: &[u8],
+    iv: &[u8],
+    aad: &[u8],
+    data: &[u8],
+) -> HsmResult<Vec<u8>> {
+    use aes_gcm::aead::Payload;
+
+    if key.len() != 32 {
+        return Err(HsmError::KeySizeRange);
+    }
+    if iv.len() != GCM_IV_LEN {
+        return Err(HsmError::MechanismParamInvalid);
+    }
+    if data.len() < GCM_TAG_LEN {
+        return Err(HsmError::EncryptedDataInvalid);
+    }
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    cipher
+        .decrypt(Nonce::from_slice(iv), Payload { msg: data, aad })
         .map_err(|_| HsmError::EncryptedDataInvalid)
 }
 
