@@ -271,6 +271,24 @@ pub trait CryptoBackend: Send + Sync {
 
     fn aes_256_gcm_encrypt(&self, key: &[u8], plaintext: &[u8]) -> HsmResult<Vec<u8>>;
     fn aes_256_gcm_decrypt(&self, key: &[u8], data: &[u8]) -> HsmResult<Vec<u8>>;
+    /// AES-256-GCM with a caller-supplied 96-bit IV (`CK_GCM_PARAMS`).
+    /// Returns ciphertext || 128-bit tag, with no IV prefix.
+    fn aes_256_gcm_encrypt_with_iv(
+        &self,
+        key: &[u8],
+        iv: &[u8],
+        aad: &[u8],
+        plaintext: &[u8],
+    ) -> HsmResult<Vec<u8>>;
+    /// Inverse of [`CryptoBackend::aes_256_gcm_encrypt_with_iv`]: `data` is
+    /// ciphertext || 128-bit tag.
+    fn aes_256_gcm_decrypt_with_iv(
+        &self,
+        key: &[u8],
+        iv: &[u8],
+        aad: &[u8],
+        data: &[u8],
+    ) -> HsmResult<Vec<u8>>;
     fn aes_cbc_encrypt(&self, key: &[u8], iv: &[u8], plaintext: &[u8]) -> HsmResult<Vec<u8>>;
     fn aes_cbc_decrypt(&self, key: &[u8], iv: &[u8], ciphertext: &[u8]) -> HsmResult<Vec<u8>>;
     fn aes_ctr_encrypt(&self, key: &[u8], iv: &[u8], plaintext: &[u8]) -> HsmResult<Vec<u8>>;

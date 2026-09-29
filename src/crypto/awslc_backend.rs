@@ -507,6 +507,50 @@ impl CryptoBackend for AwsLcBackend {
         Ok(plaintext.to_vec())
     }
 
+    fn aes_256_gcm_encrypt_with_iv(
+        &self,
+        key: &[u8],
+        iv: &[u8],
+        aad: &[u8],
+        plaintext: &[u8],
+    ) -> HsmResult<Vec<u8>> {
+        if key.len() != 32 {
+            return Err(HsmError::KeySizeRange);
+        }
+        let unbound = UnboundKey::new(&AES_256_GCM, key).map_err(|_| HsmError::KeySizeRange)?;
+        let sealing_key = LessSafeKey::new(unbound);
+        let nonce =
+            Nonce::try_assume_unique_for_key(iv).map_err(|_| HsmError::MechanismParamInvalid)?;
+
+        let mut in_out = plaintext.to_vec();
+        sealing_key
+            .seal_in_place_append_tag(nonce, Aad::from(aad), &mut in_out)
+            .map_err(|_| HsmError::GeneralError)?;
+        Ok(in_out)
+    }
+
+    fn aes_256_gcm_decrypt_with_iv(
+        &self,
+        key: &[u8],
+        iv: &[u8],
+        aad: &[u8],
+        data: &[u8],
+    ) -> HsmResult<Vec<u8>> {
+        if key.len() != 32 {
+            return Err(HsmError::KeySizeRange);
+        }
+        let unbound = UnboundKey::new(&AES_256_GCM, key).map_err(|_| HsmError::KeySizeRange)?;
+        let opening_key = LessSafeKey::new(unbound);
+        let nonce =
+            Nonce::try_assume_unique_for_key(iv).map_err(|_| HsmError::MechanismParamInvalid)?;
+
+        let mut in_out = data.to_vec();
+        let plaintext = opening_key
+            .open_in_place(nonce, Aad::from(aad), &mut in_out)
+            .map_err(|_| HsmError::EncryptedDataInvalid)?;
+        Ok(plaintext.to_vec())
+    }
+
     fn aes_cbc_encrypt(&self, key: &[u8], iv: &[u8], plaintext: &[u8]) -> HsmResult<Vec<u8>> {
         if iv.len() != 16 {
             return Err(HsmError::MechanismParamInvalid);

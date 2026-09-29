@@ -175,6 +175,34 @@ pub struct CK_ECDH1_DERIVE_PARAMS {
 }
 pub type CK_ECDH1_DERIVE_PARAMS_PTR = *mut CK_ECDH1_DERIVE_PARAMS;
 
+// --- CK_GCM_PARAMS ---
+
+/// Mechanism parameter for `CKM_AES_GCM` (PKCS#11 v2.40 errata / v3.x layout).
+#[cfg_attr(target_os = "windows", repr(C, packed))]
+#[cfg_attr(not(target_os = "windows"), repr(C))]
+#[derive(Debug, Clone, Copy)]
+pub struct CK_GCM_PARAMS {
+    pub p_iv: CK_BYTE_PTR,
+    pub iv_len: CK_ULONG,
+    pub iv_bits: CK_ULONG,
+    pub p_aad: CK_BYTE_PTR,
+    pub aad_len: CK_ULONG,
+    pub tag_bits: CK_ULONG,
+}
+
+/// `CK_GCM_PARAMS` as published in PKCS#11 v2.40 before the errata that
+/// added `ulIvBits`. Some older applications still pass this layout.
+#[cfg_attr(target_os = "windows", repr(C, packed))]
+#[cfg_attr(not(target_os = "windows"), repr(C))]
+#[derive(Debug, Clone, Copy)]
+pub struct CK_GCM_PARAMS_V240 {
+    pub p_iv: CK_BYTE_PTR,
+    pub iv_len: CK_ULONG,
+    pub p_aad: CK_BYTE_PTR,
+    pub aad_len: CK_ULONG,
+    pub tag_bits: CK_ULONG,
+}
+
 // --- CK_MECHANISM_INFO ---
 
 #[cfg_attr(target_os = "windows", repr(C, packed))]

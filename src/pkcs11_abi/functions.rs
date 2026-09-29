@@ -53,6 +53,7 @@ use std::sync::Arc;
 use crate::audit::log::{AuditOperation, AuditResult};
 use crate::core::HsmCore;
 use crate::crypto::backend::CryptoBackend;
+use crate::crypto::encrypt::{GCM_IV_LEN, GCM_TAG_LEN};
 use crate::crypto::{approved_services, derive, mechanisms, pairwise_test, pqc, sign};
 use crate::error::{HsmError, HsmResult};
 use crate::pkcs11_abi::constants::*;
@@ -283,6 +284,53 @@ fn parse_ecdh1_derive_params(p_mechanism: CK_MECHANISM_PTR) -> Result<EcdhDerive
         shared_data,
         public_data,
     })
+}
+
+/// Parse the `CKM_AES_GCM` mechanism parameter into the form kept in the
+/// session's `mechanism_param`.
+///
+/// A parameter whose length is exactly `sizeof(CK_GCM_PARAMS)` (current
+/// layout, or the pre-errata v2.40 layout without `ulIvBits`) is read as that
+/// struct, per PKCS#11: the caller supplies the IV and AAD, and the
+/// ciphertext is `ciphertext || tag`. The result is encoded as
+/// `iv (12 bytes) || aad`.
+///
+/// Any other parameter selects the legacy Craton mode, returned as an empty
+/// vector: the token generates the nonce and the ciphertext is
+/// `nonce || ciphertext || tag`. The two cannot collide: the structs are
+/// 20–48 bytes depending on platform, and legacy callers pass nothing or a
+/// bare 12-byte IV that was ignored.
+///
+/// SAFETY: caller must ensure `p_mechanism` is a valid, non-null pointer.
+fn parse_gcm_params(p_mechanism: CK_MECHANISM_PTR) -> Result<Vec<u8>, CK_RV> {
+    let mech = unsafe { &*p_mechanism };
+    if mech.p_parameter.is_null() {
+        return Ok(Vec::new());
+    }
+    // The caller's buffer carries no alignment guarantee.
+    let (p_iv, iv_len, p_aad, aad_len, tag_bits) = if mech.parameter_len as usize
+        == std::mem::size_of::<CK_GCM_PARAMS>()
+    {
+        let p = unsafe { std::ptr::read_unaligned(mech.p_parameter as *const CK_GCM_PARAMS) };
+        (p.p_iv, p.iv_len, p.p_aad, p.aad_len, p.tag_bits)
+    } else if mech.parameter_len as usize == std::mem::size_of::<CK_GCM_PARAMS_V240>() {
+        let p = unsafe { std::ptr::read_unaligned(mech.p_parameter as *const CK_GCM_PARAMS_V240) };
+        (p.p_iv, p.iv_len, p.p_aad, p.aad_len, p.tag_bits)
+    } else {
+        return Ok(Vec::new());
+    };
+    if tag_bits as usize != GCM_TAG_LEN * 8 || iv_len as usize != GCM_IV_LEN {
+        tracing::error!(
+            "CKM_AES_GCM: unsupported CK_GCM_PARAMS (ulIvLen={}, ulTagBits={}); \
+             only a 96-bit IV and 128-bit tag are supported",
+            iv_len,
+            tag_bits
+        );
+        return Err(CKR_MECHANISM_PARAM_INVALID);
+    }
+    let mut encoded = copy_param_buffer(p_iv, iv_len)?;
+    encoded.extend_from_slice(&copy_param_buffer(p_aad, aad_len)?);
+    Ok(encoded)
 }
 
 /// Copy a caller-owned `(pointer, length)` buffer out of a mechanism
@@ -1699,13 +1747,26 @@ pub extern "C" fn C_EncryptInit(
             }
         }
 
-        let mech_param = extract_mechanism_param(p_mechanism);
+        let mech_param = if mechanism == CKM_AES_GCM {
+            match parse_gcm_params(p_mechanism) {
+                Ok(p) => p,
+                Err(rv) => return rv,
+            }
+        } else {
+            extract_mechanism_param(p_mechanism)
+        };
 
-        // Early validation: reject all-zero IV/nonce for CBC and CTR modes.
+        // Early validation: reject all-zero IV/nonce for CBC, CTR and GCM.
         // An all-zero IV indicates an initialization error or IV reuse risk.
-        // Note: AES-GCM nonces are generated internally by the backend (not
-        // caller-supplied), so no zero-check is needed for GCM.
+        // (Legacy-mode GCM has no caller IV: the backend generates the nonce.)
         match mechanism {
+            CKM_AES_GCM
+                if mech_param.len() >= GCM_IV_LEN
+                    && mech_param[..GCM_IV_LEN].iter().all(|&b| b == 0) =>
+            {
+                tracing::error!("C_EncryptInit: all-zero IV rejected for AES-GCM");
+                return CKR_MECHANISM_PARAM_INVALID;
+            }
             CKM_AES_CBC | CKM_AES_CBC_PAD
                 if mech_param.len() == 16 && mech_param.iter().all(|&b| b == 0) =>
             {
@@ -1812,10 +1873,10 @@ pub extern "C" fn C_Encrypt(
         // This avoids consuming AES-GCM nonces and keeps the two-call idiom sound.
         if p_encrypted_data.is_null() {
             let estimated = match mechanism {
-                CKM_AES_GCM => {
-                    // GCM output = nonce (12) + ciphertext (= plaintext len) + tag (16)
-                    data.len() + 12 + 16
-                }
+                // CK_GCM_PARAMS: ciphertext || tag.
+                CKM_AES_GCM if !mech_param.is_empty() => data.len() + GCM_TAG_LEN,
+                // Legacy: nonce (12) || ciphertext (= plaintext len) || tag (16).
+                CKM_AES_GCM => data.len() + GCM_IV_LEN + GCM_TAG_LEN,
                 CKM_AES_CBC | CKM_AES_CBC_PAD => {
                     // CBC-PAD may add up to one block; plain CBC output = input len
                     data.len() + 16
@@ -1843,6 +1904,13 @@ pub extern "C" fn C_Encrypt(
         }
 
         let result = match mechanism {
+            CKM_AES_GCM if !mech_param.is_empty() => {
+                let (iv, aad) = mech_param.split_at(GCM_IV_LEN);
+                crate::crypto::encrypt::check_gcm_caller_iv(key_bytes, iv).and_then(|()| {
+                    hsm.crypto_backend
+                        .aes_256_gcm_encrypt_with_iv(key_bytes, iv, aad, data)
+                })
+            }
             CKM_AES_GCM => hsm.crypto_backend.aes_256_gcm_encrypt(key_bytes, data),
             CKM_AES_CBC | CKM_AES_CBC_PAD => {
                 if mech_param.is_empty() {
@@ -2009,7 +2077,14 @@ pub extern "C" fn C_DecryptInit(
             }
         }
 
-        let mech_param = extract_mechanism_param(p_mechanism);
+        let mech_param = if mechanism == CKM_AES_GCM {
+            match parse_gcm_params(p_mechanism) {
+                Ok(p) => p,
+                Err(rv) => return rv,
+            }
+        } else {
+            extract_mechanism_param(p_mechanism)
+        };
         sess.active_operation = Some(ActiveOperation::Decrypt {
             mechanism,
             key_handle: key,
@@ -2081,10 +2156,10 @@ pub extern "C" fn C_Decrypt(
         // decryption, preserving the operation state for the real call.
         if p_data.is_null() {
             let estimated = match mechanism {
-                CKM_AES_GCM => {
-                    // GCM plaintext = ciphertext - nonce (12) - tag (16)
-                    data.len().saturating_sub(28)
-                }
+                // CK_GCM_PARAMS: plaintext = ciphertext - tag (16).
+                CKM_AES_GCM if !mech_param.is_empty() => data.len().saturating_sub(GCM_TAG_LEN),
+                // Legacy: plaintext = ciphertext - nonce (12) - tag (16).
+                CKM_AES_GCM => data.len().saturating_sub(GCM_IV_LEN + GCM_TAG_LEN),
                 CKM_AES_CBC | CKM_AES_CBC_PAD => data.len(),
                 CKM_AES_CTR => data.len(),
                 CKM_RSA_PKCS_OAEP => {
@@ -2103,6 +2178,11 @@ pub extern "C" fn C_Decrypt(
         }
 
         let result = match mechanism {
+            CKM_AES_GCM if !mech_param.is_empty() => {
+                let (iv, aad) = mech_param.split_at(GCM_IV_LEN);
+                hsm.crypto_backend
+                    .aes_256_gcm_decrypt_with_iv(key_bytes, iv, aad, data)
+            }
             CKM_AES_GCM => hsm.crypto_backend.aes_256_gcm_decrypt(key_bytes, data),
             CKM_AES_CBC | CKM_AES_CBC_PAD => {
                 if mech_param.is_empty() {
