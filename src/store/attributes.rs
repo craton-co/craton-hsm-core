@@ -858,12 +858,10 @@ fn validate_deserialized_object(obj: &StoredObject) -> Result<(), &'static str> 
         return Err("handle is CK_INVALID_HANDLE (0)");
     }
 
-    // Key objects (secret/private) must be sensitive by default.
-    // If an object has key_material but is not sensitive and not extractable,
-    // that's an inconsistent state — either it's sensitive or extractable.
-    if obj.key_material.is_some() && !obj.sensitive && !obj.extractable {
-        return Err("key object is both non-sensitive and non-extractable");
-    }
+    // Note: a key that is both non-sensitive and non-extractable is valid
+    // PKCS#11 (CKA_VALUE is readable; only wrapping is forbidden), and the
+    // creation paths accept it. Rejecting it here made such keys vanish from
+    // the token on the next load, so it is deliberately not checked.
 
     // Lifecycle state "Destroyed" objects should never be persisted
     if obj.lifecycle_state == crate::store::object::KeyLifecycleState::Destroyed {
