@@ -71,6 +71,44 @@ fn test_token_objects_survive_restart() {
     }
 }
 
+/// A key that is neither sensitive nor extractable is valid PKCS#11 (it is
+/// what `pkcs11-tool --keygen` creates without `--sensitive`). It used to be
+/// accepted at creation but rejected when the store was reloaded, so it
+/// vanished from the token after a restart.
+#[test]
+fn test_non_sensitive_non_extractable_key_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = make_db_path(dir.path());
+    let (enc_key, _) = derive_key_from_pin(b"test-pin", None, Some(1));
+
+    // Built the way C_GenerateKey builds a key from such a template.
+    let handle = {
+        let store = EncryptedStore::new(Some(&db_path)).unwrap();
+        let obj_store = ObjectStore::with_persistence(store);
+        obj_store.set_persist_key(*enc_key);
+        let mut obj = StoredObject::new(obj_store.next_handle().unwrap(), CKO_SECRET_KEY);
+        obj.key_type = Some(CKK_AES);
+        obj.token_object = true;
+        obj.label = b"bao-root-key".to_vec();
+        obj.key_material = Some(RawKeyMaterial::new(vec![0x5A; 32]));
+        obj.sensitive = false;
+        obj.extractable = false;
+        obj.can_encrypt = true;
+        obj.can_decrypt = true;
+        obj_store.insert_object(obj).unwrap()
+    };
+
+    let store = EncryptedStore::new(Some(&db_path)).unwrap();
+    let obj_store = ObjectStore::with_persistence(store);
+    obj_store.set_persist_key(*enc_key);
+    assert_eq!(obj_store.load_from_store().unwrap(), 1);
+    let obj = obj_store.get_object(handle).unwrap();
+    let obj = obj.read();
+    assert_eq!(obj.label, b"bao-root-key");
+    assert!(!obj.sensitive && !obj.extractable);
+    assert_eq!(obj.key_material.as_ref().unwrap().as_bytes(), &[0x5A; 32]);
+}
+
 #[test]
 fn test_session_objects_not_persisted() {
     let dir = tempfile::tempdir().unwrap();

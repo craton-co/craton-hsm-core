@@ -177,10 +177,11 @@ impl HsmCore {
     ///
     /// # Panics
     ///
-    /// Panics if the HMAC_DRBG cannot be instantiated (OS entropy unavailable).
-    /// Use [`HsmCore::try_new`] for a fallible alternative.
+    /// Panics if [`HsmCore::try_new`] fails: the HMAC_DRBG cannot be
+    /// instantiated, or the object store or audit log cannot be opened (for
+    /// example, another process holds the store's lock).
     pub fn new(config: &HsmConfig) -> Self {
-        Self::try_new(config).expect("DRBG instantiation must succeed (requires OS entropy)")
+        Self::try_new(config).unwrap_or_else(|e| panic!("HSM core initialization failed: {e:?}"))
     }
 
     /// Generate a random 32-byte key for HMAC-binding operation state blobs.
@@ -229,11 +230,12 @@ impl HsmCore {
     ///
     /// # Panics
     ///
-    /// Panics if the HMAC_DRBG cannot be instantiated (OS entropy unavailable).
-    /// Use [`HsmCore::try_new_with_backend`] for a fallible alternative.
+    /// Panics if [`HsmCore::try_new_with_backend`] fails: the HMAC_DRBG
+    /// cannot be instantiated, or the object store or audit log cannot be
+    /// opened (for example, another process holds the store's lock).
     pub fn new_with_backend(config: &HsmConfig, backend: Arc<dyn CryptoBackend>) -> Self {
         Self::try_new_with_backend(config, backend)
-            .expect("DRBG instantiation must succeed (requires OS entropy)")
+            .unwrap_or_else(|e| panic!("HSM core initialization failed: {e:?}"))
     }
 
     /// Fallible constructor with an externally-provided crypto backend.

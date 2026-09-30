@@ -514,7 +514,16 @@ pub extern "C" fn C_Initialize(p_init_args: CK_VOID_PTR) -> CK_RV {
             return CKR_GENERAL_ERROR;
         }
 
-        let core = Arc::new(HsmCore::new_with_backend(&config, backend));
+        // Fallible constructor: opening the object store (e.g. while another
+        // process holds its lock) or the audit log can fail, and that must
+        // be a CK_RV, not a panic.
+        let core = match HsmCore::try_new_with_backend(&config, backend) {
+            Ok(core) => Arc::new(core),
+            Err(e) => {
+                tracing::error!("C_Initialize: HSM core initialization failed: {:?}", e);
+                return err_to_rv(e);
+            }
+        };
 
         // Record the PID for fork detection
         INIT_PID.store(current_pid(), Ordering::Release);

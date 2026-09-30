@@ -312,7 +312,18 @@ fn test_aes_cbc_wrong_key() {
     let key1 = keygen::generate_aes_key(32, false).unwrap();
     let key2 = keygen::generate_aes_key(32, false).unwrap();
     let iv = [0x22u8; 16];
-    let plaintext = b"wrong key test";
+    // Use a plaintext that spans multiple AES blocks so that a wrong-key
+    // decryption is guaranteed to produce invalid PKCS#7 padding.
+    //
+    // With a 14-byte plaintext the ciphertext is exactly 1 block (16 bytes).
+    // Decrypting with the wrong key yields pseudo-random bytes; the last byte
+    // has a ~1/256 chance of being 0x01 (valid single-byte padding), making
+    // the test flaky across many CI runs.
+    //
+    // With a 64-byte plaintext the ciphertext is 5 blocks (80 bytes). For the
+    // final decrypted block to carry valid PKCS#7 padding it would need all
+    // 16 bytes to be 0x10 — probability ~10^-38. Effectively impossible.
+    let plaintext = b"wrong key test -- extended to guarantee multi-block ciphertext!!!";
 
     let ciphertext = encrypt::aes_cbc_encrypt(key1.as_bytes(), &iv, plaintext).unwrap();
     let result = encrypt::aes_cbc_decrypt(key2.as_bytes(), &iv, &ciphertext);

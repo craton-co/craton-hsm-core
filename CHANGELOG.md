@@ -42,6 +42,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   from OpenSSL's exit-time cleanup, after the calling thread's thread-locals are destroyed, and
   the per-thread HSM and session caches then panicked ("cannot access a Thread Local Storage
   value during or after destruction"). The caches now fall back to the uncached path.
+- **Keys that were neither sensitive nor extractable vanished after a restart**: such a key (for
+  example `pkcs11-tool --keygen` without `--sensitive`) was created and persisted, but the store
+  loader rejected it on the next `C_Initialize` ("key object is both non-sensitive and
+  non-extractable"), so it silently disappeared from the token. The combination is valid PKCS#11
+  and is now loaded; keys already persisted this way reappear.
+- **`C_Initialize` panicked when the token store could not be opened**, e.g. while another process
+  held its lock, with the misleading message "DRBG instantiation must succeed (requires OS
+  entropy)". It now logs the cause and returns `CKR_GENERAL_ERROR`.
 - `CKA_COPYABLE` could not be read (`CKR_ATTRIBUTE_TYPE_INVALID`).
 - `craton-hsm-admin` showed wrong key-type names for Ed25519, generic secret and PQC keys.
 
