@@ -938,6 +938,39 @@ fn test_logout_zeroizes_active_operation_on_open_session() {
     );
 }
 
+#[test]
+fn test_closing_last_session_logs_token_out() {
+    let mgr = SessionManager::new();
+    let token = Token::new();
+    token
+        .init_token(b"sopin123", &padded_label(b"LastSess"))
+        .unwrap();
+    token.login(CKU_SO, b"sopin123").unwrap();
+    token.init_pin(b"userpin1").unwrap();
+    token.logout().unwrap();
+
+    let h1 = mgr
+        .open_session(0, CKF_RW_SESSION | CKF_SERIAL_SESSION, &token)
+        .unwrap();
+    token.login(CKU_USER, b"userpin1").unwrap();
+    mgr.login_all(0, CKU_USER).unwrap();
+    assert_eq!(token.login_state(), LoginState::UserLoggedIn);
+
+    // Close the only session without calling logout.
+    mgr.close_session(h1, &token).unwrap();
+    assert_eq!(token.login_state(), LoginState::Public);
+
+    // A newly opened session starts in public state and can log in again.
+    let h2 = mgr
+        .open_session(0, CKF_RW_SESSION | CKF_SERIAL_SESSION, &token)
+        .unwrap();
+    assert_eq!(mgr.get_session(h2).unwrap().read().state, SessionState::RwPublic);
+    token.login(CKU_USER, b"userpin1").unwrap();
+    mgr.login_all(0, CKU_USER).unwrap();
+    assert_eq!(mgr.get_session(h2).unwrap().read().state, SessionState::RwUser);
+    mgr.close_session(h2, &token).unwrap();
+}
+
 // ============================================================================
 // Helper
 // ============================================================================
