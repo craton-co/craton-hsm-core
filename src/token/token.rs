@@ -1027,7 +1027,7 @@ impl Token {
     /// operations. Returns `Err` on underflow (double-close) instead of
     /// silently saturating, allowing callers to detect the bug.
     pub fn decrement_session_count(&self, rw: bool) -> HsmResult<()> {
-        let _auth = self.auth.lock();
+        let mut auth = self.auth.lock();
 
         let current = self.session_count.load(Ordering::SeqCst);
         if current == 0 {
@@ -1050,6 +1050,13 @@ impl Token {
                 .store(rw_current - 1, Ordering::SeqCst);
         }
 
+        // PKCS#11 v3.0 §5.6: when the last session with the token is closed,
+        // the token returns to the public-session state (the user is logged out).
+        if current - 1 == 0 && auth.login != LoginState::Public {
+            tracing::info!("last session closed — returning token to public state");
+            auth.login = LoginState::Public;
+        }
+
         Ok(())
     }
 
@@ -1061,8 +1068,9 @@ impl Token {
     /// against concurrent `increment`/`decrement` operations (which also
     /// acquire `auth`), eliminating counter-drift races.
     pub fn reset_session_counts(&self) {
-        let _auth = self.auth.lock();
+        let mut auth = self.auth.lock();
         self.rw_session_count.store(0, Ordering::SeqCst);
         self.session_count.store(0, Ordering::SeqCst);
+        auth.login = LoginState::Public;
     }
 }
