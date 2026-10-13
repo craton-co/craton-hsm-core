@@ -2606,11 +2606,18 @@ pub extern "C" fn C_Sign(
     .unwrap_or(CKR_GENERAL_ERROR)
 }
 
-/// Helper to check if EC params correspond to P-384
+/// Helper to check if EC params correspond to P-256 (secp256r1 / prime256v1)
+fn is_p256_params(ec_params: &[u8]) -> bool {
+    // OID for secp256r1: 1.2.840.10045.3.1.7 = 06 08 2A 86 48 CE 3D 03 01 07
+    const P256_OID: &[u8] = &[0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07];
+    ec_params == P256_OID
+}
+
+/// Helper to check if EC params correspond to P-384 (secp384r1)
 fn is_p384_params(ec_params: &[u8]) -> bool {
     // OID for secp384r1: 1.3.132.0.34 = 06 05 2B 81 04 00 22
     const P384_OID: &[u8] = &[0x06, 0x05, 0x2B, 0x81, 0x04, 0x00, 0x22];
-    ec_params == P384_OID || ec_params.windows(P384_OID.len()).any(|w| w == P384_OID)
+    ec_params == P384_OID
 }
 
 /// Single-shot sign: hash + sign in one step (used by C_Sign and C_SignFinal for non-hashed mechanisms).
@@ -3419,14 +3426,28 @@ fn generate_ec_keypair(
     pub_template: &[(CK_ATTRIBUTE_TYPE, Vec<u8>)],
     priv_template: &[(CK_ATTRIBUTE_TYPE, Vec<u8>)],
 ) -> Result<(CK_OBJECT_HANDLE, CK_OBJECT_HANDLE, u32), CK_RV> {
-    // Determine curve from CKA_EC_PARAMS in the public template
+    // PKCS#11 v3.0 §2.3.4: CKA_EC_PARAMS must be specified in the public key template.
     let ec_params = pub_template
         .iter()
         .find(|(t, _)| *t == CKA_EC_PARAMS)
         .map(|(_, v)| v.clone())
-        .unwrap_or_default();
+        .ok_or(CKR_TEMPLATE_INCOMPLETE)?;
+    if ec_params.is_empty() {
+        return Err(CKR_TEMPLATE_INCOMPLETE);
+    }
+    if let Some((_, priv_params)) = priv_template.iter().find(|(t, _)| *t == CKA_EC_PARAMS) {
+        if *priv_params != ec_params {
+            return Err(CKR_TEMPLATE_INCONSISTENT);
+        }
+    }
 
-    let is_p384 = is_p384_params(&ec_params);
+    let is_p384 = if is_p384_params(&ec_params) {
+        true
+    } else if is_p256_params(&ec_params) {
+        false
+    } else {
+        return Err(CKR_CURVE_NOT_SUPPORTED);
+    };
     let (private_key, public_key, key_bits) = if is_p384 {
         let (priv_key, pub_key) = hsm
             .crypto_backend

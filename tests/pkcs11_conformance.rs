@@ -1537,3 +1537,65 @@ fn test_mechanism_list_and_info() {
         "AES-GCM should support decrypt"
     );
 }
+
+#[test]
+fn test_ec_keygen_rejects_unsupported_and_missing_curve() {
+    let session = setup_user_session();
+    let ck_true: CK_BBOOL = CK_TRUE;
+    let mut mechanism = CK_MECHANISM {
+        mechanism: CKM_EC_KEY_PAIR_GEN,
+        p_parameter: ptr::null_mut(),
+        parameter_len: 0,
+    };
+    let mut priv_template = vec![CK_ATTRIBUTE {
+        attr_type: CKA_SIGN,
+        p_value: &ck_true as *const _ as CK_VOID_PTR,
+        value_len: 1,
+    }];
+
+    // 1. Unsupported curve (secp521r1 OID: 06 05 2B 81 04 00 23) -> CKR_CURVE_NOT_SUPPORTED
+    let p521_oid: [u8; 7] = [0x06, 0x05, 0x2B, 0x81, 0x04, 0x00, 0x23];
+    let mut pub_p521 = vec![
+        CK_ATTRIBUTE {
+            attr_type: CKA_EC_PARAMS,
+            p_value: p521_oid.as_ptr() as CK_VOID_PTR,
+            value_len: p521_oid.len() as CK_ULONG,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_VERIFY,
+            p_value: &ck_true as *const _ as CK_VOID_PTR,
+            value_len: 1,
+        },
+    ];
+    let mut pub_key: CK_OBJECT_HANDLE = 0;
+    let mut priv_key: CK_OBJECT_HANDLE = 0;
+    let rv = C_GenerateKeyPair(
+        session,
+        &mut mechanism,
+        pub_p521.as_mut_ptr(),
+        pub_p521.len() as CK_ULONG,
+        priv_template.as_mut_ptr(),
+        priv_template.len() as CK_ULONG,
+        &mut pub_key,
+        &mut priv_key,
+    );
+    assert_eq!(rv, CKR_CURVE_NOT_SUPPORTED);
+
+    // 2. Missing CKA_EC_PARAMS -> CKR_TEMPLATE_INCOMPLETE
+    let mut pub_missing = vec![CK_ATTRIBUTE {
+        attr_type: CKA_VERIFY,
+        p_value: &ck_true as *const _ as CK_VOID_PTR,
+        value_len: 1,
+    }];
+    let rv = C_GenerateKeyPair(
+        session,
+        &mut mechanism,
+        pub_missing.as_mut_ptr(),
+        pub_missing.len() as CK_ULONG,
+        priv_template.as_mut_ptr(),
+        priv_template.len() as CK_ULONG,
+        &mut pub_key,
+        &mut priv_key,
+    );
+    assert_eq!(rv, CKR_TEMPLATE_INCOMPLETE);
+}
