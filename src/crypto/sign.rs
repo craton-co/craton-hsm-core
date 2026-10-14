@@ -1081,6 +1081,17 @@ pub fn is_ecdsa_mechanism(mechanism: CK_MECHANISM_TYPE) -> bool {
     )
 }
 
+/// Map an ECDSA mechanism to its hash algorithm (`None` for raw `CKM_ECDSA`).
+pub fn ecdsa_mechanism_to_hash(mechanism: CK_MECHANISM_TYPE) -> HsmResult<Option<HashAlg>> {
+    match mechanism {
+        CKM_ECDSA => Ok(None),
+        CKM_ECDSA_SHA256 => Ok(Some(HashAlg::Sha256)),
+        CKM_ECDSA_SHA384 => Ok(Some(HashAlg::Sha384)),
+        CKM_ECDSA_SHA512 => Ok(Some(HashAlg::Sha512)),
+        _ => Err(HsmError::MechanismInvalid),
+    }
+}
+
 /// Check if mechanism is EdDSA
 pub fn is_eddsa_mechanism(mechanism: CK_MECHANISM_TYPE) -> bool {
     mechanism == CKM_EDDSA
@@ -1400,14 +1411,12 @@ pub(crate) fn ecdsa_p256_sign_prehashed(
     use p256::ecdsa::signature::hazmat::RandomizedPrehashSigner;
     use p256::ecdsa::SigningKey;
 
-    // P-256 operates on SHA-256 digests (32 bytes)
-    validate_digest_length(digest, HashAlg::Sha256)?;
     let signing_key =
         SigningKey::from_slice(private_key_bytes).map_err(|_| HsmError::KeyHandleInvalid)?;
     let mut rng = DrbgRng::new()?;
     let signature: p256::ecdsa::Signature = signing_key
         .sign_prehash_with_rng(&mut rng, digest)
-        .map_err(|_| HsmError::GeneralError)?;
+        .map_err(|_| HsmError::DataLenRange)?;
     // PKCS#11 §2.3.1: ECDSA signature format is raw r || s (fixed-size, no ASN.1 DER).
     // P-256: 64 bytes (32-byte r + 32-byte s).
     Ok(signature.to_bytes().to_vec())
@@ -1422,8 +1431,9 @@ pub(crate) fn ecdsa_p256_verify_prehashed(
     use p256::ecdsa::signature::hazmat::PrehashVerifier;
     use p256::ecdsa::VerifyingKey;
 
-    // P-256 operates on SHA-256 digests (32 bytes)
-    validate_digest_length(digest, HashAlg::Sha256)?;
+    if digest.len() < 16 {
+        return Err(HsmError::DataLenRange);
+    }
     // PKCS#11 §2.3.1: ECDSA signature format is raw r || s (fixed-size, no ASN.1 DER).
     // P-256: exactly 64 bytes (32-byte r + 32-byte s).
     if signature.len() != 64 {
@@ -1452,14 +1462,12 @@ pub(crate) fn ecdsa_p384_sign_prehashed(
     use p384::ecdsa::signature::hazmat::RandomizedPrehashSigner;
     use p384::ecdsa::SigningKey;
 
-    // P-384 operates on SHA-384 digests (48 bytes)
-    validate_digest_length(digest, HashAlg::Sha384)?;
     let signing_key =
         SigningKey::from_slice(private_key_bytes).map_err(|_| HsmError::KeyHandleInvalid)?;
     let mut rng = DrbgRng::new()?;
     let signature: p384::ecdsa::Signature = signing_key
         .sign_prehash_with_rng(&mut rng, digest)
-        .map_err(|_| HsmError::GeneralError)?;
+        .map_err(|_| HsmError::DataLenRange)?;
     // PKCS#11 §2.3.1: ECDSA signature format is raw r || s (fixed-size, no ASN.1 DER).
     // P-384: 96 bytes (48-byte r + 48-byte s).
     Ok(signature.to_bytes().to_vec())
@@ -1474,8 +1482,9 @@ pub(crate) fn ecdsa_p384_verify_prehashed(
     use p384::ecdsa::signature::hazmat::PrehashVerifier;
     use p384::ecdsa::VerifyingKey;
 
-    // P-384 operates on SHA-384 digests (48 bytes)
-    validate_digest_length(digest, HashAlg::Sha384)?;
+    if digest.len() < 24 {
+        return Err(HsmError::DataLenRange);
+    }
     // PKCS#11 §2.3.1: ECDSA signature format is raw r || s (fixed-size, no ASN.1 DER).
     // P-384: exactly 96 bytes (48-byte r + 48-byte s).
     if signature.len() != 96 {

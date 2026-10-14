@@ -2643,11 +2643,27 @@ fn sign_single_shot(
         let key_type = obj.key_type.unwrap_or(0);
         match key_type {
             CKK_EC => {
+                let digest_buf;
+                let digest: &[u8] = match sign::ecdsa_mechanism_to_hash(mechanism)? {
+                    Some(sign::HashAlg::Sha256) => {
+                        digest_buf = backend.compute_digest(CKM_SHA256, data)?;
+                        &digest_buf
+                    }
+                    Some(sign::HashAlg::Sha384) => {
+                        digest_buf = backend.compute_digest(CKM_SHA384, data)?;
+                        &digest_buf
+                    }
+                    Some(sign::HashAlg::Sha512) => {
+                        digest_buf = backend.compute_digest(CKM_SHA512, data)?;
+                        &digest_buf
+                    }
+                    None => data,
+                };
                 let ec_params = obj.ec_params.as_deref().unwrap_or(&[]);
                 if is_p384_params(ec_params) {
-                    backend.ecdsa_p384_sign(key_bytes, data)
+                    backend.ecdsa_p384_sign_prehashed(key_bytes, digest)
                 } else {
-                    backend.ecdsa_p256_sign(key_bytes, data)
+                    backend.ecdsa_p256_sign_prehashed(key_bytes, digest)
                 }
             }
             _ => Err(HsmError::KeyTypeInconsistent),
@@ -2742,11 +2758,27 @@ fn verify_single_shot(
         )
     } else if sign::is_ecdsa_mechanism(mechanism) {
         let ec_point = obj.ec_point.as_deref().ok_or(HsmError::KeyHandleInvalid)?;
+        let digest_buf;
+        let digest: &[u8] = match sign::ecdsa_mechanism_to_hash(mechanism)? {
+            Some(sign::HashAlg::Sha256) => {
+                digest_buf = backend.compute_digest(CKM_SHA256, data)?;
+                &digest_buf
+            }
+            Some(sign::HashAlg::Sha384) => {
+                digest_buf = backend.compute_digest(CKM_SHA384, data)?;
+                &digest_buf
+            }
+            Some(sign::HashAlg::Sha512) => {
+                digest_buf = backend.compute_digest(CKM_SHA512, data)?;
+                &digest_buf
+            }
+            None => data,
+        };
         let ec_params = obj.ec_params.as_deref().unwrap_or(&[]);
         if is_p384_params(ec_params) {
-            backend.ecdsa_p384_verify(ec_point, data, signature)
+            backend.ecdsa_p384_verify_prehashed(ec_point, digest, signature)
         } else {
-            backend.ecdsa_p256_verify(ec_point, data, signature)
+            backend.ecdsa_p256_verify_prehashed(ec_point, digest, signature)
         }
     } else if sign::is_eddsa_mechanism(mechanism) {
         let pub_key = obj
