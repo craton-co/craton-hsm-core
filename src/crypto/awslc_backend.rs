@@ -392,7 +392,7 @@ impl CryptoBackend for AwsLcBackend {
             SigningKey::from_slice(private_key_bytes).map_err(|_| HsmError::KeyHandleInvalid)?;
         let signature: p256::ecdsa::Signature = signing_key
             .sign_prehash(digest)
-            .map_err(|_| HsmError::GeneralError)?;
+            .map_err(|_| HsmError::DataLenRange)?;
         // PKCS#11 §2.3.1: ECDSA signature format is raw r || s (fixed-size, no ASN.1 DER).
         // P-256: 64 bytes (32-byte r + 32-byte s).
         Ok(signature.to_bytes().to_vec())
@@ -407,6 +407,9 @@ impl CryptoBackend for AwsLcBackend {
         use p256::ecdsa::signature::hazmat::PrehashVerifier;
         use p256::ecdsa::VerifyingKey;
 
+        if digest.len() < 16 {
+            return Err(HsmError::DataLenRange);
+        }
         // PKCS#11 §2.3.1: ECDSA signature format is raw r || s (fixed-size, no ASN.1 DER).
         // P-256: exactly 64 bytes (32-byte r + 32-byte s).
         if signature.len() != 64 {
@@ -431,7 +434,7 @@ impl CryptoBackend for AwsLcBackend {
             SigningKey::from_slice(private_key_bytes).map_err(|_| HsmError::KeyHandleInvalid)?;
         let signature: p384::ecdsa::Signature = signing_key
             .sign_prehash(digest)
-            .map_err(|_| HsmError::GeneralError)?;
+            .map_err(|_| HsmError::DataLenRange)?;
         // PKCS#11 §2.3.1: ECDSA signature format is raw r || s (fixed-size, no ASN.1 DER).
         // P-384: 96 bytes (48-byte r + 48-byte s).
         Ok(signature.to_bytes().to_vec())

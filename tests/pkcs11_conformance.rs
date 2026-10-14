@@ -1599,3 +1599,133 @@ fn test_ec_keygen_rejects_unsupported_and_missing_curve() {
     );
     assert_eq!(rv, CKR_TEMPLATE_INCOMPLETE);
 }
+
+#[test]
+fn test_ecdsa_mechanism_hash_binding() {
+    use sha2::{Digest, Sha256, Sha512};
+
+    let session = setup_user_session();
+    let ec_params: [u8; 10] = [0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07];
+    let ck_true: CK_BBOOL = CK_TRUE;
+    let mut pub_template = vec![
+        CK_ATTRIBUTE {
+            attr_type: CKA_EC_PARAMS,
+            p_value: ec_params.as_ptr() as CK_VOID_PTR,
+            value_len: ec_params.len() as CK_ULONG,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_VERIFY,
+            p_value: &ck_true as *const _ as CK_VOID_PTR,
+            value_len: 1,
+        },
+    ];
+    let mut priv_template = vec![CK_ATTRIBUTE {
+        attr_type: CKA_SIGN,
+        p_value: &ck_true as *const _ as CK_VOID_PTR,
+        value_len: 1,
+    }];
+    let mut gen_mech = CK_MECHANISM {
+        mechanism: CKM_EC_KEY_PAIR_GEN,
+        p_parameter: ptr::null_mut(),
+        parameter_len: 0,
+    };
+    let mut pub_key: CK_OBJECT_HANDLE = 0;
+    let mut priv_key: CK_OBJECT_HANDLE = 0;
+    assert_eq!(
+        C_GenerateKeyPair(
+            session,
+            &mut gen_mech,
+            pub_template.as_mut_ptr(),
+            pub_template.len() as CK_ULONG,
+            priv_template.as_mut_ptr(),
+            priv_template.len() as CK_ULONG,
+            &mut pub_key,
+            &mut priv_key,
+        ),
+        CKR_OK
+    );
+
+    let message = b"ECDSA hash mechanism binding test";
+    let digest256 = Sha256::digest(message);
+
+    // 1. CKM_ECDSA signs the pre-computed SHA-256 digest directly (no double hash),
+    //    so CKM_ECDSA_SHA256 over `message` verifies the signature!
+    let mut raw_ecdsa = CK_MECHANISM {
+        mechanism: CKM_ECDSA,
+        p_parameter: ptr::null_mut(),
+        parameter_len: 0,
+    };
+    assert_eq!(C_SignInit(session, &mut raw_ecdsa, priv_key), CKR_OK);
+    let mut sig = vec![0u8; 64];
+    let mut sig_len = sig.len() as CK_ULONG;
+    assert_eq!(
+        C_Sign(
+            session,
+            digest256.as_ptr() as CK_BYTE_PTR,
+            digest256.len() as CK_ULONG,
+            sig.as_mut_ptr(),
+            &mut sig_len,
+        ),
+        CKR_OK
+    );
+
+    let mut ecdsa_sha256 = CK_MECHANISM {
+        mechanism: CKM_ECDSA_SHA256,
+        p_parameter: ptr::null_mut(),
+        parameter_len: 0,
+    };
+    assert_eq!(C_VerifyInit(session, &mut ecdsa_sha256, pub_key), CKR_OK);
+    assert_eq!(
+        C_Verify(
+            session,
+            message.as_ptr() as CK_BYTE_PTR,
+            message.len() as CK_ULONG,
+            sig.as_mut_ptr(),
+            sig_len,
+        ),
+        CKR_OK
+    );
+
+    // 2. CKM_ECDSA_SHA512 on P-256 hashes with SHA-512 (not SHA-256), and
+    //    verifies under CKM_ECDSA with SHA-512(message), not SHA-256(message).
+    let mut ecdsa_sha512 = CK_MECHANISM {
+        mechanism: CKM_ECDSA_SHA512,
+        p_parameter: ptr::null_mut(),
+        parameter_len: 0,
+    };
+    assert_eq!(C_SignInit(session, &mut ecdsa_sha512, priv_key), CKR_OK);
+    sig_len = sig.len() as CK_ULONG;
+    assert_eq!(
+        C_Sign(
+            session,
+            message.as_ptr() as CK_BYTE_PTR,
+            message.len() as CK_ULONG,
+            sig.as_mut_ptr(),
+            &mut sig_len,
+        ),
+        CKR_OK
+    );
+    let digest512 = Sha512::digest(message);
+    assert_eq!(C_VerifyInit(session, &mut raw_ecdsa, pub_key), CKR_OK);
+    assert_eq!(
+        C_Verify(
+            session,
+            digest512.as_ptr() as CK_BYTE_PTR,
+            digest512.len() as CK_ULONG,
+            sig.as_mut_ptr(),
+            sig_len,
+        ),
+        CKR_OK
+    );
+    assert_eq!(C_VerifyInit(session, &mut ecdsa_sha256, pub_key), CKR_OK);
+    assert_eq!(
+        C_Verify(
+            session,
+            message.as_ptr() as CK_BYTE_PTR,
+            message.len() as CK_ULONG,
+            sig.as_mut_ptr(),
+            sig_len,
+        ),
+        CKR_SIGNATURE_INVALID
+    );
+}
