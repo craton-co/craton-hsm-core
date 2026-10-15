@@ -1729,3 +1729,78 @@ fn test_ecdsa_mechanism_hash_binding() {
         CKR_SIGNATURE_INVALID
     );
 }
+
+/// Issue #82: C_CreateObject must accept CKA_EXTRACTABLE = true and
+/// CKA_SENSITIVE = false in the creation template (the one-way rule only
+/// constrains post-creation C_SetAttributeValue / C_CopyObject).
+#[test]
+fn test_create_object_accepts_extractable_and_non_sensitive() {
+    let session = setup_user_session();
+
+    let mut class = CKO_SECRET_KEY;
+    let mut key_type = CKK_AES;
+    let mut key_val = [0x55u8; 32];
+    let mut ck_true: CK_BBOOL = CK_TRUE;
+    let mut ck_false: CK_BBOOL = CK_FALSE;
+
+    let mut template = [
+        CK_ATTRIBUTE {
+            attr_type: CKA_CLASS,
+            p_value: &mut class as *mut _ as CK_VOID_PTR,
+            value_len: std::mem::size_of::<CK_ULONG>() as CK_ULONG,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_KEY_TYPE,
+            p_value: &mut key_type as *mut _ as CK_VOID_PTR,
+            value_len: std::mem::size_of::<CK_ULONG>() as CK_ULONG,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_VALUE,
+            p_value: key_val.as_mut_ptr() as CK_VOID_PTR,
+            value_len: key_val.len() as CK_ULONG,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_EXTRACTABLE,
+            p_value: &mut ck_true as *mut _ as CK_VOID_PTR,
+            value_len: 1,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_SENSITIVE,
+            p_value: &mut ck_false as *mut _ as CK_VOID_PTR,
+            value_len: 1,
+        },
+    ];
+
+    let mut handle: CK_OBJECT_HANDLE = 0;
+    assert_eq!(
+        C_CreateObject(
+            session,
+            template.as_mut_ptr(),
+            template.len() as CK_ULONG,
+            &mut handle,
+        ),
+        CKR_OK
+    );
+
+    let mut read_extractable: CK_BBOOL = CK_FALSE;
+    let mut read_sensitive: CK_BBOOL = CK_TRUE;
+    let mut query = [
+        CK_ATTRIBUTE {
+            attr_type: CKA_EXTRACTABLE,
+            p_value: &mut read_extractable as *mut _ as CK_VOID_PTR,
+            value_len: 1,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_SENSITIVE,
+            p_value: &mut read_sensitive as *mut _ as CK_VOID_PTR,
+            value_len: 1,
+        },
+    ];
+    assert_eq!(
+        C_GetAttributeValue(session, handle, query.as_mut_ptr(), query.len() as CK_ULONG),
+        CKR_OK
+    );
+    assert_eq!(read_extractable, CK_TRUE);
+    assert_eq!(read_sensitive, CK_FALSE);
+}
+
