@@ -637,20 +637,10 @@ pub fn apply_attribute(
             obj.private = !value.is_empty() && value[0] != 0;
         }
         CKA_SENSITIVE => {
-            let new_val = !value.is_empty() && value[0] != 0;
-            // PKCS#11 §10.7: CKA_SENSITIVE is one-way — once true, cannot be reset to false
-            if obj.sensitive && !new_val {
-                return Err(HsmError::AttributeReadOnly);
-            }
-            obj.sensitive = new_val;
+            obj.sensitive = !value.is_empty() && value[0] != 0;
         }
         CKA_EXTRACTABLE => {
-            let new_val = !value.is_empty() && value[0] != 0;
-            // PKCS#11 §10.7: CKA_EXTRACTABLE is one-way — once false, cannot be set back to true
-            if !obj.extractable && new_val {
-                return Err(HsmError::AttributeReadOnly);
-            }
-            obj.extractable = new_val;
+            obj.extractable = !value.is_empty() && value[0] != 0;
         }
         CKA_MODIFIABLE => {
             obj.modifiable = !value.is_empty() && value[0] != 0;
@@ -739,6 +729,46 @@ pub fn apply_attribute(
         }
     }
     Ok(())
+}
+
+/// Apply a post-creation attribute modification (`C_SetAttributeValue`),
+/// enforcing PKCS#11 v3.0 §4.9 (Table 39, notes 11–12) one-way rules for
+/// `CKA_SENSITIVE` (false -> true only) and `CKA_EXTRACTABLE` (true -> false only).
+pub fn modify_attribute(
+    obj: &mut StoredObject,
+    attr_type: CK_ATTRIBUTE_TYPE,
+    value: &[u8],
+) -> HsmResult<()> {
+    if !obj.modifiable {
+        return Err(HsmError::AttributeReadOnly);
+    }
+    match attr_type {
+        CKA_LABEL => {
+            obj.label = value.to_vec();
+            Ok(())
+        }
+        CKA_ID => {
+            obj.id = value.to_vec();
+            Ok(())
+        }
+        CKA_SENSITIVE => {
+            let new_val = !value.is_empty() && value[0] != 0;
+            if obj.sensitive && !new_val {
+                return Err(HsmError::AttributeReadOnly);
+            }
+            obj.sensitive = new_val;
+            Ok(())
+        }
+        CKA_EXTRACTABLE => {
+            let new_val = !value.is_empty() && value[0] != 0;
+            if !obj.extractable && new_val {
+                return Err(HsmError::AttributeReadOnly);
+            }
+            obj.extractable = new_val;
+            Ok(())
+        }
+        _ => Err(HsmError::AttributeReadOnly),
+    }
 }
 
 /// Read attribute value from a stored object.

@@ -1647,13 +1647,28 @@ pub extern "C" fn C_SetAttributeValue(
         };
         for (attr_type, value) in &template {
             match *attr_type {
-                // PKCS#11 §4.1.2: Only CKA_LABEL and CKA_ID are modifiable
-                // after object creation. All other attributes (especially
-                // CKA_CLASS, CKA_KEY_TYPE, CKA_SENSITIVE, CKA_EXTRACTABLE,
-                // CKA_PRIVATE, permission flags, key material, etc.) are
-                // read-only once the object exists.
                 CKA_LABEL => obj.label = value.clone(),
                 CKA_ID => obj.id = value.clone(),
+                CKA_SENSITIVE => {
+                    let new_val = match parse_ck_bbool(value) {
+                        Ok(v) => v,
+                        Err(rv) => return rv,
+                    };
+                    if obj.sensitive && !new_val {
+                        return CKR_ATTRIBUTE_READ_ONLY;
+                    }
+                    obj.sensitive = new_val;
+                }
+                CKA_EXTRACTABLE => {
+                    let new_val = match parse_ck_bbool(value) {
+                        Ok(v) => v,
+                        Err(rv) => return rv,
+                    };
+                    if !obj.extractable && new_val {
+                        return CKR_ATTRIBUTE_READ_ONLY;
+                    }
+                    obj.extractable = new_val;
+                }
                 // Hybrid signature mechanisms (e.g. CKM_HYBRID_ML_DSA_ECDSA)
                 // attach the ECDSA component to a PQC key object via
                 // CKA_EC_POINT. The hybrid sign/verify paths look this up in
