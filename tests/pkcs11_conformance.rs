@@ -1804,3 +1804,92 @@ fn test_create_object_accepts_extractable_and_non_sensitive() {
     assert_eq!(read_sensitive, CK_FALSE);
 }
 
+/// Issue #83: C_GetAttributeValue(CKA_VALUE) on CKO_DATA and CKO_CERTIFICATE
+/// objects must succeed instead of returning CKR_ATTRIBUTE_SENSITIVE.
+#[test]
+fn test_data_and_certificate_cka_value_readable() {
+    let session = setup_user_session();
+
+    // 1. CKO_DATA object
+    let mut data_class = CKO_DATA;
+    let mut app_name = *b"test";
+    let mut data_val = [0x01u8, 0x02, 0x03, 0x04];
+    let mut data_tpl = [
+        CK_ATTRIBUTE {
+            attr_type: CKA_CLASS,
+            p_value: &mut data_class as *mut _ as CK_VOID_PTR,
+            value_len: std::mem::size_of::<CK_ULONG>() as CK_ULONG,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_APPLICATION,
+            p_value: app_name.as_mut_ptr() as CK_VOID_PTR,
+            value_len: app_name.len() as CK_ULONG,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_VALUE,
+            p_value: data_val.as_mut_ptr() as CK_VOID_PTR,
+            value_len: data_val.len() as CK_ULONG,
+        },
+    ];
+    let mut data_handle: CK_OBJECT_HANDLE = 0;
+    assert_eq!(
+        C_CreateObject(
+            session,
+            data_tpl.as_mut_ptr(),
+            data_tpl.len() as CK_ULONG,
+            &mut data_handle,
+        ),
+        CKR_OK
+    );
+
+    let mut out_buf = [0u8; 4];
+    let mut get_attr = [CK_ATTRIBUTE {
+        attr_type: CKA_VALUE,
+        p_value: out_buf.as_mut_ptr() as CK_VOID_PTR,
+        value_len: out_buf.len() as CK_ULONG,
+    }];
+    assert_eq!(
+        C_GetAttributeValue(session, data_handle, get_attr.as_mut_ptr(), 1),
+        CKR_OK
+    );
+    assert_eq!(out_buf, data_val);
+
+    // 2. CKO_CERTIFICATE object
+    let mut cert_class = CKO_CERTIFICATE;
+    let mut cert_val = [0x30u8, 0x82, 0x01, 0x0a];
+    let mut cert_tpl = [
+        CK_ATTRIBUTE {
+            attr_type: CKA_CLASS,
+            p_value: &mut cert_class as *mut _ as CK_VOID_PTR,
+            value_len: std::mem::size_of::<CK_ULONG>() as CK_ULONG,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_VALUE,
+            p_value: cert_val.as_mut_ptr() as CK_VOID_PTR,
+            value_len: cert_val.len() as CK_ULONG,
+        },
+    ];
+    let mut cert_handle: CK_OBJECT_HANDLE = 0;
+    assert_eq!(
+        C_CreateObject(
+            session,
+            cert_tpl.as_mut_ptr(),
+            cert_tpl.len() as CK_ULONG,
+            &mut cert_handle,
+        ),
+        CKR_OK
+    );
+
+    let mut cert_out = [0u8; 4];
+    let mut get_cert = [CK_ATTRIBUTE {
+        attr_type: CKA_VALUE,
+        p_value: cert_out.as_mut_ptr() as CK_VOID_PTR,
+        value_len: cert_out.len() as CK_ULONG,
+    }];
+    assert_eq!(
+        C_GetAttributeValue(session, cert_handle, get_cert.as_mut_ptr(), 1),
+        CKR_OK
+    );
+    assert_eq!(cert_out, cert_val);
+}
+
