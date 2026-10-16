@@ -823,16 +823,16 @@ pub fn read_attribute(
         CKA_UNWRAP => Ok(Some(vec![if obj.can_unwrap { 1 } else { 0 }])),
         CKA_DERIVE => Ok(Some(vec![if obj.can_derive { 1 } else { 0 }])),
         CKA_VALUE => {
-            // CKA_VALUE access policy:
+            // CKA_VALUE access policy (applies to secret/private keys; data,
+            // certificate, and public key objects have non-sensitive CKA_VALUE
+            // per PKCS#11 v3.0 §4.5–4.7):
             // - sensitive=true AND extractable=false → block (key is fully protected)
             // - sensitive=true AND extractable=true  → allow (key is exportable)
             // - sensitive=false → always allow (regardless of extractable)
-            //
-            // This follows the convention that CKA_SENSITIVE + CKA_EXTRACTABLE
-            // together determine the key's protection level. A sensitive key
-            // that is also extractable can still be read (it's exportable by
-            // design). Only when both guards are engaged is the value blocked.
-            if obj.sensitive && !obj.extractable {
+            if crate::store::object::is_secret_class(obj.class)
+                && obj.sensitive
+                && !obj.extractable
+            {
                 return Err(HsmError::AttributeSensitive);
             }
             // PKCS#11 v3.2: CKA_VALUE of an ML-KEM / ML-DSA / SLH-DSA public

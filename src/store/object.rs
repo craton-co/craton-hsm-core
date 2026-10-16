@@ -125,8 +125,14 @@ impl Drop for StoredObject {
     }
 }
 
+/// Returns true for object classes whose value is secret key material.
+pub fn is_secret_class(class: CK_OBJECT_CLASS) -> bool {
+    class == CKO_SECRET_KEY || class == CKO_PRIVATE_KEY
+}
+
 impl StoredObject {
     pub fn new(handle: CK_OBJECT_HANDLE, class: CK_OBJECT_CLASS) -> Self {
+        let secret = is_secret_class(class);
         Self {
             handle,
             slot_id: 0,
@@ -136,8 +142,8 @@ impl StoredObject {
             id: Vec::new(),
             token_object: false,
             private: true,
-            sensitive: true,
-            extractable: false,
+            sensitive: secret,
+            extractable: !secret,
             modifiable: true,
             destroyable: true,
             copyable: true,
