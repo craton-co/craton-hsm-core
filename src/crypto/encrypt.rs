@@ -758,6 +758,115 @@ pub fn aes_cbc_decrypt(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> HsmResult<Ve
     result
 }
 
+/// Unpadded AES-CBC encrypt (`CKM_AES_CBC`, PKCS#11 v3.0 §6.7.4).
+///
+/// Input must be a non-empty multiple of 16 bytes; output has the exact same length.
+pub fn aes_cbc_encrypt_unpadded(key: &[u8], iv: &[u8], plaintext: &[u8]) -> HsmResult<Vec<u8>> {
+    use cbc::cipher::{BlockEncryptMut, KeyIvInit};
+
+    tracing::warn!("AES-CBC encrypt: unauthenticated mode — prefer AES-GCM for new applications");
+
+    if plaintext.is_empty()
+        || !plaintext.len().is_multiple_of(16)
+        || plaintext.len() > AES_CBC_CTR_MAX_PLAINTEXT
+    {
+        return Err(HsmError::DataLenRange);
+    }
+
+    if iv.len() != 16 {
+        return Err(HsmError::MechanismParamInvalid);
+    }
+
+    if iv.iter().all(|&b| b == 0) {
+        tracing::error!(
+            "AES-CBC encrypt rejected: all-zero IV is not permitted (likely uninitialized)"
+        );
+        return Err(HsmError::MechanismParamInvalid);
+    }
+
+    let iv_array: [u8; 16] = iv.try_into().unwrap();
+    check_iv_reuse(key, &iv_array, "AES-CBC")?;
+
+    match key.len() {
+        16 => {
+            type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
+            let encryptor =
+                Aes128CbcEnc::new_from_slices(key, iv).map_err(|_| HsmError::KeySizeRange)?;
+            Ok(
+                encryptor
+                    .encrypt_padded_vec_mut::<cbc::cipher::block_padding::NoPadding>(plaintext),
+            )
+        }
+        24 => {
+            type Aes192CbcEnc = cbc::Encryptor<aes::Aes192>;
+            let encryptor =
+                Aes192CbcEnc::new_from_slices(key, iv).map_err(|_| HsmError::KeySizeRange)?;
+            Ok(
+                encryptor
+                    .encrypt_padded_vec_mut::<cbc::cipher::block_padding::NoPadding>(plaintext),
+            )
+        }
+        32 => {
+            type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
+            let encryptor =
+                Aes256CbcEnc::new_from_slices(key, iv).map_err(|_| HsmError::KeySizeRange)?;
+            Ok(
+                encryptor
+                    .encrypt_padded_vec_mut::<cbc::cipher::block_padding::NoPadding>(plaintext),
+            )
+        }
+        _ => Err(HsmError::KeySizeRange),
+    }
+}
+
+/// Unpadded AES-CBC decrypt (`CKM_AES_CBC`, PKCS#11 v3.0 §6.7.4).
+///
+/// Input must be a non-empty multiple of 16 bytes; output has the exact same length.
+pub fn aes_cbc_decrypt_unpadded(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> HsmResult<Vec<u8>> {
+    use cbc::cipher::{BlockDecryptMut, KeyIvInit};
+
+    if iv.len() != 16 {
+        return Err(HsmError::MechanismParamInvalid);
+    }
+    if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(16) {
+        return Err(HsmError::EncryptedDataLenRange);
+    }
+
+    match key.len() {
+        16 => {
+            type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
+            Aes128CbcDec::new_from_slices(key, iv)
+                .map_err(|_| HsmError::KeySizeRange)
+                .and_then(|decryptor| {
+                    decryptor
+                        .decrypt_padded_vec_mut::<cbc::cipher::block_padding::NoPadding>(ciphertext)
+                        .map_err(|_| HsmError::EncryptedDataInvalid)
+                })
+        }
+        24 => {
+            type Aes192CbcDec = cbc::Decryptor<aes::Aes192>;
+            Aes192CbcDec::new_from_slices(key, iv)
+                .map_err(|_| HsmError::KeySizeRange)
+                .and_then(|decryptor| {
+                    decryptor
+                        .decrypt_padded_vec_mut::<cbc::cipher::block_padding::NoPadding>(ciphertext)
+                        .map_err(|_| HsmError::EncryptedDataInvalid)
+                })
+        }
+        32 => {
+            type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
+            Aes256CbcDec::new_from_slices(key, iv)
+                .map_err(|_| HsmError::KeySizeRange)
+                .and_then(|decryptor| {
+                    decryptor
+                        .decrypt_padded_vec_mut::<cbc::cipher::block_padding::NoPadding>(ciphertext)
+                        .map_err(|_| HsmError::EncryptedDataInvalid)
+                })
+        }
+        _ => Err(HsmError::KeySizeRange),
+    }
+}
+
 // ============================================================================
 // AES-CTR
 // ============================================================================

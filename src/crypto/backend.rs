@@ -291,6 +291,22 @@ pub trait CryptoBackend: Send + Sync {
     ) -> HsmResult<Vec<u8>>;
     fn aes_cbc_encrypt(&self, key: &[u8], iv: &[u8], plaintext: &[u8]) -> HsmResult<Vec<u8>>;
     fn aes_cbc_decrypt(&self, key: &[u8], iv: &[u8], ciphertext: &[u8]) -> HsmResult<Vec<u8>>;
+    fn aes_cbc_encrypt_unpadded(
+        &self,
+        key: &[u8],
+        iv: &[u8],
+        plaintext: &[u8],
+    ) -> HsmResult<Vec<u8>> {
+        super::encrypt::aes_cbc_encrypt_unpadded(key, iv, plaintext)
+    }
+    fn aes_cbc_decrypt_unpadded(
+        &self,
+        key: &[u8],
+        iv: &[u8],
+        ciphertext: &[u8],
+    ) -> HsmResult<Vec<u8>> {
+        super::encrypt::aes_cbc_decrypt_unpadded(key, iv, ciphertext)
+    }
     fn aes_ctr_encrypt(&self, key: &[u8], iv: &[u8], plaintext: &[u8]) -> HsmResult<Vec<u8>>;
     fn aes_ctr_decrypt(&self, key: &[u8], iv: &[u8], ciphertext: &[u8]) -> HsmResult<Vec<u8>>;
 
