@@ -2004,10 +2004,14 @@ pub extern "C" fn C_Encrypt(
                 CKM_AES_GCM if !mech_param.is_empty() => data.len() + GCM_TAG_LEN,
                 // Legacy: nonce (12) || ciphertext (= plaintext len) || tag (16).
                 CKM_AES_GCM => data.len() + GCM_IV_LEN + GCM_TAG_LEN,
-                CKM_AES_CBC | CKM_AES_CBC_PAD => {
-                    // CBC-PAD may add up to one block; plain CBC output = input len
-                    data.len() + 16
+                CKM_AES_CBC => {
+                    if data.is_empty() || !data.len().is_multiple_of(16) {
+                        sess.active_operation = None;
+                        return CKR_DATA_LEN_RANGE;
+                    }
+                    data.len()
                 }
+                CKM_AES_CBC_PAD => (data.len() / 16 + 1) * 16,
                 CKM_AES_CTR => data.len(),
                 CKM_RSA_PKCS_OAEP => {
                     // RSA-OAEP output = modulus size in bytes
@@ -2039,7 +2043,15 @@ pub extern "C" fn C_Encrypt(
                 })
             }
             CKM_AES_GCM => hsm.crypto_backend.aes_256_gcm_encrypt(key_bytes, data),
-            CKM_AES_CBC | CKM_AES_CBC_PAD => {
+            CKM_AES_CBC => {
+                if mech_param.is_empty() {
+                    Err(HsmError::MechanismParamInvalid)
+                } else {
+                    hsm.crypto_backend
+                        .aes_cbc_encrypt_unpadded(key_bytes, &mech_param, data)
+                }
+            }
+            CKM_AES_CBC_PAD => {
                 if mech_param.is_empty() {
                     Err(HsmError::MechanismParamInvalid)
                 } else {
@@ -2311,7 +2323,15 @@ pub extern "C" fn C_Decrypt(
                     .aes_256_gcm_decrypt_with_iv(key_bytes, iv, aad, data)
             }
             CKM_AES_GCM => hsm.crypto_backend.aes_256_gcm_decrypt(key_bytes, data),
-            CKM_AES_CBC | CKM_AES_CBC_PAD => {
+            CKM_AES_CBC => {
+                if mech_param.is_empty() {
+                    Err(HsmError::MechanismParamInvalid)
+                } else {
+                    hsm.crypto_backend
+                        .aes_cbc_decrypt_unpadded(key_bytes, &mech_param, data)
+                }
+            }
+            CKM_AES_CBC_PAD => {
                 if mech_param.is_empty() {
                     Err(HsmError::MechanismParamInvalid)
                 } else {
@@ -4544,8 +4564,11 @@ pub extern "C" fn C_EncryptFinal(
                         sess.active_operation = None;
                         return CKR_MECHANISM_INVALID;
                     }
-                    // AES-CBC_PAD may add up to one block (16 bytes); others output same length
-                    data.len() + 16
+                    if *mechanism == CKM_AES_CBC_PAD {
+                        data.len() + 16
+                    } else {
+                        data.len()
+                    }
                 }
                 _ => return CKR_OPERATION_NOT_INITIALIZED,
             };
@@ -4570,7 +4593,11 @@ pub extern "C" fn C_EncryptFinal(
                 sess.active_operation = None;
                 return CKR_MECHANISM_INVALID;
             }
-            let estimated = data_ref.len() + 16; // CBC-PAD may add one block
+            let estimated = if mech == CKM_AES_CBC_PAD {
+                data_ref.len() + 16
+            } else {
+                data_ref.len()
+            };
             if buf_len < estimated {
                 unsafe {
                     *pul_last_encrypted_part_len = estimated as CK_ULONG;
@@ -4619,7 +4646,15 @@ pub extern "C" fn C_EncryptFinal(
         };
 
         let result = match mechanism {
-            CKM_AES_CBC | CKM_AES_CBC_PAD => {
+            CKM_AES_CBC => {
+                if mech_param.is_empty() {
+                    Err(HsmError::MechanismParamInvalid)
+                } else {
+                    hsm.crypto_backend
+                        .aes_cbc_encrypt_unpadded(key_bytes, &mech_param, &data)
+                }
+            }
+            CKM_AES_CBC_PAD => {
                 if mech_param.is_empty() {
                     Err(HsmError::MechanismParamInvalid)
                 } else {
@@ -4849,7 +4884,15 @@ pub extern "C" fn C_DecryptFinal(
         };
 
         let result = match mechanism {
-            CKM_AES_CBC | CKM_AES_CBC_PAD => {
+            CKM_AES_CBC => {
+                if mech_param.is_empty() {
+                    Err(HsmError::MechanismParamInvalid)
+                } else {
+                    hsm.crypto_backend
+                        .aes_cbc_decrypt_unpadded(key_bytes, &mech_param, &data)
+                }
+            }
+            CKM_AES_CBC_PAD => {
                 if mech_param.is_empty() {
                     Err(HsmError::MechanismParamInvalid)
                 } else {

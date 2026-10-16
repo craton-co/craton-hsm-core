@@ -1893,3 +1893,109 @@ fn test_data_and_certificate_cka_value_readable() {
     assert_eq!(cert_out, cert_val);
 }
 
+
+/// Issue #86: CKM_AES_CBC must perform unpadded block-aligned encryption and
+/// decryption, producing 32 bytes (not 48) for a 32-byte input.
+#[test]
+fn test_aes_cbc_unpadded_vector() {
+    let session = setup_user_session();
+
+    let mut class = CKO_SECRET_KEY;
+    let mut key_type = CKK_AES;
+    let mut key_val: [u8; 16] = core::array::from_fn(|i| i as u8);
+    let mut ck_true: CK_BBOOL = CK_TRUE;
+    let mut template = [
+        CK_ATTRIBUTE {
+            attr_type: CKA_CLASS,
+            p_value: &mut class as *mut _ as CK_VOID_PTR,
+            value_len: std::mem::size_of::<CK_ULONG>() as CK_ULONG,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_KEY_TYPE,
+            p_value: &mut key_type as *mut _ as CK_VOID_PTR,
+            value_len: std::mem::size_of::<CK_ULONG>() as CK_ULONG,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_VALUE,
+            p_value: key_val.as_mut_ptr() as CK_VOID_PTR,
+            value_len: key_val.len() as CK_ULONG,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_ENCRYPT,
+            p_value: &mut ck_true as *mut _ as CK_VOID_PTR,
+            value_len: 1,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_DECRYPT,
+            p_value: &mut ck_true as *mut _ as CK_VOID_PTR,
+            value_len: 1,
+        },
+    ];
+    let mut key: CK_OBJECT_HANDLE = 0;
+    assert_eq!(
+        C_CreateObject(
+            session,
+            template.as_mut_ptr(),
+            template.len() as CK_ULONG,
+            &mut key,
+        ),
+        CKR_OK
+    );
+
+    let mut iv = [0u8; 16];
+    iv[0] = 0x07;
+    let mut mech = CK_MECHANISM {
+        mechanism: CKM_AES_CBC,
+        p_parameter: iv.as_mut_ptr() as CK_VOID_PTR,
+        parameter_len: iv.len() as CK_ULONG,
+    };
+
+    let plaintext = [0u8; 32];
+    assert_eq!(C_EncryptInit(session, &mut mech, key), CKR_OK);
+
+    let mut ct_len: CK_ULONG = 0;
+    assert_eq!(
+        C_Encrypt(
+            session,
+            plaintext.as_ptr() as CK_BYTE_PTR,
+            plaintext.len() as CK_ULONG,
+            ptr::null_mut(),
+            &mut ct_len,
+        ),
+        CKR_OK
+    );
+    assert_eq!(ct_len, 32);
+
+    let mut ciphertext = vec![0u8; ct_len as usize];
+    assert_eq!(
+        C_Encrypt(
+            session,
+            plaintext.as_ptr() as CK_BYTE_PTR,
+            plaintext.len() as CK_ULONG,
+            ciphertext.as_mut_ptr(),
+            &mut ct_len,
+        ),
+        CKR_OK
+    );
+    assert_eq!(ct_len, 32);
+    let expected =
+        hex::decode("0A54C3E6EAE07ECCF451BBCD991A30ECBDF945C8ADFF96B31E0EAF2CFC3A7058").unwrap();
+    assert_eq!(ciphertext, expected);
+
+    assert_eq!(C_DecryptInit(session, &mut mech, key), CKR_OK);
+    let mut pt_out = vec![0u8; 32];
+    let mut pt_len = pt_out.len() as CK_ULONG;
+    assert_eq!(
+        C_Decrypt(
+            session,
+            ciphertext.as_mut_ptr(),
+            ct_len,
+            pt_out.as_mut_ptr(),
+            &mut pt_len,
+        ),
+        CKR_OK
+    );
+    assert_eq!(pt_len, 32);
+    assert_eq!(pt_out, plaintext);
+}
+
