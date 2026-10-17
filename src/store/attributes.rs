@@ -673,6 +673,9 @@ pub fn apply_attribute(
             if value.len() > MAX_KEY_MATERIAL_LEN {
                 return Err(HsmError::AttributeValueInvalid);
             }
+            if obj.class == CKO_SECRET_KEY && obj.value_len.is_none() {
+                obj.value_len = Some(value.len() as CK_ULONG);
+            }
             obj.key_material = Some(RawKeyMaterial::new(value.to_vec()));
         }
         CKA_MODULUS => {
