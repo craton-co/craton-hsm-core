@@ -2045,6 +2045,58 @@ fn test_unwrap_key_accepts_extractable_and_non_sensitive() {
     assert_eq!(read_sensitive, CK_FALSE);
 }
 
+/// Issue #85: A CKO_SECRET_KEY created with C_CreateObject and CKA_VALUE must
+/// have CKA_VALUE_LEN populated to the length of CKA_VALUE.
+#[test]
+fn test_secret_key_created_with_value_has_value_len() {
+    let session = setup_user_session();
+
+    let mut class = CKO_SECRET_KEY;
+    let mut key_type = CKK_AES;
+    let mut key_val = [0xAAu8; 16];
+    let mut template = [
+        CK_ATTRIBUTE {
+            attr_type: CKA_CLASS,
+            p_value: &mut class as *mut _ as CK_VOID_PTR,
+            value_len: std::mem::size_of::<CK_ULONG>() as CK_ULONG,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_KEY_TYPE,
+            p_value: &mut key_type as *mut _ as CK_VOID_PTR,
+            value_len: std::mem::size_of::<CK_ULONG>() as CK_ULONG,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_VALUE,
+            p_value: key_val.as_mut_ptr() as CK_VOID_PTR,
+            value_len: key_val.len() as CK_ULONG,
+        },
+    ];
+
+    let mut handle: CK_OBJECT_HANDLE = 0;
+    assert_eq!(
+        C_CreateObject(
+            session,
+            template.as_mut_ptr(),
+            template.len() as CK_ULONG,
+            &mut handle,
+        ),
+        CKR_OK
+    );
+
+    let mut val_len: CK_ULONG = 0;
+    let mut get_attr = [CK_ATTRIBUTE {
+        attr_type: CKA_VALUE_LEN,
+        p_value: &mut val_len as *mut _ as CK_VOID_PTR,
+        value_len: std::mem::size_of::<CK_ULONG>() as CK_ULONG,
+    }];
+    assert_eq!(
+        C_GetAttributeValue(session, handle, get_attr.as_mut_ptr(), 1),
+        CKR_OK
+    );
+    assert_eq!(val_len, 16);
+}
+
+
 
 
 /// Issue #86: CKM_AES_CBC must perform unpadded block-aligned encryption and
