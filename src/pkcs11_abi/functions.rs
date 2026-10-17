@@ -1987,13 +1987,10 @@ pub extern "C" fn C_Encrypt(
             }
         };
         let obj = obj.read();
-        let key_bytes = match &obj.key_material {
-            Some(km) => km.as_bytes(),
-            None => {
-                sess.active_operation = None;
-                return CKR_KEY_HANDLE_INVALID;
-            }
-        };
+        if mechanism != CKM_RSA_PKCS_OAEP && obj.key_material.is_none() {
+            sess.active_operation = None;
+            return CKR_KEY_HANDLE_INVALID;
+        }
 
         // Length query: estimate output size WITHOUT performing the actual
         // encryption, preserving the operation state for the real call.
@@ -2035,38 +2032,6 @@ pub extern "C" fn C_Encrypt(
         }
 
         let result = match mechanism {
-            CKM_AES_GCM if !mech_param.is_empty() => {
-                let (iv, aad) = mech_param.split_at(GCM_IV_LEN);
-                crate::crypto::encrypt::check_gcm_caller_iv(key_bytes, iv).and_then(|()| {
-                    hsm.crypto_backend
-                        .aes_256_gcm_encrypt_with_iv(key_bytes, iv, aad, data)
-                })
-            }
-            CKM_AES_GCM => hsm.crypto_backend.aes_256_gcm_encrypt(key_bytes, data),
-            CKM_AES_CBC => {
-                if mech_param.is_empty() {
-                    Err(HsmError::MechanismParamInvalid)
-                } else {
-                    hsm.crypto_backend
-                        .aes_cbc_encrypt_unpadded(key_bytes, &mech_param, data)
-                }
-            }
-            CKM_AES_CBC_PAD => {
-                if mech_param.is_empty() {
-                    Err(HsmError::MechanismParamInvalid)
-                } else {
-                    hsm.crypto_backend
-                        .aes_cbc_encrypt(key_bytes, &mech_param, data)
-                }
-            }
-            CKM_AES_CTR => {
-                if mech_param.is_empty() {
-                    Err(HsmError::MechanismParamInvalid)
-                } else {
-                    hsm.crypto_backend
-                        .aes_ctr_encrypt(key_bytes, &mech_param, data)
-                }
-            }
             CKM_RSA_PKCS_OAEP => {
                 let modulus = match &obj.modulus {
                     Some(m) => m.as_slice(),
@@ -2098,6 +2063,50 @@ pub extern "C" fn C_Encrypt(
                     data,
                     oaep_hash,
                 )
+            }
+            CKM_AES_GCM | CKM_AES_CBC | CKM_AES_CBC_PAD | CKM_AES_CTR => {
+                let key_bytes = match &obj.key_material {
+                    Some(km) => km.as_bytes(),
+                    None => {
+                        sess.active_operation = None;
+                        return CKR_KEY_HANDLE_INVALID;
+                    }
+                };
+                match mechanism {
+                    CKM_AES_GCM if !mech_param.is_empty() => {
+                        let (iv, aad) = mech_param.split_at(GCM_IV_LEN);
+                        crate::crypto::encrypt::check_gcm_caller_iv(key_bytes, iv).and_then(|()| {
+                            hsm.crypto_backend
+                                .aes_256_gcm_encrypt_with_iv(key_bytes, iv, aad, data)
+                        })
+                    }
+                    CKM_AES_GCM => hsm.crypto_backend.aes_256_gcm_encrypt(key_bytes, data),
+                    CKM_AES_CBC => {
+                        if mech_param.is_empty() {
+                            Err(HsmError::MechanismParamInvalid)
+                        } else {
+                            hsm.crypto_backend
+                                .aes_cbc_encrypt_unpadded(key_bytes, &mech_param, data)
+                        }
+                    }
+                    CKM_AES_CBC_PAD => {
+                        if mech_param.is_empty() {
+                            Err(HsmError::MechanismParamInvalid)
+                        } else {
+                            hsm.crypto_backend
+                                .aes_cbc_encrypt(key_bytes, &mech_param, data)
+                        }
+                    }
+                    CKM_AES_CTR => {
+                        if mech_param.is_empty() {
+                            Err(HsmError::MechanismParamInvalid)
+                        } else {
+                            hsm.crypto_backend
+                                .aes_ctr_encrypt(key_bytes, &mech_param, data)
+                        }
+                    }
+                    _ => unreachable!(),
+                }
             }
             _ => {
                 sess.active_operation = None;

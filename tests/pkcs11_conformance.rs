@@ -1729,7 +1729,6 @@ fn test_ecdsa_mechanism_hash_binding() {
         CKR_SIGNATURE_INVALID
     );
 }
-
 /// Issue #82: C_CreateObject must accept CKA_EXTRACTABLE = true and
 /// CKA_SENSITIVE = false in the creation template (the one-way rule only
 /// constrains post-creation C_SetAttributeValue / C_CopyObject).
@@ -1997,5 +1996,121 @@ fn test_aes_cbc_unpadded_vector() {
     );
     assert_eq!(pt_len, 32);
     assert_eq!(pt_out, plaintext);
+}
+
+/// Issue #81: C_Encrypt with CKM_RSA_PKCS_OAEP on an RSA public key (which only
+/// stores modulus and public_exponent, not key_material) must succeed for both
+/// length queries and encryption, and round-trip with C_Decrypt on the private key.
+#[test]
+fn test_rsa_oaep_encrypt_with_public_key() {
+    let session = setup_user_session();
+
+    let mut mech = CK_MECHANISM {
+        mechanism: CKM_RSA_PKCS_KEY_PAIR_GEN,
+        p_parameter: ptr::null_mut(),
+        parameter_len: 0,
+    };
+    let mut modulus_bits: CK_ULONG = 2048;
+    let mut ck_true: CK_BBOOL = CK_TRUE;
+    let mut pub_template = [
+        CK_ATTRIBUTE {
+            attr_type: CKA_MODULUS_BITS,
+            p_value: &mut modulus_bits as *mut _ as CK_VOID_PTR,
+            value_len: std::mem::size_of::<CK_ULONG>() as CK_ULONG,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_ENCRYPT,
+            p_value: &mut ck_true as *mut _ as CK_VOID_PTR,
+            value_len: 1,
+        },
+    ];
+    let mut priv_template = [CK_ATTRIBUTE {
+        attr_type: CKA_DECRYPT,
+        p_value: &mut ck_true as *mut _ as CK_VOID_PTR,
+        value_len: 1,
+    }];
+    let mut pub_key: CK_OBJECT_HANDLE = 0;
+    let mut priv_key: CK_OBJECT_HANDLE = 0;
+    assert_eq!(
+        C_GenerateKeyPair(
+            session,
+            &mut mech,
+            pub_template.as_mut_ptr(),
+            pub_template.len() as CK_ULONG,
+            priv_template.as_mut_ptr(),
+            priv_template.len() as CK_ULONG,
+            &mut pub_key,
+            &mut priv_key,
+        ),
+        CKR_OK
+    );
+
+    #[repr(C)]
+    struct CkRsaPkcsOaepParams {
+        hash_alg: CK_MECHANISM_TYPE,
+        mgf: CK_ULONG,
+        source: CK_ULONG,
+        p_source_data: CK_VOID_PTR,
+        ul_source_data_len: CK_ULONG,
+    }
+    let mut oaep_params = CkRsaPkcsOaepParams {
+        hash_alg: CKM_SHA256,
+        mgf: 0x00000002, // CKG_MGF1_SHA256
+        source: 1,       // CKZ_DATA_SPECIFIED
+        p_source_data: ptr::null_mut(),
+        ul_source_data_len: 0,
+    };
+    let mut oaep_mech = CK_MECHANISM {
+        mechanism: CKM_RSA_PKCS_OAEP,
+        p_parameter: &mut oaep_params as *mut _ as CK_VOID_PTR,
+        parameter_len: std::mem::size_of::<CkRsaPkcsOaepParams>() as CK_ULONG,
+    };
+
+    let plaintext = b"RSA-OAEP public key encryption test (#81)";
+    assert_eq!(C_EncryptInit(session, &mut oaep_mech, pub_key), CKR_OK);
+
+    // Length query (p_encrypted_data == NULL)
+    let mut ct_len: CK_ULONG = 0;
+    assert_eq!(
+        C_Encrypt(
+            session,
+            plaintext.as_ptr() as CK_BYTE_PTR,
+            plaintext.len() as CK_ULONG,
+            ptr::null_mut(),
+            &mut ct_len,
+        ),
+        CKR_OK
+    );
+    assert_eq!(ct_len, 256);
+
+    // Real encryption call
+    let mut ciphertext = vec![0u8; ct_len as usize];
+    assert_eq!(
+        C_Encrypt(
+            session,
+            plaintext.as_ptr() as CK_BYTE_PTR,
+            plaintext.len() as CK_ULONG,
+            ciphertext.as_mut_ptr(),
+            &mut ct_len,
+        ),
+        CKR_OK
+    );
+    assert_eq!(ct_len, 256);
+
+    // Decrypt with private key to verify round-trip
+    assert_eq!(C_DecryptInit(session, &mut oaep_mech, priv_key), CKR_OK);
+    let mut pt_out = vec![0u8; 256];
+    let mut pt_out_len = pt_out.len() as CK_ULONG;
+    assert_eq!(
+        C_Decrypt(
+            session,
+            ciphertext.as_mut_ptr(),
+            ct_len,
+            pt_out.as_mut_ptr(),
+            &mut pt_out_len,
+        ),
+        CKR_OK
+    );
+    assert_eq!(&pt_out[..pt_out_len as usize], plaintext);
 }
 
