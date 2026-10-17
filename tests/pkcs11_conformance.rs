@@ -1892,6 +1892,160 @@ fn test_data_and_certificate_cka_value_readable() {
     assert_eq!(cert_out, cert_val);
 }
 
+/// Issue #84: C_UnwrapKey must accept CKA_EXTRACTABLE = true and CKA_SENSITIVE = false
+/// in the unwrap template (even when the unwrapping KEK is sensitive).
+#[test]
+fn test_unwrap_key_accepts_extractable_and_non_sensitive() {
+    let session = setup_user_session();
+
+    let mut keygen_mech = CK_MECHANISM {
+        mechanism: CKM_AES_KEY_GEN,
+        p_parameter: ptr::null_mut(),
+        parameter_len: 0,
+    };
+    let mut key_len: CK_ULONG = 32;
+    let mut ck_true: CK_BBOOL = CK_TRUE;
+    let mut ck_false: CK_BBOOL = CK_FALSE;
+
+    let mut kek_tpl = [
+        CK_ATTRIBUTE {
+            attr_type: CKA_VALUE_LEN,
+            p_value: &mut key_len as *mut _ as CK_VOID_PTR,
+            value_len: std::mem::size_of::<CK_ULONG>() as CK_ULONG,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_WRAP,
+            p_value: &mut ck_true as *mut _ as CK_VOID_PTR,
+            value_len: 1,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_UNWRAP,
+            p_value: &mut ck_true as *mut _ as CK_VOID_PTR,
+            value_len: 1,
+        },
+    ];
+    let mut kek: CK_OBJECT_HANDLE = 0;
+    assert_eq!(
+        C_GenerateKey(
+            session,
+            &mut keygen_mech,
+            kek_tpl.as_mut_ptr(),
+            kek_tpl.len() as CK_ULONG,
+            &mut kek,
+        ),
+        CKR_OK
+    );
+
+    let mut target_tpl = [
+        CK_ATTRIBUTE {
+            attr_type: CKA_VALUE_LEN,
+            p_value: &mut key_len as *mut _ as CK_VOID_PTR,
+            value_len: std::mem::size_of::<CK_ULONG>() as CK_ULONG,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_EXTRACTABLE,
+            p_value: &mut ck_true as *mut _ as CK_VOID_PTR,
+            value_len: 1,
+        },
+    ];
+    let mut target: CK_OBJECT_HANDLE = 0;
+    assert_eq!(
+        C_GenerateKey(
+            session,
+            &mut keygen_mech,
+            target_tpl.as_mut_ptr(),
+            target_tpl.len() as CK_ULONG,
+            &mut target,
+        ),
+        CKR_OK
+    );
+
+    let mut wrap_mech = CK_MECHANISM {
+        mechanism: CKM_AES_KEY_WRAP,
+        p_parameter: ptr::null_mut(),
+        parameter_len: 0,
+    };
+    let mut wrapped = vec![0u8; 64];
+    let mut wrapped_len = wrapped.len() as CK_ULONG;
+    assert_eq!(
+        C_WrapKey(
+            session,
+            &mut wrap_mech,
+            kek,
+            target,
+            wrapped.as_mut_ptr(),
+            &mut wrapped_len,
+        ),
+        CKR_OK
+    );
+
+    let mut secret_class = CKO_SECRET_KEY;
+    let mut aes_type = CKK_AES;
+    let mut unwrap_tpl = [
+        CK_ATTRIBUTE {
+            attr_type: CKA_CLASS,
+            p_value: &mut secret_class as *mut _ as CK_VOID_PTR,
+            value_len: std::mem::size_of::<CK_ULONG>() as CK_ULONG,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_KEY_TYPE,
+            p_value: &mut aes_type as *mut _ as CK_VOID_PTR,
+            value_len: std::mem::size_of::<CK_ULONG>() as CK_ULONG,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_EXTRACTABLE,
+            p_value: &mut ck_true as *mut _ as CK_VOID_PTR,
+            value_len: 1,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_SENSITIVE,
+            p_value: &mut ck_false as *mut _ as CK_VOID_PTR,
+            value_len: 1,
+        },
+    ];
+    let mut unwrapped_key: CK_OBJECT_HANDLE = 0;
+    assert_eq!(
+        C_UnwrapKey(
+            session,
+            &mut wrap_mech,
+            kek,
+            wrapped.as_mut_ptr(),
+            wrapped_len,
+            unwrap_tpl.as_mut_ptr(),
+            unwrap_tpl.len() as CK_ULONG,
+            &mut unwrapped_key,
+        ),
+        CKR_OK
+    );
+
+    let mut read_extractable: CK_BBOOL = CK_FALSE;
+    let mut read_sensitive: CK_BBOOL = CK_TRUE;
+    let mut query = [
+        CK_ATTRIBUTE {
+            attr_type: CKA_EXTRACTABLE,
+            p_value: &mut read_extractable as *mut _ as CK_VOID_PTR,
+            value_len: 1,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_SENSITIVE,
+            p_value: &mut read_sensitive as *mut _ as CK_VOID_PTR,
+            value_len: 1,
+        },
+    ];
+    assert_eq!(
+        C_GetAttributeValue(
+            session,
+            unwrapped_key,
+            query.as_mut_ptr(),
+            query.len() as CK_ULONG,
+        ),
+        CKR_OK
+    );
+    assert_eq!(read_extractable, CK_TRUE);
+    assert_eq!(read_sensitive, CK_FALSE);
+}
+
+
 
 /// Issue #86: CKM_AES_CBC must perform unpadded block-aligned encryption and
 /// decryption, producing 32 bytes (not 48) for a 32-byte input.
