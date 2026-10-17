@@ -5958,7 +5958,6 @@ pub extern "C" fn C_UnwrapKey(
             Some(km) => km.as_bytes().to_vec(),
             None => return CKR_KEY_HANDLE_INVALID,
         };
-        let uk_sensitive = uk_obj.sensitive;
         drop(uk_obj);
 
         // Defense-in-depth: bound wrapped_key_len before slice construction
@@ -5995,12 +5994,26 @@ pub extern "C" fn C_UnwrapKey(
         obj.key_material = Some(RawKeyMaterial::new(unwrapped.clone()));
         obj.value_len = Some(unwrapped.len() as CK_ULONG);
         obj.sensitive = true;
-        obj.extractable = false; // secure default: unwrapped keys are non-extractable
+        obj.extractable = false; // default if omitted by template
         obj.can_encrypt = true;
         obj.can_decrypt = true;
 
         for (attr_type, value) in &template {
             match *attr_type {
+                CKA_CLASS => {
+                    if let Some(c) = crate::store::attributes::read_ck_ulong(value) {
+                        obj.class = c;
+                    } else {
+                        return CKR_ATTRIBUTE_VALUE_INVALID;
+                    }
+                }
+                CKA_KEY_TYPE => {
+                    if let Some(kt) = crate::store::attributes::read_ck_ulong(value) {
+                        obj.key_type = Some(normalize_key_type(kt));
+                    } else {
+                        return CKR_ATTRIBUTE_VALUE_INVALID;
+                    }
+                }
                 CKA_LABEL => obj.label = value.clone(),
                 CKA_ID => obj.id = value.clone(),
                 CKA_TOKEN => {
@@ -6009,29 +6022,23 @@ pub extern "C" fn C_UnwrapKey(
                         Err(rv) => return rv,
                     }
                 }
+                CKA_PRIVATE => {
+                    obj.private = match parse_ck_bbool(value) {
+                        Ok(v) => v,
+                        Err(rv) => return rv,
+                    }
+                }
                 CKA_SENSITIVE => {
-                    let requested = match parse_ck_bbool(value) {
+                    obj.sensitive = match parse_ck_bbool(value) {
                         Ok(v) => v,
                         Err(rv) => return rv,
                     };
-                    // PKCS#11: sensitivity can only increase, never decrease.
-                    // If the unwrapping key is sensitive, the unwrapped key
-                    // must also be sensitive (inherited constraint).
-                    if uk_sensitive && !requested {
-                        return CKR_TEMPLATE_INCONSISTENT;
-                    }
-                    obj.sensitive = requested;
                 }
                 CKA_EXTRACTABLE => {
-                    let requested = match parse_ck_bbool(value) {
+                    obj.extractable = match parse_ck_bbool(value) {
                         Ok(v) => v,
                         Err(rv) => return rv,
                     };
-                    // PKCS#11: extractability can only decrease, never increase.
-                    if !obj.extractable && requested {
-                        return CKR_TEMPLATE_INCONSISTENT;
-                    }
-                    obj.extractable = requested;
                 }
                 CKA_ENCRYPT => {
                     obj.can_encrypt = match parse_ck_bbool(value) {
@@ -6041,6 +6048,36 @@ pub extern "C" fn C_UnwrapKey(
                 }
                 CKA_DECRYPT => {
                     obj.can_decrypt = match parse_ck_bbool(value) {
+                        Ok(v) => v,
+                        Err(rv) => return rv,
+                    }
+                }
+                CKA_SIGN => {
+                    obj.can_sign = match parse_ck_bbool(value) {
+                        Ok(v) => v,
+                        Err(rv) => return rv,
+                    }
+                }
+                CKA_VERIFY => {
+                    obj.can_verify = match parse_ck_bbool(value) {
+                        Ok(v) => v,
+                        Err(rv) => return rv,
+                    }
+                }
+                CKA_WRAP => {
+                    obj.can_wrap = match parse_ck_bbool(value) {
+                        Ok(v) => v,
+                        Err(rv) => return rv,
+                    }
+                }
+                CKA_UNWRAP => {
+                    obj.can_unwrap = match parse_ck_bbool(value) {
+                        Ok(v) => v,
+                        Err(rv) => return rv,
+                    }
+                }
+                CKA_DERIVE => {
+                    obj.can_derive = match parse_ck_bbool(value) {
                         Ok(v) => v,
                         Err(rv) => return rv,
                     }
