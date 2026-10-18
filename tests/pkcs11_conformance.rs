@@ -2320,3 +2320,76 @@ fn test_rsa_oaep_encrypt_with_public_key() {
     assert_eq!(&pt_out[..pt_out_len as usize], plaintext);
 }
 
+#[test]
+fn test_single_shot_after_update_rejected() {
+    let session = setup_user_session();
+
+    let mut mech = CK_MECHANISM {
+        mechanism: CKM_AES_KEY_GEN,
+        p_parameter: ptr::null_mut(),
+        parameter_len: 0,
+    };
+    let mut key: CK_OBJECT_HANDLE = 0;
+    assert_eq!(
+        C_GenerateKey(session, &mut mech, ptr::null_mut(), 0, &mut key),
+        CKR_OK
+    );
+
+    let mut iv = [0x42u8; 16];
+    let mut cbc_mech = CK_MECHANISM {
+        mechanism: CKM_AES_CBC_PAD,
+        p_parameter: iv.as_mut_ptr() as CK_VOID_PTR,
+        parameter_len: iv.len() as CK_ULONG,
+    };
+
+    // 1. C_EncryptInit -> C_EncryptUpdate -> C_Encrypt must fail with CKR_OPERATION_ACTIVE
+    assert_eq!(C_EncryptInit(session, &mut cbc_mech, key), CKR_OK);
+    let part = [0x11u8; 16];
+    let mut part_out_len: CK_ULONG = 0;
+    assert_eq!(
+        C_EncryptUpdate(
+            session,
+            part.as_ptr() as CK_BYTE_PTR,
+            part.len() as CK_ULONG,
+            ptr::null_mut(),
+            &mut part_out_len,
+        ),
+        CKR_OK
+    );
+    let mut out_buf = [0u8; 64];
+    let mut out_len = out_buf.len() as CK_ULONG;
+    assert_eq!(
+        C_Encrypt(
+            session,
+            part.as_ptr() as CK_BYTE_PTR,
+            part.len() as CK_ULONG,
+            out_buf.as_mut_ptr(),
+            &mut out_len,
+        ),
+        CKR_OPERATION_ACTIVE
+    );
+
+    // 2. C_DecryptInit -> C_DecryptUpdate -> C_Decrypt must fail with CKR_OPERATION_ACTIVE
+    assert_eq!(C_DecryptInit(session, &mut cbc_mech, key), CKR_OK);
+    assert_eq!(
+        C_DecryptUpdate(
+            session,
+            part.as_ptr() as CK_BYTE_PTR,
+            part.len() as CK_ULONG,
+            ptr::null_mut(),
+            &mut part_out_len,
+        ),
+        CKR_OK
+    );
+    out_len = out_buf.len() as CK_ULONG;
+    assert_eq!(
+        C_Decrypt(
+            session,
+            part.as_ptr() as CK_BYTE_PTR,
+            part.len() as CK_ULONG,
+            out_buf.as_mut_ptr(),
+            &mut out_len,
+        ),
+        CKR_OPERATION_ACTIVE
+    );
+}

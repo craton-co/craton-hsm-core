@@ -1967,8 +1967,16 @@ pub extern "C" fn C_Encrypt(
                 mechanism,
                 key_handle,
                 mechanism_param,
+                data,
                 ..
-            }) => (*mechanism, *key_handle, mechanism_param.clone()),
+            }) => {
+                // PKCS#11 v3.0 §5.9: C_Encrypt is single-shot; reject if EncryptUpdate was already called
+                if !data.is_empty() {
+                    sess.active_operation = None;
+                    return CKR_OPERATION_ACTIVE;
+                }
+                (*mechanism, *key_handle, mechanism_param.clone())
+            }
             _ => return CKR_OPERATION_NOT_INITIALIZED,
         };
 
@@ -2273,8 +2281,16 @@ pub extern "C" fn C_Decrypt(
                 mechanism,
                 key_handle,
                 mechanism_param,
+                data,
                 ..
-            }) => (*mechanism, *key_handle, mechanism_param.clone()),
+            }) => {
+                // PKCS#11 v3.0 §5.10: C_Decrypt is single-shot; reject if DecryptUpdate was already called
+                if !data.is_empty() {
+                    sess.active_operation = None;
+                    return CKR_OPERATION_ACTIVE;
+                }
+                (*mechanism, *key_handle, mechanism_param.clone())
+            }
             _ => return CKR_OPERATION_NOT_INITIALIZED,
         };
 
