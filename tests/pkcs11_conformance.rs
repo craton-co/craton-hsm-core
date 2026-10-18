@@ -2393,3 +2393,214 @@ fn test_single_shot_after_update_rejected() {
         CKR_OPERATION_ACTIVE
     );
 }
+
+#[test]
+fn test_wrap_and_unwrap_template_enforcement() {
+    let session = setup_user_session();
+
+    let mut ck_true: CK_BBOOL = CK_TRUE;
+    let mut ck_false: CK_BBOOL = CK_FALSE;
+
+    // Wrap template requires target key to have CKA_SENSITIVE = true
+    let mut wrap_inner = [CK_ATTRIBUTE {
+        attr_type: CKA_SENSITIVE,
+        p_value: &mut ck_true as *mut _ as CK_VOID_PTR,
+        value_len: 1,
+    }];
+    // Unwrap template forces unwrapped key to have CKA_SENSITIVE = true, CKA_EXTRACTABLE = false
+    let mut unwrap_inner = [
+        CK_ATTRIBUTE {
+            attr_type: CKA_SENSITIVE,
+            p_value: &mut ck_true as *mut _ as CK_VOID_PTR,
+            value_len: 1,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_EXTRACTABLE,
+            p_value: &mut ck_false as *mut _ as CK_VOID_PTR,
+            value_len: 1,
+        },
+    ];
+
+    let mut kek_template = [
+        CK_ATTRIBUTE {
+            attr_type: CKA_WRAP,
+            p_value: &mut ck_true as *mut _ as CK_VOID_PTR,
+            value_len: 1,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_UNWRAP,
+            p_value: &mut ck_true as *mut _ as CK_VOID_PTR,
+            value_len: 1,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_WRAP_TEMPLATE,
+            p_value: wrap_inner.as_mut_ptr() as CK_VOID_PTR,
+            value_len: std::mem::size_of_val(&wrap_inner) as CK_ULONG,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_UNWRAP_TEMPLATE,
+            p_value: unwrap_inner.as_mut_ptr() as CK_VOID_PTR,
+            value_len: std::mem::size_of_val(&unwrap_inner) as CK_ULONG,
+        },
+    ];
+
+    let mut keygen_mech = CK_MECHANISM {
+        mechanism: CKM_AES_KEY_GEN,
+        p_parameter: ptr::null_mut(),
+        parameter_len: 0,
+    };
+    let mut kek: CK_OBJECT_HANDLE = 0;
+    assert_eq!(
+        C_GenerateKey(
+            session,
+            &mut keygen_mech,
+            kek_template.as_mut_ptr(),
+            kek_template.len() as CK_ULONG,
+            &mut kek,
+        ),
+        CKR_OK
+    );
+
+    // 1. Non-sensitive target key does NOT match KEK's CKA_WRAP_TEMPLATE
+    let mut non_sens_tpl = [
+        CK_ATTRIBUTE {
+            attr_type: CKA_SENSITIVE,
+            p_value: &mut ck_false as *mut _ as CK_VOID_PTR,
+            value_len: 1,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_EXTRACTABLE,
+            p_value: &mut ck_true as *mut _ as CK_VOID_PTR,
+            value_len: 1,
+        },
+    ];
+    let mut non_sens_key: CK_OBJECT_HANDLE = 0;
+    assert_eq!(
+        C_GenerateKey(
+            session,
+            &mut keygen_mech,
+            non_sens_tpl.as_mut_ptr(),
+            non_sens_tpl.len() as CK_ULONG,
+            &mut non_sens_key,
+        ),
+        CKR_OK
+    );
+
+    let mut wrap_mech = CK_MECHANISM {
+        mechanism: CKM_AES_KEY_WRAP,
+        p_parameter: ptr::null_mut(),
+        parameter_len: 0,
+    };
+    let mut wrapped_buf = [0u8; 64];
+    let mut wrapped_len = wrapped_buf.len() as CK_ULONG;
+    assert_eq!(
+        C_WrapKey(
+            session,
+            &mut wrap_mech,
+            kek,
+            non_sens_key,
+            wrapped_buf.as_mut_ptr(),
+            &mut wrapped_len,
+        ),
+        CKR_KEY_HANDLE_INVALID
+    );
+
+    // 2. Sensitive, extractable target key DOES match KEK's CKA_WRAP_TEMPLATE
+    let mut sens_tpl = [
+        CK_ATTRIBUTE {
+            attr_type: CKA_SENSITIVE,
+            p_value: &mut ck_true as *mut _ as CK_VOID_PTR,
+            value_len: 1,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_EXTRACTABLE,
+            p_value: &mut ck_true as *mut _ as CK_VOID_PTR,
+            value_len: 1,
+        },
+    ];
+    let mut sens_key: CK_OBJECT_HANDLE = 0;
+    assert_eq!(
+        C_GenerateKey(
+            session,
+            &mut keygen_mech,
+            sens_tpl.as_mut_ptr(),
+            sens_tpl.len() as CK_ULONG,
+            &mut sens_key,
+        ),
+        CKR_OK
+    );
+    wrapped_len = wrapped_buf.len() as CK_ULONG;
+    assert_eq!(
+        C_WrapKey(
+            session,
+            &mut wrap_mech,
+            kek,
+            sens_key,
+            wrapped_buf.as_mut_ptr(),
+            &mut wrapped_len,
+        ),
+        CKR_OK
+    );
+
+    // 3. Unwrapping with CKA_EXTRACTABLE = true conflicts with KEK's CKA_UNWRAP_TEMPLATE
+    let mut conflict_unwrap_tpl = [CK_ATTRIBUTE {
+        attr_type: CKA_EXTRACTABLE,
+        p_value: &mut ck_true as *mut _ as CK_VOID_PTR,
+        value_len: 1,
+    }];
+    let mut unwrapped_key: CK_OBJECT_HANDLE = 0;
+    assert_eq!(
+        C_UnwrapKey(
+            session,
+            &mut wrap_mech,
+            kek,
+            wrapped_buf.as_mut_ptr(),
+            wrapped_len,
+            conflict_unwrap_tpl.as_mut_ptr(),
+            conflict_unwrap_tpl.len() as CK_ULONG,
+            &mut unwrapped_key,
+        ),
+        CKR_TEMPLATE_INCONSISTENT
+    );
+
+    // 4. Unwrapping with empty template succeeds and applies CKA_UNWRAP_TEMPLATE
+    assert_eq!(
+        C_UnwrapKey(
+            session,
+            &mut wrap_mech,
+            kek,
+            wrapped_buf.as_mut_ptr(),
+            wrapped_len,
+            ptr::null_mut(),
+            0,
+            &mut unwrapped_key,
+        ),
+        CKR_OK
+    );
+    let mut got_sens: CK_BBOOL = CK_FALSE;
+    let mut got_extr: CK_BBOOL = CK_TRUE;
+    let mut read_tpl = [
+        CK_ATTRIBUTE {
+            attr_type: CKA_SENSITIVE,
+            p_value: &mut got_sens as *mut _ as CK_VOID_PTR,
+            value_len: 1,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_EXTRACTABLE,
+            p_value: &mut got_extr as *mut _ as CK_VOID_PTR,
+            value_len: 1,
+        },
+    ];
+    assert_eq!(
+        C_GetAttributeValue(
+            session,
+            unwrapped_key,
+            read_tpl.as_mut_ptr(),
+            read_tpl.len() as CK_ULONG,
+        ),
+        CKR_OK
+    );
+    assert_eq!(got_sens, CK_TRUE);
+    assert_eq!(got_extr, CK_FALSE);
+}
+

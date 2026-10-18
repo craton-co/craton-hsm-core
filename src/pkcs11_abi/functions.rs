@@ -3286,6 +3286,30 @@ pub extern "C" fn C_GenerateKey(
                         obj.end_date = None;
                     }
                 }
+                CKA_MODIFIABLE => {
+                    obj.modifiable = match parse_ck_bbool(value) {
+                        Ok(v) => v,
+                        Err(rv) => return rv,
+                    }
+                }
+                CKA_DESTROYABLE => {
+                    obj.destroyable = match parse_ck_bbool(value) {
+                        Ok(v) => v,
+                        Err(rv) => return rv,
+                    }
+                }
+                CKA_COPYABLE => {
+                    obj.copyable = match parse_ck_bbool(value) {
+                        Ok(v) => v,
+                        Err(rv) => return rv,
+                    }
+                }
+                CKA_WRAP_TEMPLATE
+                | CKA_UNWRAP_TEMPLATE
+                | CKA_WRAP_WITH_TRUSTED
+                | CKA_TRUSTED => {
+                    obj.extra_attributes.insert(*attr_type, value.clone());
+                }
                 _ => {}
             }
         }
@@ -3860,6 +3884,9 @@ fn apply_pub_template(obj: &mut StoredObject, template: &[(CK_ATTRIBUTE_TYPE, Ve
                     obj.end_date = None;
                 }
             }
+            CKA_WRAP_TEMPLATE | CKA_TRUSTED => {
+                obj.extra_attributes.insert(*attr_type, value.clone());
+            }
             _ => {}
         }
     }
@@ -3930,6 +3957,9 @@ fn apply_priv_template(obj: &mut StoredObject, template: &[(CK_ATTRIBUTE_TYPE, V
                 } else if value.is_empty() {
                     obj.end_date = None;
                 }
+            }
+            CKA_UNWRAP_TEMPLATE | CKA_WRAP_WITH_TRUSTED => {
+                obj.extra_attributes.insert(*attr_type, value.clone());
             }
             _ => {}
         }
@@ -5844,6 +5874,7 @@ pub extern "C" fn C_WrapKey(
             .get(&CKA_TRUSTED)
             .map(|v| v.first().copied().unwrap_or(0) != 0)
             .unwrap_or(false);
+        let wk_wrap_template = wk_obj.extra_attributes.get(&CKA_WRAP_TEMPLATE).cloned();
         let wk_bytes = match &wk_obj.key_material {
             Some(km) => km.as_bytes().to_vec(),
             None => return CKR_KEY_HANDLE_INVALID,
@@ -5867,6 +5898,18 @@ pub extern "C" fn C_WrapKey(
             .unwrap_or(false);
         if requires_trusted && !wk_is_trusted {
             return CKR_KEY_FUNCTION_NOT_PERMITTED;
+        }
+        // PKCS#11 v3.0 §4.10 / §5.18: if the wrapping key has a CKA_WRAP_TEMPLATE,
+        // the target key must match all attributes in that template.
+        if let Some(ref encoded_tpl) = wk_wrap_template {
+            match decode_nested_template(encoded_tpl) {
+                Some(ref wrap_tpl) => {
+                    if !key_obj.matches_template(wrap_tpl) {
+                        return CKR_KEY_HANDLE_INVALID;
+                    }
+                }
+                None => return CKR_GENERAL_ERROR,
+            }
         }
         let key_bytes = match &key_obj.key_material {
             Some(km) => km.as_bytes().to_vec(),
@@ -5970,6 +6013,7 @@ pub extern "C" fn C_UnwrapKey(
         {
             return err_to_rv(e);
         }
+        let uk_unwrap_template = uk_obj.extra_attributes.get(&CKA_UNWRAP_TEMPLATE).cloned();
         let uk_bytes = match &uk_obj.key_material {
             Some(km) => km.as_bytes().to_vec(),
             None => return CKR_KEY_HANDLE_INVALID,
@@ -6001,6 +6045,46 @@ pub extern "C" fn C_UnwrapKey(
             }
         };
 
+        // PKCS#11 v3.0 §4.10 / §5.18: if the unwrapping key has a CKA_UNWRAP_TEMPLATE,
+        // check for conflicts with the caller's template (CKR_TEMPLATE_INCONSISTENT)
+        // and apply both templates to the unwrapped key.
+        let unwrap_tpl = match uk_unwrap_template {
+            Some(ref encoded_tpl) => match decode_nested_template(encoded_tpl) {
+                Some(tpl) => {
+                    for (u_type, u_val) in &tpl {
+                        for (t_type, t_val) in &template {
+                            if u_type == t_type {
+                                let conflict = if is_bool_attribute(*u_type) {
+                                    match (parse_ck_bbool(u_val), parse_ck_bbool(t_val)) {
+                                        (Ok(a), Ok(b)) => a != b,
+                                        _ => true,
+                                    }
+                                } else if *u_type == CKA_KEY_TYPE {
+                                    match (
+                                        crate::store::attributes::read_ck_ulong(u_val),
+                                        crate::store::attributes::read_ck_ulong(t_val),
+                                    ) {
+                                        (Some(a), Some(b)) => {
+                                            normalize_key_type(a) != normalize_key_type(b)
+                                        }
+                                        _ => true,
+                                    }
+                                } else {
+                                    u_val != t_val
+                                };
+                                if conflict {
+                                    return CKR_TEMPLATE_INCONSISTENT;
+                                }
+                            }
+                        }
+                    }
+                    tpl
+                }
+                None => return CKR_GENERAL_ERROR,
+            },
+            None => Vec::new(),
+        };
+
         let handle = match hsm.object_store.next_handle() {
             Ok(h) => h,
             Err(e) => return err_to_rv(e),
@@ -6014,7 +6098,7 @@ pub extern "C" fn C_UnwrapKey(
         obj.can_encrypt = true;
         obj.can_decrypt = true;
 
-        for (attr_type, value) in &template {
+        for (attr_type, value) in unwrap_tpl.iter().chain(template.iter()) {
             match *attr_type {
                 CKA_CLASS => {
                     if let Some(c) = crate::store::attributes::read_ck_ulong(value) {
@@ -6052,6 +6136,24 @@ pub extern "C" fn C_UnwrapKey(
                 }
                 CKA_EXTRACTABLE => {
                     obj.extractable = match parse_ck_bbool(value) {
+                        Ok(v) => v,
+                        Err(rv) => return rv,
+                    };
+                }
+                CKA_MODIFIABLE => {
+                    obj.modifiable = match parse_ck_bbool(value) {
+                        Ok(v) => v,
+                        Err(rv) => return rv,
+                    };
+                }
+                CKA_DESTROYABLE => {
+                    obj.destroyable = match parse_ck_bbool(value) {
+                        Ok(v) => v,
+                        Err(rv) => return rv,
+                    };
+                }
+                CKA_COPYABLE => {
+                    obj.copyable = match parse_ck_bbool(value) {
                         Ok(v) => v,
                         Err(rv) => return rv,
                     };
@@ -6097,6 +6199,12 @@ pub extern "C" fn C_UnwrapKey(
                         Ok(v) => v,
                         Err(rv) => return rv,
                     }
+                }
+                CKA_WRAP_TEMPLATE
+                | CKA_UNWRAP_TEMPLATE
+                | CKA_WRAP_WITH_TRUSTED
+                | CKA_TRUSTED => {
+                    obj.extra_attributes.insert(*attr_type, value.clone());
                 }
                 _ => {}
             }
@@ -6466,6 +6574,48 @@ fn parse_ck_bbool(value: &[u8]) -> Result<bool, CK_RV> {
     Ok(value[0] != 0)
 }
 
+/// Encode a nested attribute template (`CKA_WRAP_TEMPLATE` / `CKA_UNWRAP_TEMPLATE`)
+/// into a self-contained binary representation so inner pointers are resolved at
+/// template-parse time.
+fn encode_nested_template(attrs: &[(CK_ATTRIBUTE_TYPE, Vec<u8>)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(attrs.len() as u32).to_le_bytes());
+    for (t, v) in attrs {
+        out.extend_from_slice(&(*t as u64).to_le_bytes());
+        out.extend_from_slice(&(v.len() as u32).to_le_bytes());
+        out.extend_from_slice(v);
+    }
+    out
+}
+
+/// Decode a nested attribute template previously encoded by [`encode_nested_template`].
+fn decode_nested_template(bytes: &[u8]) -> Option<Vec<(CK_ATTRIBUTE_TYPE, Vec<u8>)>> {
+    if bytes.len() < 4 {
+        return None;
+    }
+    let count = u32::from_le_bytes(bytes[0..4].try_into().ok()?) as usize;
+    let mut offset = 4;
+    let mut out = Vec::with_capacity(count.min(MAX_TEMPLATE_ATTRS));
+    for _ in 0..count {
+        if offset + 12 > bytes.len() {
+            return None;
+        }
+        let t = u64::from_le_bytes(bytes[offset..offset + 8].try_into().ok()?) as CK_ATTRIBUTE_TYPE;
+        let len = u32::from_le_bytes(bytes[offset + 8..offset + 12].try_into().ok()?) as usize;
+        offset += 12;
+        if offset + len > bytes.len() {
+            return None;
+        }
+        out.push((t, bytes[offset..offset + len].to_vec()));
+        offset += len;
+    }
+    if offset == bytes.len() {
+        Some(out)
+    } else {
+        None
+    }
+}
+
 /// Parse a PKCS#11 attribute template from C pointers into safe Rust types.
 ///
 /// Returns `Err(CKR_ATTRIBUTE_VALUE_INVALID)` if any attribute value exceeds
@@ -6478,6 +6628,14 @@ fn parse_ck_bbool(value: &[u8]) -> Result<bool, CK_RV> {
 fn parse_template(
     p_template: CK_ATTRIBUTE_PTR,
     count: CK_ULONG,
+) -> Result<Vec<(CK_ATTRIBUTE_TYPE, Vec<u8>)>, CK_RV> {
+    parse_template_inner(p_template, count, true)
+}
+
+fn parse_template_inner(
+    p_template: CK_ATTRIBUTE_PTR,
+    count: CK_ULONG,
+    allow_nested: bool,
 ) -> Result<Vec<(CK_ATTRIBUTE_TYPE, Vec<u8>)>, CK_RV> {
     let count_usize = count as usize;
 
@@ -6496,24 +6654,41 @@ fn parse_template(
     let attrs = unsafe { slice::from_raw_parts(p_template, count_usize) };
     let mut result = Vec::with_capacity(count_usize);
     for attr in attrs {
-        let value = if attr.p_value.is_null() || attr.value_len == 0 {
+        let attr_type = attr.attr_type;
+        let value = if attr_type == CKA_WRAP_TEMPLATE || attr_type == CKA_UNWRAP_TEMPLATE {
+            if !allow_nested {
+                return Err(CKR_ATTRIBUTE_VALUE_INVALID);
+            }
+            if attr.p_value.is_null() || attr.value_len == 0 {
+                encode_nested_template(&[])
+            } else {
+                let len = attr.value_len as usize;
+                let elem_size = std::mem::size_of::<CK_ATTRIBUTE>();
+                if !len.is_multiple_of(elem_size) {
+                    return Err(CKR_ATTRIBUTE_VALUE_INVALID);
+                }
+                let sub_count = (len / elem_size) as CK_ULONG;
+                let sub_attrs =
+                    parse_template_inner(attr.p_value as CK_ATTRIBUTE_PTR, sub_count, false)?;
+                encode_nested_template(&sub_attrs)
+            }
+        } else if attr.p_value.is_null() || attr.value_len == 0 {
             vec![]
         } else {
             // Reject absurdly large attribute values to prevent out-of-bounds
             // reads from a malicious or buggy C caller.
             let len = attr.value_len as usize;
             if len > MAX_ATTR_VALUE_LEN {
-                let atype = { attr.attr_type };
                 tracing::error!(
                     "parse_template: attribute 0x{:08X} value_len {} exceeds MAX_ATTR_VALUE_LEN",
-                    atype,
+                    attr_type,
                     len
                 );
                 return Err(CKR_ATTRIBUTE_VALUE_INVALID);
             }
             unsafe { slice::from_raw_parts(attr.p_value as *const u8, len) }.to_vec()
         };
-        result.push((attr.attr_type, value));
+        result.push((attr_type, value));
     }
     Ok(result)
 }

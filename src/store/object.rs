@@ -260,6 +260,34 @@ impl StoredObject {
                         1
                     }
                 }
+                CKA_EXTRACTABLE => {
+                    if !value.is_empty() {
+                        ((value[0] != 0) == self.extractable) as u8
+                    } else {
+                        1
+                    }
+                }
+                CKA_MODIFIABLE => {
+                    if !value.is_empty() {
+                        ((value[0] != 0) == self.modifiable) as u8
+                    } else {
+                        1
+                    }
+                }
+                CKA_DESTROYABLE => {
+                    if !value.is_empty() {
+                        ((value[0] != 0) == self.destroyable) as u8
+                    } else {
+                        1
+                    }
+                }
+                CKA_COPYABLE => {
+                    if !value.is_empty() {
+                        ((value[0] != 0) == self.copyable) as u8
+                    } else {
+                        1
+                    }
+                }
                 CKA_SIGN => {
                     if !value.is_empty() {
                         ((value[0] != 0) == self.can_sign) as u8
@@ -288,6 +316,39 @@ impl StoredObject {
                         1
                     }
                 }
+                CKA_WRAP => {
+                    if !value.is_empty() {
+                        ((value[0] != 0) == self.can_wrap) as u8
+                    } else {
+                        1
+                    }
+                }
+                CKA_UNWRAP => {
+                    if !value.is_empty() {
+                        ((value[0] != 0) == self.can_unwrap) as u8
+                    } else {
+                        1
+                    }
+                }
+                CKA_DERIVE => {
+                    if !value.is_empty() {
+                        ((value[0] != 0) == self.can_derive) as u8
+                    } else {
+                        1
+                    }
+                }
+                CKA_VALUE_LEN => match (self.value_len, read_ck_ulong(value)) {
+                    (Some(vl), Some(v)) => (v == vl) as u8,
+                    _ => 0,
+                },
+                CKA_MODULUS_BITS => match (self.modulus_bits, read_ck_ulong(value)) {
+                    (Some(mb), Some(v)) => (v == mb) as u8,
+                    _ => 0,
+                },
+                CKA_EC_PARAMS => match &self.ec_params {
+                    Some(params) => ct_bytes_eq(value, params),
+                    None => 0,
+                },
                 _ => {
                     if let Some(stored) = self.extra_attributes.get(attr_type) {
                         ct_bytes_eq(stored, value)
