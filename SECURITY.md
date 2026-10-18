@@ -6,13 +6,15 @@ If you discover a security vulnerability in Craton HSM, please report it respons
 
 **Do NOT open a public GitHub issue for security vulnerabilities.**
 
-Instead, please use [GitHub's private vulnerability reporting](https://github.com/craton-co/craton-hsm-core/security/advisories/new).
+Primary channel: [GitHub's private vulnerability reporting](https://github.com/craton-co/craton-hsm-core/security/advisories/new).
+
+Fallback (if GitHub private vulnerability reporting is unavailable): e-mail `dev@craton.com.ar` with the subject `[SECURITY] Craton HSM`. Do not include exploit details in that first message; we will reply with an encrypted channel or a GitHub private advisory invitation.
 
 ### What to include
 
 - Description of the vulnerability
 - Steps to reproduce (or a proof-of-concept)
-- Affected versions
+- Affected versions / commit
 - Any potential impact assessment
 
 ### Response timeline
@@ -33,9 +35,9 @@ Instead, please use [GitHub's private vulnerability reporting](https://github.co
 
 | Version | Supported |
 |---------|-----------|
+| 0.10.x  | Yes       |
 | 0.9.x   | Yes (0.9.1 includes critical security fixes) |
-| 0.8.x   | Yes       |
-| < 0.8   | No        |
+| < 0.9   | No        |
 
 ## Security Design
 
