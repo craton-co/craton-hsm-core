@@ -70,7 +70,7 @@ pub fn approval_status(mechanism: CK_MECHANISM_TYPE) -> ApprovalStatus {
         CKM_EC_KEY_PAIR_GEN => ApprovalStatus::Approved,
 
         // === NON-APPROVED: Ed25519 (not yet in FIPS 186-5) ===
-        CKM_EDDSA => ApprovalStatus::NonApproved,
+        CKM_EC_EDWARDS_KEY_PAIR_GEN | CKM_EDDSA => ApprovalStatus::NonApproved,
 
         // === APPROVED: AES (all modes with 256-bit key) ===
         CKM_AES_GCM => ApprovalStatus::Approved,

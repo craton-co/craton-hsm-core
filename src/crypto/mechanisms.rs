@@ -56,6 +56,7 @@ pub fn is_keypair_gen_mechanism(mechanism: CK_MECHANISM_TYPE) -> bool {
         mechanism,
         CKM_RSA_PKCS_KEY_PAIR_GEN
             | CKM_EC_KEY_PAIR_GEN
+            | CKM_EC_EDWARDS_KEY_PAIR_GEN
             | CKM_EDDSA
             | CKM_ML_KEM_KEY_PAIR_GEN
             | CKM_ML_DSA_KEY_PAIR_GEN
@@ -124,6 +125,7 @@ pub fn supported_mechanisms() -> Vec<CK_MECHANISM_TYPE> {
         CKM_ECDH1_DERIVE,
         CKM_ECDH1_COFACTOR_DERIVE,
         // EdDSA
+        CKM_EC_EDWARDS_KEY_PAIR_GEN,
         CKM_EDDSA,
         // AES
         CKM_AES_KEY_GEN,

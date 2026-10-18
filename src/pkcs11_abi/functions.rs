@@ -1003,6 +1003,11 @@ pub extern "C" fn C_GetMechanismInfo(
                 max_key_size: 384 as CK_ULONG,
                 flags: CKF_DERIVE_FLAG,
             },
+            CKM_EC_EDWARDS_KEY_PAIR_GEN => CK_MECHANISM_INFO {
+                min_key_size: 256 as CK_ULONG,
+                max_key_size: 256 as CK_ULONG,
+                flags: CKF_GENERATE_KEY_PAIR_FLAG,
+            },
             CKM_EDDSA => CK_MECHANISM_INFO {
                 min_key_size: 256 as CK_ULONG,
                 max_key_size: 256 as CK_ULONG,
@@ -3415,7 +3420,9 @@ pub extern "C" fn C_GenerateKeyPair(
         let result = match mechanism {
             CKM_RSA_PKCS_KEY_PAIR_GEN => generate_rsa_keypair(&hsm, &pub_template, &priv_template),
             CKM_EC_KEY_PAIR_GEN => generate_ec_keypair(&hsm, &pub_template, &priv_template),
-            CKM_EDDSA => generate_ed25519_keypair(&hsm, &pub_template, &priv_template),
+            CKM_EC_EDWARDS_KEY_PAIR_GEN | CKM_EDDSA => {
+                generate_ed25519_keypair(&hsm, mechanism, &pub_template, &priv_template)
+            }
             m if pqc::is_ml_kem_mechanism(m)
                 || pqc::is_ml_dsa_mechanism(m)
                 || pqc::is_slh_dsa_mechanism(m) =>
@@ -3636,12 +3643,47 @@ fn generate_ec_keypair(
     Ok((pub_handle, priv_handle, key_bits))
 }
 
+/// Helper to check if EC params correspond to Ed25519 (id-Ed25519 OID 1.3.101.112
+/// or PrintableString "edwards25519" per PKCS#11 v3.0 §2.3.12).
+fn is_ed25519_params(ec_params: &[u8]) -> bool {
+    const ED25519_OID: &[u8] = &[0x06, 0x03, 0x2B, 0x65, 0x70];
+    const ED25519_NAME: &[u8] = b"\x13\x0cedwards25519";
+    ec_params == ED25519_OID || ec_params == ED25519_NAME
+}
+
 /// Ed25519 key pair generation helper
 fn generate_ed25519_keypair(
     hsm: &HsmCore,
+    mechanism: CK_MECHANISM_TYPE,
     pub_template: &[(CK_ATTRIBUTE_TYPE, Vec<u8>)],
     priv_template: &[(CK_ATTRIBUTE_TYPE, Vec<u8>)],
 ) -> Result<(CK_OBJECT_HANDLE, CK_OBJECT_HANDLE, u32), CK_RV> {
+    const ED25519_OID: &[u8] = &[0x06, 0x03, 0x2B, 0x65, 0x70];
+    let ec_params = match pub_template.iter().find(|(t, _)| *t == CKA_EC_PARAMS) {
+        Some((_, v)) => {
+            if v.is_empty() {
+                return Err(CKR_TEMPLATE_INCOMPLETE);
+            }
+            if !is_ed25519_params(v) {
+                return Err(CKR_CURVE_NOT_SUPPORTED);
+            }
+            v.clone()
+        }
+        None => {
+            // PKCS#11 v3.0 §2.3.12: CKM_EC_EDWARDS_KEY_PAIR_GEN requires CKA_EC_PARAMS;
+            // legacy CKM_EDDSA keygen defaults to Ed25519 OID for backward compatibility.
+            if mechanism == CKM_EC_EDWARDS_KEY_PAIR_GEN {
+                return Err(CKR_TEMPLATE_INCOMPLETE);
+            }
+            ED25519_OID.to_vec()
+        }
+    };
+    if let Some((_, priv_params)) = priv_template.iter().find(|(t, _)| *t == CKA_EC_PARAMS) {
+        if *priv_params != ec_params {
+            return Err(CKR_TEMPLATE_INCONSISTENT);
+        }
+    }
+
     let (private_key, public_key) = hsm
         .crypto_backend
         .generate_ed25519_key_pair()
@@ -3659,6 +3701,7 @@ fn generate_ed25519_keypair(
     let pub_handle = hsm.object_store.next_handle().map_err(err_to_rv)?;
     let mut pub_obj = StoredObject::new(pub_handle, CKO_PUBLIC_KEY);
     pub_obj.key_type = Some(CKK_EC_EDWARDS);
+    pub_obj.ec_params = Some(ec_params.clone());
     pub_obj.public_key_data = Some(public_key.clone());
     pub_obj.ec_point = Some(public_key.clone());
     pub_obj.can_verify = true;
@@ -3672,6 +3715,7 @@ fn generate_ed25519_keypair(
     let priv_handle = hsm.object_store.next_handle().map_err(err_to_rv)?;
     let mut priv_obj = StoredObject::new(priv_handle, CKO_PRIVATE_KEY);
     priv_obj.key_type = Some(CKK_EC_EDWARDS);
+    priv_obj.ec_params = Some(ec_params);
     priv_obj.key_material = Some(private_key);
     priv_obj.public_key_data = Some(public_key.clone());
     priv_obj.ec_point = Some(public_key);

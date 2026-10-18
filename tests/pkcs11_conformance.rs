@@ -2604,3 +2604,128 @@ fn test_wrap_and_unwrap_template_enforcement() {
     assert_eq!(got_extr, CK_FALSE);
 }
 
+#[test]
+fn test_edwards_key_pair_gen_mechanism() {
+    let session = setup_user_session();
+
+    // 1. C_GetMechanismList includes CKM_EC_EDWARDS_KEY_PAIR_GEN
+    let mut mech_count: CK_ULONG = 0;
+    assert_eq!(
+        C_GetMechanismList(0, ptr::null_mut(), &mut mech_count),
+        CKR_OK
+    );
+    let mut mechs = vec![0 as CK_MECHANISM_TYPE; mech_count as usize];
+    assert_eq!(
+        C_GetMechanismList(0, mechs.as_mut_ptr(), &mut mech_count),
+        CKR_OK
+    );
+    assert!(mechs.contains(&CKM_EC_EDWARDS_KEY_PAIR_GEN));
+
+    // 2. C_GetMechanismInfo succeeds for CKM_EC_EDWARDS_KEY_PAIR_GEN
+    let mut info = CK_MECHANISM_INFO {
+        min_key_size: 0,
+        max_key_size: 0,
+        flags: 0,
+    };
+    assert_eq!(
+        C_GetMechanismInfo(0, CKM_EC_EDWARDS_KEY_PAIR_GEN, &mut info),
+        CKR_OK
+    );
+    assert_eq!(info.flags & CKF_GENERATE_KEY_PAIR_FLAG, CKF_GENERATE_KEY_PAIR_FLAG);
+
+    // 3. C_GenerateKeyPair(CKM_EC_EDWARDS_KEY_PAIR_GEN) with Ed25519 OID succeeds
+    let mut ed25519_oid: [u8; 5] = [0x06, 0x03, 0x2B, 0x65, 0x70];
+    let mut ck_true: CK_BBOOL = CK_TRUE;
+    let mut pub_tpl = [
+        CK_ATTRIBUTE {
+            attr_type: CKA_EC_PARAMS,
+            p_value: ed25519_oid.as_mut_ptr() as CK_VOID_PTR,
+            value_len: ed25519_oid.len() as CK_ULONG,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_VERIFY,
+            p_value: &mut ck_true as *mut _ as CK_VOID_PTR,
+            value_len: 1,
+        },
+    ];
+    let mut priv_tpl = [CK_ATTRIBUTE {
+        attr_type: CKA_SIGN,
+        p_value: &mut ck_true as *mut _ as CK_VOID_PTR,
+        value_len: 1,
+    }];
+    let mut gen_mech = CK_MECHANISM {
+        mechanism: CKM_EC_EDWARDS_KEY_PAIR_GEN,
+        p_parameter: ptr::null_mut(),
+        parameter_len: 0,
+    };
+    let mut pub_key: CK_OBJECT_HANDLE = 0;
+    let mut priv_key: CK_OBJECT_HANDLE = 0;
+    assert_eq!(
+        C_GenerateKeyPair(
+            session,
+            &mut gen_mech,
+            pub_tpl.as_mut_ptr(),
+            pub_tpl.len() as CK_ULONG,
+            priv_tpl.as_mut_ptr(),
+            priv_tpl.len() as CK_ULONG,
+            &mut pub_key,
+            &mut priv_key,
+        ),
+        CKR_OK
+    );
+
+    // Sign and verify with CKM_EDDSA using the generated key pair
+    let mut eddsa_mech = CK_MECHANISM {
+        mechanism: CKM_EDDSA,
+        p_parameter: ptr::null_mut(),
+        parameter_len: 0,
+    };
+    assert_eq!(C_SignInit(session, &mut eddsa_mech, priv_key), CKR_OK);
+    let msg = b"Ed25519 key pair generated via CKM_EC_EDWARDS_KEY_PAIR_GEN";
+    let mut sig = [0u8; 64];
+    let mut sig_len = sig.len() as CK_ULONG;
+    assert_eq!(
+        C_Sign(
+            session,
+            msg.as_ptr() as CK_BYTE_PTR,
+            msg.len() as CK_ULONG,
+            sig.as_mut_ptr(),
+            &mut sig_len,
+        ),
+        CKR_OK
+    );
+    assert_eq!(sig_len, 64);
+
+    assert_eq!(C_VerifyInit(session, &mut eddsa_mech, pub_key), CKR_OK);
+    assert_eq!(
+        C_Verify(
+            session,
+            msg.as_ptr() as CK_BYTE_PTR,
+            msg.len() as CK_ULONG,
+            sig.as_mut_ptr(),
+            sig_len,
+        ),
+        CKR_OK
+    );
+
+    // 4. Unsupported curve (Ed448 OID 06 03 2B 65 71) is rejected with CKR_CURVE_NOT_SUPPORTED
+    let mut ed448_oid: [u8; 5] = [0x06, 0x03, 0x2B, 0x65, 0x71];
+    let mut bad_pub_tpl = [CK_ATTRIBUTE {
+        attr_type: CKA_EC_PARAMS,
+        p_value: ed448_oid.as_mut_ptr() as CK_VOID_PTR,
+        value_len: ed448_oid.len() as CK_ULONG,
+    }];
+    assert_eq!(
+        C_GenerateKeyPair(
+            session,
+            &mut gen_mech,
+            bad_pub_tpl.as_mut_ptr(),
+            bad_pub_tpl.len() as CK_ULONG,
+            priv_tpl.as_mut_ptr(),
+            priv_tpl.len() as CK_ULONG,
+            &mut pub_key,
+            &mut priv_key,
+        ),
+        CKR_CURVE_NOT_SUPPORTED
+    );
+}
