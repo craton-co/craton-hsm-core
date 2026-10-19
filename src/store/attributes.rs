@@ -832,9 +832,7 @@ pub fn read_attribute(
             // - sensitive=true AND extractable=false → block (key is fully protected)
             // - sensitive=true AND extractable=true  → allow (key is exportable)
             // - sensitive=false → always allow (regardless of extractable)
-            if crate::store::object::is_secret_class(obj.class)
-                && obj.sensitive
-                && !obj.extractable
+            if crate::store::object::is_secret_class(obj.class) && obj.sensitive && !obj.extractable
             {
                 return Err(HsmError::AttributeSensitive);
             }

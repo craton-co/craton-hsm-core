@@ -8,7 +8,7 @@ If you discover a security vulnerability in Craton HSM, please report it respons
 
 Primary channel: [GitHub's private vulnerability reporting](https://github.com/craton-co/craton-hsm-core/security/advisories/new).
 
-Fallback (if GitHub private vulnerability reporting is unavailable): e-mail `dev@craton.com.ar` with the subject `[SECURITY] Craton HSM`. Do not include exploit details in that first message; we will reply with an encrypted channel or a GitHub private advisory invitation.
+Fallback (if GitHub private vulnerability reporting is unavailable): e-mail `security@craton.com.ar` with the subject `[SECURITY] Craton HSM`. Do not include exploit details in that first message; we will reply with an encrypted channel or a GitHub private advisory invitation.
 
 ### What to include
 

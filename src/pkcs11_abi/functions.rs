@@ -2098,8 +2098,11 @@ pub extern "C" fn C_Encrypt(
                         if mech_param.is_empty() {
                             Err(HsmError::MechanismParamInvalid)
                         } else {
-                            hsm.crypto_backend
-                                .aes_cbc_encrypt_unpadded(key_bytes, &mech_param, data)
+                            hsm.crypto_backend.aes_cbc_encrypt_unpadded(
+                                key_bytes,
+                                &mech_param,
+                                data,
+                            )
                         }
                     }
                     CKM_AES_CBC_PAD => {
@@ -3309,10 +3312,7 @@ pub extern "C" fn C_GenerateKey(
                         Err(rv) => return rv,
                     }
                 }
-                CKA_WRAP_TEMPLATE
-                | CKA_UNWRAP_TEMPLATE
-                | CKA_WRAP_WITH_TRUSTED
-                | CKA_TRUSTED => {
+                CKA_WRAP_TEMPLATE | CKA_UNWRAP_TEMPLATE | CKA_WRAP_WITH_TRUSTED | CKA_TRUSTED => {
                     obj.extra_attributes.insert(*attr_type, value.clone());
                 }
                 _ => {}
@@ -6145,10 +6145,14 @@ pub extern "C" fn C_UnwrapKey(
         for (attr_type, value) in unwrap_tpl.iter().chain(template.iter()) {
             match *attr_type {
                 CKA_CLASS => {
-                    if let Some(c) = crate::store::attributes::read_ck_ulong(value) {
-                        obj.class = c;
-                    } else {
-                        return CKR_ATTRIBUTE_VALUE_INVALID;
+                    // Unwrapped material is always raw secret-key bytes. Allowing
+                    // any other class (e.g. CKO_DATA, whose CKA_VALUE is never
+                    // treated as sensitive) would let a caller unwrap a key and
+                    // read the plaintext back via C_GetAttributeValue.
+                    match crate::store::attributes::read_ck_ulong(value) {
+                        Some(CKO_SECRET_KEY) => {}
+                        Some(_) => return CKR_TEMPLATE_INCONSISTENT,
+                        None => return CKR_ATTRIBUTE_VALUE_INVALID,
                     }
                 }
                 CKA_KEY_TYPE => {
@@ -6244,10 +6248,7 @@ pub extern "C" fn C_UnwrapKey(
                         Err(rv) => return rv,
                     }
                 }
-                CKA_WRAP_TEMPLATE
-                | CKA_UNWRAP_TEMPLATE
-                | CKA_WRAP_WITH_TRUSTED
-                | CKA_TRUSTED => {
+                CKA_WRAP_TEMPLATE | CKA_UNWRAP_TEMPLATE | CKA_WRAP_WITH_TRUSTED | CKA_TRUSTED => {
                     obj.extra_attributes.insert(*attr_type, value.clone());
                 }
                 _ => {}
