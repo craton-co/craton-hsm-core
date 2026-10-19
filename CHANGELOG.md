@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.10.4] - 2026-10-18
+
+### Fixed
+
+- **Support `CKM_EC_EDWARDS_KEY_PAIR_GEN` for Ed25519 key generation (#89)**: added PKCS#11 v3.0 mechanism
+  `CKM_EC_EDWARDS_KEY_PAIR_GEN` with support for standard Ed25519 OID and `edwards25519` curve names.
+- **Enforce `CKA_WRAP_TEMPLATE` and `CKA_UNWRAP_TEMPLATE` (#88)**: properly validate target key
+  attributes against wrapping templates and enforce consistency on unwrap templates.
+- **Reject single-shot `C_Encrypt` / `C_Decrypt` after `*Update` (#87)**: return `CKR_OPERATION_ACTIVE`
+  when single-shot operation is invoked after an active multipart update call.
+- **`CKM_AES_CBC` unpadded block-aligned operations (#86)**: perform raw unpadded encryption and decryption
+  without implicitly appending or stripping PKCS#7 padding.
+- **Populate `CKA_VALUE_LEN` from `CKA_VALUE` for secret keys (#85)**: ensure `CKA_VALUE_LEN` attribute is
+  automatically inferred and populated when creating secret keys with `CKA_VALUE`.
+- **Allow `CKA_EXTRACTABLE=true` and `CKA_SENSITIVE=false` in `C_UnwrapKey` (#84)**: permit unwrapping
+  keys with non-sensitive or extractable attributes when explicitly requested.
+- **Allow RSA-OAEP encryption with public keys in `C_Encrypt` (#81)**: support public key handles for
+  `CKM_RSA_PKCS_OAEP` encryption operations.
+- **Enforce one-way attribute modifications in `C_SetAttributeValue`**: enforce PKCS#11 v3.0 rules
+  preventing clearing `CKA_SENSITIVE` (once true) or setting `CKA_EXTRACTABLE` back to true (once false).
+- **Auto-logout on last session closure**: token state resets to public when the last session closes
+  per PKCS#11 v3.0 §5.6.
+- **Restrict `CKA_CLASS` in `C_UnwrapKey`**: prevent unwrapping secret key material into non-secret
+  object classes like `CKO_DATA` which would bypass attribute sensitivity checks.
+
 ## [0.10.3] - 2026-09-29
 
 ### Fixed

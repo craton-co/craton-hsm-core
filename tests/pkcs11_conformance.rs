@@ -2096,9 +2096,6 @@ fn test_secret_key_created_with_value_has_value_len() {
     assert_eq!(val_len, 16);
 }
 
-
-
-
 /// Issue #86: CKM_AES_CBC must perform unpadded block-aligned encryption and
 /// decryption, producing 32 bytes (not 48) for a 32-byte input.
 #[test]
@@ -2631,7 +2628,10 @@ fn test_edwards_key_pair_gen_mechanism() {
         C_GetMechanismInfo(0, CKM_EC_EDWARDS_KEY_PAIR_GEN, &mut info),
         CKR_OK
     );
-    assert_eq!(info.flags & CKF_GENERATE_KEY_PAIR_FLAG, CKF_GENERATE_KEY_PAIR_FLAG);
+    assert_eq!(
+        info.flags & CKF_GENERATE_KEY_PAIR_FLAG,
+        CKF_GENERATE_KEY_PAIR_FLAG
+    );
 
     // 3. C_GenerateKeyPair(CKM_EC_EDWARDS_KEY_PAIR_GEN) with Ed25519 OID succeeds
     let mut ed25519_oid: [u8; 5] = [0x06, 0x03, 0x2B, 0x65, 0x70];

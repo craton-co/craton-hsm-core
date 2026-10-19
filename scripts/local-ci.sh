@@ -44,6 +44,11 @@ if [[ "${CRATON_CI_CONTAINER:-}" != "1" ]]; then
         -v "$REPO_ROOT":/app
         -v craton-cargo-registry:/usr/local/cargo/registry
         -v craton-cargo-git:/usr/local/cargo/git
+        # The library falls back to a CWD-relative `craton_hsm_store` when the
+        # system storage dir is absent. Without this, all parallel containers
+        # share /app/craton_hsm_store on the host bind mount and race on the
+        # lockout/state files (flaky shard failures). Give each its own tmpfs.
+        --tmpfs /app/craton_hsm_store:rw,mode=0700
     )
 
     if [[ $RUN_SHARDS -eq 1 ]]; then

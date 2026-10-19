@@ -964,10 +964,16 @@ fn test_closing_last_session_logs_token_out() {
     let h2 = mgr
         .open_session(0, CKF_RW_SESSION | CKF_SERIAL_SESSION, &token)
         .unwrap();
-    assert_eq!(mgr.get_session(h2).unwrap().read().state, SessionState::RwPublic);
+    assert_eq!(
+        mgr.get_session(h2).unwrap().read().state,
+        SessionState::RwPublic
+    );
     token.login(CKU_USER, b"userpin1").unwrap();
     mgr.login_all(0, CKU_USER).unwrap();
-    assert_eq!(mgr.get_session(h2).unwrap().read().state, SessionState::RwUser);
+    assert_eq!(
+        mgr.get_session(h2).unwrap().read().state,
+        SessionState::RwUser
+    );
     mgr.close_session(h2, &token).unwrap();
 }
 
