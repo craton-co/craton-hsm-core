@@ -858,6 +858,16 @@ pub fn read_attribute(
         CKA_VALUE_LEN => Ok(obj.value_len.map(ck_ulong_to_bytes)),
         CKA_START_DATE => Ok(obj.start_date.map(|d| d.to_vec())),
         CKA_END_DATE => Ok(obj.end_date.map(|d| d.to_vec())),
+        t if crate::store::object::SENSITIVE_COMPONENT_ATTRIBUTES.contains(&t) => {
+            if obj.class == CKO_PRIVATE_KEY {
+                if obj.sensitive || !obj.extractable {
+                    return Err(HsmError::AttributeSensitive);
+                }
+                Ok(obj.extra_attributes.get(&t).cloned())
+            } else {
+                Ok(None)
+            }
+        }
         _ => Ok(obj.extra_attributes.get(&attr_type).cloned()),
     }
 }
@@ -943,4 +953,50 @@ impl Drop for ZeroizingObjects {
         // Now drop all elements (which triggers RawKeyMaterial::drop → zeroize key bytes)
         self.0.clear();
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+
+    #[test]
+    fn rsa_private_components_sensitivity() {
+        let mut obj = StoredObject::new(1, CKO_PRIVATE_KEY);
+        obj.key_type = Some(CKK_RSA);
+        obj.sensitive = true;
+        obj.extractable = false;
+        obj.extra_attributes.insert(CKA_PRIVATE_EXPONENT, vec![1, 2, 3]);
+        obj.extra_attributes.insert(CKA_PRIME_1, vec![4, 5, 6]);
+
+        // Sensitive and non-extractable: returns AttributeSensitive
+        assert!(matches!(
+            read_attribute(&obj, CKA_PRIVATE_EXPONENT, true),
+            Err(HsmError::AttributeSensitive)
+        ));
+        assert!(matches!(
+            read_attribute(&obj, CKA_PRIME_1, true),
+            Err(HsmError::AttributeSensitive)
+        ));
+
+        // Sensitive but extractable: also sensitive per Table 39 note 7
+        obj.extractable = true;
+        assert!(matches!(
+            read_attribute(&obj, CKA_PRIVATE_EXPONENT, true),
+            Err(HsmError::AttributeSensitive)
+        ));
+
+        // Non-sensitive and extractable: permitted
+        obj.sensitive = false;
+        obj.extractable = true;
+        assert_eq!(
+            read_attribute(&obj, CKA_PRIVATE_EXPONENT, true).unwrap(),
+            Some(vec![1, 2, 3])
+        );
+        assert_eq!(
+            read_attribute(&obj, CKA_PRIME_1, true).unwrap(),
+            Some(vec![4, 5, 6])
+        );
+    }
+
 }
