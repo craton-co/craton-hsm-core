@@ -125,6 +125,17 @@ impl Drop for StoredObject {
     }
 }
 
+/// Private-key component attributes that must never be revealed in plaintext
+/// when the object is sensitive or non-extractable (PKCS#11 v3.0 §4.9 Table 39).
+pub const SENSITIVE_COMPONENT_ATTRIBUTES: &[CK_ATTRIBUTE_TYPE] = &[
+    CKA_PRIVATE_EXPONENT,
+    CKA_PRIME_1,
+    CKA_PRIME_2,
+    CKA_EXPONENT_1,
+    CKA_EXPONENT_2,
+    CKA_COEFFICIENT,
+];
+
 /// Returns true for object classes whose value is secret key material.
 pub fn is_secret_class(class: CK_OBJECT_CLASS) -> bool {
     class == CKO_SECRET_KEY || class == CKO_PRIVATE_KEY
