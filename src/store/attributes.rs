@@ -326,6 +326,54 @@ impl ObjectStore {
             apply_attribute(&mut obj, *attr_type, value)?;
         }
 
+        // If an RSA private key object was created with discrete components instead
+        // of CKA_VALUE, synthesize key_material (PKCS#8 DER) so it can be used for
+        // cryptographic operations (RFC 8017 / PKCS#11 v3.0 §2.1.3 Table 39).
+        if obj.class == CKO_PRIVATE_KEY
+            && obj.key_type == Some(CKK_RSA)
+            && obj.key_material.is_none()
+            && obj.extra_attributes.contains_key(&CKA_PRIVATE_EXPONENT)
+        {
+            let modulus = obj.modulus.as_ref().ok_or(HsmError::TemplateInconsistent)?;
+            let pub_exp = obj.public_exponent.as_ref().ok_or(HsmError::TemplateInconsistent)?;
+            let priv_exp = obj
+                .extra_attributes
+                .get(&CKA_PRIVATE_EXPONENT)
+                .ok_or(HsmError::TemplateInconsistent)?;
+            let prime1 = obj
+                .extra_attributes
+                .get(&CKA_PRIME_1)
+                .ok_or(HsmError::TemplateInconsistent)?;
+            let prime2 = obj
+                .extra_attributes
+                .get(&CKA_PRIME_2)
+                .ok_or(HsmError::TemplateInconsistent)?;
+
+            use rsa::pkcs8::EncodePrivateKey;
+            use rsa::{BigUint, RsaPrivateKey};
+
+            let n = BigUint::from_bytes_be(modulus);
+            let e = BigUint::from_bytes_be(pub_exp);
+            let d = BigUint::from_bytes_be(priv_exp);
+            let p = BigUint::from_bytes_be(prime1);
+            let q = BigUint::from_bytes_be(prime2);
+
+            let private_key = RsaPrivateKey::from_components(n, e, d, vec![p, q])
+                .map_err(|_| HsmError::AttributeValueInvalid)?;
+            private_key
+                .validate()
+                .map_err(|_| HsmError::AttributeValueInvalid)?;
+
+            let der = private_key
+                .to_pkcs8_der()
+                .map_err(|_| HsmError::GeneralError)?;
+
+            obj.key_material = Some(RawKeyMaterial::new(der.as_bytes().to_vec()));
+            if obj.modulus_bits.is_none() {
+                obj.modulus_bits = Some((modulus.len() * 8) as CK_ULONG);
+            }
+        }
+
         // Persist if it's a token object
         self.persist_object(&obj);
 
@@ -999,4 +1047,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rsa_private_key_created_from_components_has_key_material() {
+        use rsa::traits::{PrivateKeyParts, PublicKeyParts};
+        use rsa::RsaPrivateKey;
+        use crate::crypto::drbg::DrbgRng;
+
+        let mut rng = DrbgRng::new().unwrap();
+        let priv_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let n = priv_key.n().to_bytes_be();
+        let e = priv_key.e().to_bytes_be();
+        let d = priv_key.d().to_bytes_be();
+        let p = priv_key.primes()[0].to_bytes_be();
+        let q = priv_key.primes()[1].to_bytes_be();
+
+        let store = ObjectStore::new();
+        let template = vec![
+            (CKA_CLASS, ck_ulong_to_bytes(CKO_PRIVATE_KEY)),
+            (CKA_KEY_TYPE, ck_ulong_to_bytes(CKK_RSA)),
+            (CKA_MODULUS, n.clone()),
+            (CKA_PUBLIC_EXPONENT, e.clone()),
+            (CKA_PRIVATE_EXPONENT, d),
+            (CKA_PRIME_1, p),
+            (CKA_PRIME_2, q),
+            (CKA_DECRYPT, vec![CK_TRUE]),
+        ];
+
+        let handle = store.create_object(&template).expect("create_object should succeed");
+        let obj = store.get_object(handle).unwrap();
+        let obj = obj.read();
+        assert!(obj.key_material.is_some(), "key_material must be populated from components");
+
+        let priv_der = obj.key_material.as_ref().unwrap().as_bytes();
+        let pt = b"RSA discrete component decryption test";
+        let ct = crate::crypto::sign::rsa_oaep_encrypt(&n, &e, pt, crate::crypto::sign::OaepHash::Sha256).unwrap();
+        let recovered = crate::crypto::sign::rsa_oaep_decrypt(priv_der, &ct, crate::crypto::sign::OaepHash::Sha256).unwrap();
+        assert_eq!(&recovered, pt);
+    }
 }
