@@ -239,11 +239,11 @@ fn test_rsa_oaep_encrypt_decrypt() {
     let plaintext = b"RSA-OAEP test plaintext";
 
     let ciphertext =
-        sign::rsa_oaep_encrypt(&modulus, &pub_exp, plaintext, sign::OaepHash::Sha256).unwrap();
+        sign::rsa_oaep_encrypt(&modulus, &pub_exp, plaintext, sign::OaepHash::Sha256, &[]).unwrap();
     assert_ne!(ciphertext.as_slice(), plaintext.as_slice());
 
     let decrypted =
-        sign::rsa_oaep_decrypt(priv_der.as_bytes(), &ciphertext, sign::OaepHash::Sha256).unwrap();
+        sign::rsa_oaep_decrypt(priv_der.as_bytes(), &ciphertext, sign::OaepHash::Sha256, &[]).unwrap();
     assert_eq!(decrypted, plaintext);
 }
 
@@ -260,8 +260,8 @@ fn test_rsa_oaep_wrong_key() {
     let plaintext = b"wrong key test";
 
     let ciphertext =
-        sign::rsa_oaep_encrypt(&modulus, &pub_exp, plaintext, sign::OaepHash::Sha256).unwrap();
-    let result = sign::rsa_oaep_decrypt(priv_der2.as_bytes(), &ciphertext, sign::OaepHash::Sha256);
+        sign::rsa_oaep_encrypt(&modulus, &pub_exp, plaintext, sign::OaepHash::Sha256, &[]).unwrap();
+    let result = sign::rsa_oaep_decrypt(priv_der2.as_bytes(), &ciphertext, sign::OaepHash::Sha256, &[]);
     assert!(
         result.is_err(),
         "RSA-OAEP decrypt with wrong key should fail"

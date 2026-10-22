@@ -1080,8 +1080,8 @@ mod tests {
 
         let priv_der = obj.key_material.as_ref().unwrap().as_bytes();
         let pt = b"RSA discrete component decryption test";
-        let ct = crate::crypto::sign::rsa_oaep_encrypt(&n, &e, pt, crate::crypto::sign::OaepHash::Sha256).unwrap();
-        let recovered = crate::crypto::sign::rsa_oaep_decrypt(priv_der, &ct, crate::crypto::sign::OaepHash::Sha256).unwrap();
+        let ct = crate::crypto::sign::rsa_oaep_encrypt(&n, &e, pt, crate::crypto::sign::OaepHash::Sha256, &[]).unwrap();
+        let recovered = crate::crypto::sign::rsa_oaep_decrypt(priv_der, &ct, crate::crypto::sign::OaepHash::Sha256, &[]).unwrap();
         assert_eq!(&recovered, pt);
     }
 }

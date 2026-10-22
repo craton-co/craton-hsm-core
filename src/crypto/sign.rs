@@ -532,42 +532,45 @@ pub enum OaepHash {
 /// Uses the SP 800-90A HMAC_DRBG for OAEP padding randomness (via `DrbgRng`)
 /// instead of `OsRng` directly, ensuring all randomness benefits from
 /// the DRBG's continuous health testing and prediction resistance.
+fn oaep_padding(hash_alg: OaepHash, label: &[u8]) -> HsmResult<rsa::Oaep> {
+    use rsa::Oaep;
+    let label_str = if label.is_empty() {
+        None
+    } else {
+        Some(
+            std::str::from_utf8(label)
+                .map_err(|_| HsmError::MechanismParamInvalid)?
+                .to_owned(),
+        )
+    };
+    Ok(match (hash_alg, label_str) {
+        (OaepHash::Sha256, None) => Oaep::new::<Sha256>(),
+        (OaepHash::Sha384, None) => Oaep::new::<Sha384>(),
+        (OaepHash::Sha512, None) => Oaep::new::<Sha512>(),
+        (OaepHash::Sha256, Some(l)) => Oaep::new_with_label::<Sha256, _>(l),
+        (OaepHash::Sha384, Some(l)) => Oaep::new_with_label::<Sha384, _>(l),
+        (OaepHash::Sha512, Some(l)) => Oaep::new_with_label::<Sha512, _>(l),
+    })
+}
+
 pub fn rsa_oaep_encrypt(
     modulus: &[u8],
     public_exponent: &[u8],
     plaintext: &[u8],
     hash_alg: OaepHash,
+    label: &[u8],
 ) -> HsmResult<Vec<u8>> {
     use crate::crypto::drbg::DrbgRng;
-    use rsa::Oaep;
 
-    validate_rsa_public_key_size(modulus)?;
     let n = rsa::BigUint::from_bytes_be(modulus);
     let e = rsa::BigUint::from_bytes_be(public_exponent);
     let public_key = RsaPublicKey::new(n, e).map_err(|_| HsmError::KeyHandleInvalid)?;
 
     let mut rng = DrbgRng::new()?;
-
-    match hash_alg {
-        OaepHash::Sha256 => {
-            let padding = Oaep::new::<Sha256>();
-            public_key
-                .encrypt(&mut rng, padding, plaintext)
-                .map_err(|_| HsmError::GeneralError)
-        }
-        OaepHash::Sha384 => {
-            let padding = Oaep::new::<Sha384>();
-            public_key
-                .encrypt(&mut rng, padding, plaintext)
-                .map_err(|_| HsmError::GeneralError)
-        }
-        OaepHash::Sha512 => {
-            let padding = Oaep::new::<Sha512>();
-            public_key
-                .encrypt(&mut rng, padding, plaintext)
-                .map_err(|_| HsmError::GeneralError)
-        }
-    }
+    let padding = oaep_padding(hash_alg, label)?;
+    public_key
+        .encrypt(&mut rng, padding, plaintext)
+        .map_err(|_| HsmError::GeneralError)
 }
 
 /// RSA-OAEP decrypt (using private key DER)
@@ -575,33 +578,17 @@ pub fn rsa_oaep_decrypt(
     private_key_der: &[u8],
     ciphertext: &[u8],
     hash_alg: OaepHash,
+    label: &[u8],
 ) -> HsmResult<Vec<u8>> {
     require_rustcrypto_rsa_private_ops()?;
-    use rsa::Oaep;
 
     let private_key = parse_rsa_private_key(private_key_der)?;
     validate_rsa_private_key_size(&private_key)?;
 
-    match hash_alg {
-        OaepHash::Sha256 => {
-            let padding = Oaep::new::<Sha256>();
-            private_key
-                .decrypt(padding, ciphertext)
-                .map_err(|_| HsmError::EncryptedDataInvalid)
-        }
-        OaepHash::Sha384 => {
-            let padding = Oaep::new::<Sha384>();
-            private_key
-                .decrypt(padding, ciphertext)
-                .map_err(|_| HsmError::EncryptedDataInvalid)
-        }
-        OaepHash::Sha512 => {
-            let padding = Oaep::new::<Sha512>();
-            private_key
-                .decrypt(padding, ciphertext)
-                .map_err(|_| HsmError::EncryptedDataInvalid)
-        }
-    }
+    let padding = oaep_padding(hash_alg, label)?;
+    private_key
+        .decrypt(padding, ciphertext)
+        .map_err(|_| HsmError::EncryptedDataInvalid)
 }
 
 // ============================================================================
@@ -787,32 +774,17 @@ pub fn rsa_oaep_encrypt_cached(
     public_exponent: &[u8],
     plaintext: &[u8],
     hash_alg: OaepHash,
+    label: &[u8],
 ) -> HsmResult<Vec<u8>> {
     use crate::crypto::drbg::DrbgRng;
-    use rsa::Oaep;
 
     validate_rsa_public_key_size(modulus)?;
     let key = get_or_build_public_key(slot_id, handle, modulus, public_exponent)?;
 
     let mut rng = DrbgRng::new()?;
-
-    match hash_alg {
-        OaepHash::Sha256 => {
-            let padding = Oaep::new::<Sha256>();
-            key.encrypt(&mut rng, padding, plaintext)
-                .map_err(|_| HsmError::GeneralError)
-        }
-        OaepHash::Sha384 => {
-            let padding = Oaep::new::<Sha384>();
-            key.encrypt(&mut rng, padding, plaintext)
-                .map_err(|_| HsmError::GeneralError)
-        }
-        OaepHash::Sha512 => {
-            let padding = Oaep::new::<Sha512>();
-            key.encrypt(&mut rng, padding, plaintext)
-                .map_err(|_| HsmError::GeneralError)
-        }
-    }
+    let padding = oaep_padding(hash_alg, label)?;
+    key.encrypt(&mut rng, padding, plaintext)
+        .map_err(|_| HsmError::GeneralError)
 }
 
 /// RSA-OAEP decrypt using handle-based private key cache.
@@ -822,30 +794,16 @@ pub fn rsa_oaep_decrypt_cached(
     private_key_der: &[u8],
     ciphertext: &[u8],
     hash_alg: OaepHash,
+    label: &[u8],
 ) -> HsmResult<Vec<u8>> {
     require_rustcrypto_rsa_private_ops()?;
-    use rsa::Oaep;
 
     let key = get_or_parse_private_key(slot_id, handle, private_key_der)?;
     validate_rsa_private_key_size(&key)?;
 
-    match hash_alg {
-        OaepHash::Sha256 => {
-            let padding = Oaep::new::<Sha256>();
-            key.decrypt(padding, ciphertext)
-                .map_err(|_| HsmError::EncryptedDataInvalid)
-        }
-        OaepHash::Sha384 => {
-            let padding = Oaep::new::<Sha384>();
-            key.decrypt(padding, ciphertext)
-                .map_err(|_| HsmError::EncryptedDataInvalid)
-        }
-        OaepHash::Sha512 => {
-            let padding = Oaep::new::<Sha512>();
-            key.decrypt(padding, ciphertext)
-                .map_err(|_| HsmError::EncryptedDataInvalid)
-        }
-    }
+    let padding = oaep_padding(hash_alg, label)?;
+    key.decrypt(padding, ciphertext)
+        .map_err(|_| HsmError::EncryptedDataInvalid)
 }
 
 // ============================================================================
@@ -1628,14 +1586,14 @@ mod tests {
         let (slot, handle) = unique_ids();
         let (priv_der, modulus, pub_exp) = fresh_rsa_keypair();
         let ct =
-            rsa_oaep_encrypt_cached(slot, handle, &modulus, &pub_exp, b"test", OaepHash::Sha256)
+            rsa_oaep_encrypt_cached(slot, handle, &modulus, &pub_exp, b"test", OaepHash::Sha256, &[])
                 .expect("encrypt");
 
         // Pre-condition: cache miss for private key
         assert!(get_cached_rsa_private_key(slot, handle).is_none());
 
         // Decrypt: should populate private key cache
-        let pt = rsa_oaep_decrypt_cached(slot, handle, &priv_der, &ct, OaepHash::Sha256)
+        let pt = rsa_oaep_decrypt_cached(slot, handle, &priv_der, &ct, OaepHash::Sha256, &[])
             .expect("decrypt");
         assert_eq!(pt, b"test");
 
@@ -1644,7 +1602,7 @@ mod tests {
             .expect("rsa_oaep_decrypt_cached should populate the private-key handle cache");
 
         // Second decrypt: should reuse the cached Arc<RsaPrivateKey>
-        let _pt = rsa_oaep_decrypt_cached(slot, handle, &priv_der, &ct, OaepHash::Sha256)
+        let _pt = rsa_oaep_decrypt_cached(slot, handle, &priv_der, &ct, OaepHash::Sha256, &[])
             .expect("second decrypt");
         let arc2 = get_cached_rsa_private_key(slot, handle).unwrap();
         assert!(
@@ -1696,7 +1654,7 @@ mod tests {
 
         assert!(get_cached_rsa_public_key(slot, handle).is_none());
         let ct =
-            rsa_oaep_encrypt_cached(slot, handle, &modulus, &pub_exp, b"hello", OaepHash::Sha256)
+            rsa_oaep_encrypt_cached(slot, handle, &modulus, &pub_exp, b"hello", OaepHash::Sha256, &[])
                 .expect("encrypt");
         assert!(
             get_cached_rsa_public_key(slot, handle).is_some(),
@@ -1704,7 +1662,7 @@ mod tests {
         );
 
         // Sanity: the ciphertext decrypts back via the legacy decrypt path.
-        let pt = rsa_oaep_decrypt(&priv_der, &ct, OaepHash::Sha256).unwrap();
+        let pt = rsa_oaep_decrypt(&priv_der, &ct, OaepHash::Sha256, &[]).unwrap();
         assert_eq!(pt, b"hello");
 
         evict_cached_keys(slot, handle);
@@ -1765,9 +1723,9 @@ mod tests {
             .unwrap();
 
         // Populate public-key cache for both slots via OAEP encrypt.
-        let _ = rsa_oaep_encrypt_cached(slot_a, handle_a, &mod_a, &exp_a, b"x", OaepHash::Sha256)
+        let _ = rsa_oaep_encrypt_cached(slot_a, handle_a, &mod_a, &exp_a, b"x", OaepHash::Sha256, &[])
             .unwrap();
-        let _ = rsa_oaep_encrypt_cached(slot_b, handle_b, &mod_b, &exp_b, b"x", OaepHash::Sha256)
+        let _ = rsa_oaep_encrypt_cached(slot_b, handle_b, &mod_b, &exp_b, b"x", OaepHash::Sha256, &[])
             .unwrap();
 
         assert!(get_cached_rsa_private_key(slot_a, handle_a).is_some());
@@ -1817,7 +1775,7 @@ mod tests {
             .unwrap();
         let _ = rsa_pkcs1v15_sign_cached(slot_b, handle_b, &der_b, b"x", Some(HashAlg::Sha256))
             .unwrap();
-        let _ = rsa_oaep_encrypt_cached(slot_a, handle_a, &mod_a, &exp_a, b"x", OaepHash::Sha256)
+        let _ = rsa_oaep_encrypt_cached(slot_a, handle_a, &mod_a, &exp_a, b"x", OaepHash::Sha256, &[])
             .unwrap();
 
         assert!(get_cached_rsa_private_key(slot_a, handle_a).is_some());

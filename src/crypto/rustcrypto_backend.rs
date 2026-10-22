@@ -375,8 +375,9 @@ impl CryptoBackend for RustCryptoBackend {
         public_exponent: &[u8],
         plaintext: &[u8],
         hash_alg: super::sign::OaepHash,
+        label: &[u8],
     ) -> HsmResult<Vec<u8>> {
-        super::sign::rsa_oaep_encrypt(modulus, public_exponent, plaintext, hash_alg)
+        super::sign::rsa_oaep_encrypt(modulus, public_exponent, plaintext, hash_alg, label)
     }
 
     fn rsa_oaep_encrypt_with_handle(
@@ -387,6 +388,7 @@ impl CryptoBackend for RustCryptoBackend {
         public_exponent: &[u8],
         plaintext: &[u8],
         hash_alg: super::sign::OaepHash,
+        label: &[u8],
     ) -> HsmResult<Vec<u8>> {
         super::sign::rsa_oaep_encrypt_cached(
             slot_id,
@@ -395,6 +397,7 @@ impl CryptoBackend for RustCryptoBackend {
             public_exponent,
             plaintext,
             hash_alg,
+            label,
         )
     }
 
@@ -403,8 +406,9 @@ impl CryptoBackend for RustCryptoBackend {
         private_key_der: &[u8],
         ciphertext: &[u8],
         hash_alg: super::sign::OaepHash,
+        label: &[u8],
     ) -> HsmResult<Vec<u8>> {
-        super::sign::rsa_oaep_decrypt(private_key_der, ciphertext, hash_alg)
+        super::sign::rsa_oaep_decrypt(private_key_der, ciphertext, hash_alg, label)
     }
 
     fn rsa_oaep_decrypt_with_handle(
@@ -414,8 +418,9 @@ impl CryptoBackend for RustCryptoBackend {
         private_key_der: &[u8],
         ciphertext: &[u8],
         hash_alg: super::sign::OaepHash,
+        label: &[u8],
     ) -> HsmResult<Vec<u8>> {
-        super::sign::rsa_oaep_decrypt_cached(slot_id, handle, private_key_der, ciphertext, hash_alg)
+        super::sign::rsa_oaep_decrypt_cached(slot_id, handle, private_key_der, ciphertext, hash_alg, label)
     }
 
     // ========================================================================

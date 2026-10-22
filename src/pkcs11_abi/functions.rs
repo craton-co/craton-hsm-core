@@ -220,30 +220,92 @@ fn stored_key_bits(obj: &StoredObject) -> Option<u32> {
     None
 }
 
-/// Parse OAEP hash algorithm from CK_RSA_PKCS_OAEP_PARAMS mechanism parameter bytes.
-/// The first CK_ULONG in the struct is hashAlg. Returns error for unrecognized or missing hash.
-fn parse_oaep_hash(mech_param: &[u8]) -> Result<crate::crypto::sign::OaepHash, CK_RV> {
-    use crate::crypto::sign::OaepHash;
-    if mech_param.len() >= std::mem::size_of::<CK_ULONG>() {
+/// Parse CK_RSA_PKCS_OAEP_PARAMS mechanism parameter into internal encoding [hash_id, label...].
+fn parse_oaep_params(p_mechanism: CK_MECHANISM_PTR) -> Result<Vec<u8>, CK_RV> {
+    let mech = unsafe { &*p_mechanism };
+    if mech.p_parameter.is_null() || mech.parameter_len == 0 {
+        return Ok(vec![1u8]);
+    }
+    let param_len = mech.parameter_len as usize;
+    if param_len == std::mem::size_of::<CK_RSA_PKCS_OAEP_PARAMS>() {
+        let p = unsafe { std::ptr::read_unaligned(mech.p_parameter as *const CK_RSA_PKCS_OAEP_PARAMS) };
+        let hash_alg = p.hash_alg;
+        let mgf = p.mgf;
+        let source = p.source;
+        let p_source_data = p.p_source_data;
+        let source_data_len = p.source_data_len;
+        let hash_id = match hash_alg {
+            CKM_SHA_1 => {
+                tracing::error!("RSA-OAEP with SHA-1 is rejected — use SHA-256 or stronger");
+                return Err(CKR_MECHANISM_PARAM_INVALID);
+            }
+            CKM_SHA256 => 1u8,
+            CKM_SHA384 => 2u8,
+            CKM_SHA512 => 3u8,
+            _ => return Err(CKR_MECHANISM_PARAM_INVALID),
+        };
+        let expected_mgf = match hash_alg {
+            CKM_SHA256 => CKG_MGF1_SHA256,
+            CKM_SHA384 => CKG_MGF1_SHA384,
+            CKM_SHA512 => CKG_MGF1_SHA512,
+            _ => return Err(CKR_MECHANISM_PARAM_INVALID),
+        };
+        if mgf != expected_mgf {
+            tracing::error!(
+                "RSA-OAEP: MGF1 ({:#x}) does not match hashAlg ({:#x})",
+                mgf,
+                expected_mgf
+            );
+            return Err(CKR_MECHANISM_PARAM_INVALID);
+        }
+        let label = if source_data_len > 0 {
+            if source != CKZ_DATA_SPECIFIED {
+                return Err(CKR_MECHANISM_PARAM_INVALID);
+            }
+            copy_param_buffer(p_source_data as CK_BYTE_PTR, source_data_len)?
+        } else {
+            if source != 0 && source != CKZ_DATA_SPECIFIED {
+                return Err(CKR_MECHANISM_PARAM_INVALID);
+            }
+            Vec::new()
+        };
+        let mut encoded = Vec::with_capacity(1 + label.len());
+        encoded.push(hash_id);
+        encoded.extend_from_slice(&label);
+        Ok(encoded)
+    } else if param_len >= std::mem::size_of::<CK_ULONG>() {
         let hash_mech = CK_ULONG::from_ne_bytes(
-            match mech_param[..std::mem::size_of::<CK_ULONG>()].try_into() {
+            match unsafe { slice::from_raw_parts(mech.p_parameter as *const u8, std::mem::size_of::<CK_ULONG>()) }.try_into() {
                 Ok(b) => b,
                 Err(_) => return Err(CKR_MECHANISM_PARAM_INVALID),
             },
         );
-        match hash_mech {
-            CKM_SHA_1 => {
-                tracing::error!("RSA-OAEP with SHA-1 is rejected — use SHA-256 or stronger");
-                Err(CKR_MECHANISM_PARAM_INVALID)
-            }
-            CKM_SHA256 => Ok(OaepHash::Sha256),
-            CKM_SHA384 => Ok(OaepHash::Sha384),
-            CKM_SHA512 => Ok(OaepHash::Sha512),
-            _ => Err(CKR_MECHANISM_PARAM_INVALID),
-        }
+        let hash_id = match hash_mech {
+            CKM_SHA_1 => return Err(CKR_MECHANISM_PARAM_INVALID),
+            CKM_SHA256 => 1u8,
+            CKM_SHA384 => 2u8,
+            CKM_SHA512 => 3u8,
+            _ => return Err(CKR_MECHANISM_PARAM_INVALID),
+        };
+        Ok(vec![hash_id])
     } else {
         Err(CKR_MECHANISM_PARAM_INVALID)
     }
+}
+
+fn decode_oaep_param(param: &[u8]) -> Result<(crate::crypto::sign::OaepHash, &[u8]), CK_RV> {
+    use crate::crypto::sign::OaepHash;
+    if param.is_empty() {
+        return Err(CKR_MECHANISM_PARAM_INVALID);
+    }
+    let hash = match param[0] {
+        1 => OaepHash::Sha256,
+        2 => OaepHash::Sha384,
+        3 => OaepHash::Sha512,
+        _ => return Err(CKR_MECHANISM_PARAM_INVALID),
+    };
+    let label = &param[1..];
+    Ok((hash, label))
 }
 
 /// Parsed `CKM_ECDH1_DERIVE` / `CKM_ECDH1_COFACTOR_DERIVE` parameters.
@@ -1884,6 +1946,11 @@ pub extern "C" fn C_EncryptInit(
                 Ok(p) => p,
                 Err(rv) => return rv,
             }
+        } else if mechanism == CKM_RSA_PKCS_OAEP {
+            match parse_oaep_params(p_mechanism) {
+                Ok(p) => p,
+                Err(rv) => return rv,
+            }
         } else {
             extract_mechanism_param(p_mechanism)
         };
@@ -2060,8 +2127,8 @@ pub extern "C" fn C_Encrypt(
                         return CKR_KEY_HANDLE_INVALID;
                     }
                 };
-                let oaep_hash = match parse_oaep_hash(&mech_param) {
-                    Ok(h) => h,
+                let (oaep_hash, label) = match decode_oaep_param(&mech_param) {
+                    Ok(p) => p,
                     Err(rv) => {
                         sess.active_operation = None;
                         return rv;
@@ -2075,6 +2142,7 @@ pub extern "C" fn C_Encrypt(
                     pub_exp,
                     data,
                     oaep_hash,
+                    label,
                 )
             }
             CKM_AES_GCM | CKM_AES_CBC | CKM_AES_CBC_PAD | CKM_AES_CTR => {
@@ -2246,6 +2314,11 @@ pub extern "C" fn C_DecryptInit(
                 Ok(p) => p,
                 Err(rv) => return rv,
             }
+        } else if mechanism == CKM_RSA_PKCS_OAEP {
+            match parse_oaep_params(p_mechanism) {
+                Ok(p) => p,
+                Err(rv) => return rv,
+            }
         } else {
             extract_mechanism_param(p_mechanism)
         };
@@ -2381,8 +2454,8 @@ pub extern "C" fn C_Decrypt(
                 }
             }
             CKM_RSA_PKCS_OAEP => {
-                let oaep_hash = match parse_oaep_hash(&mech_param) {
-                    Ok(h) => h,
+                let (oaep_hash, label) = match decode_oaep_param(&mech_param) {
+                    Ok(p) => p,
                     Err(rv) => {
                         sess.active_operation = None;
                         return rv;
@@ -2395,6 +2468,7 @@ pub extern "C" fn C_Decrypt(
                     key_bytes,
                     data,
                     oaep_hash,
+                    label,
                 )
             }
             _ => {
