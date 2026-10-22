@@ -251,7 +251,7 @@ fn read_rsa_public_components(
 /// step before reaching the OAEP code path. We use the internal API for encryption
 /// and the C ABI for decryption to still exercise the ABI decrypt path.
 fn oaep_encrypt_via_internal(modulus: &[u8], pub_exp: &[u8], plaintext: &[u8]) -> Vec<u8> {
-    crypto_sign::rsa_oaep_encrypt(modulus, pub_exp, plaintext, OaepHash::Sha256)
+    crypto_sign::rsa_oaep_encrypt(modulus, pub_exp, plaintext, OaepHash::Sha256, &[])
         .expect("Internal OAEP encrypt failed")
 }
 
@@ -1412,4 +1412,188 @@ fn test_rsa_keygen_produces_unique_keys() {
         modulus_1, modulus_2,
         "Two RSA keypairs should have different moduli"
     );
+}
+
+// ============================================================================
+// 29. RSA-OAEP mismatched MGF is refused with CKR_MECHANISM_PARAM_INVALID
+// ============================================================================
+
+#[test]
+fn test_rsa_oaep_mismatched_mgf_refused() {
+    let session = setup_user_session();
+    let (pub_key, _priv_key) = generate_rsa_keypair(session, 2048);
+
+    let mut oaep_params = CK_RSA_PKCS_OAEP_PARAMS {
+        hash_alg: CKM_SHA256,
+        mgf: CKG_MGF1_SHA1,
+        source: CKZ_DATA_SPECIFIED,
+        p_source_data: ptr::null_mut(),
+        source_data_len: 0,
+    };
+    let mut mech = CK_MECHANISM {
+        mechanism: CKM_RSA_PKCS_OAEP,
+        p_parameter: &mut oaep_params as *mut _ as CK_VOID_PTR,
+        parameter_len: std::mem::size_of::<CK_RSA_PKCS_OAEP_PARAMS>() as CK_ULONG,
+    };
+
+    let rv = C_EncryptInit(session, &mut mech, pub_key);
+    assert_eq!(rv, CKR_MECHANISM_PARAM_INVALID, "Mismatched MGF must be refused");
+}
+
+// ============================================================================
+// 30. RSA-OAEP label mismatch fails decryption with CKR_ENCRYPTED_DATA_INVALID
+// ============================================================================
+
+#[test]
+#[cfg_attr(
+    not(any(
+        debug_assertions,
+        feature = "insecure-rustcrypto-rsa-private-ops",
+        all(feature = "awslc-backend", not(feature = "rustcrypto-backend"))
+    )),
+    ignore = "needs a backend providing RSA private-key operations"
+)]
+fn test_rsa_oaep_different_label_decrypt_fails() {
+    let session = setup_user_session();
+    let (pub_key, priv_key) = generate_rsa_keypair(session, 2048);
+    let plaintext = b"oaep label sensitivity check";
+
+    let mut label_a = b"label-a".to_vec();
+    let mut enc_params = CK_RSA_PKCS_OAEP_PARAMS {
+        hash_alg: CKM_SHA256,
+        mgf: CKG_MGF1_SHA256,
+        source: CKZ_DATA_SPECIFIED,
+        p_source_data: label_a.as_mut_ptr() as CK_VOID_PTR,
+        source_data_len: label_a.len() as CK_ULONG,
+    };
+    let mut enc_mech = CK_MECHANISM {
+        mechanism: CKM_RSA_PKCS_OAEP,
+        p_parameter: &mut enc_params as *mut _ as CK_VOID_PTR,
+        parameter_len: std::mem::size_of::<CK_RSA_PKCS_OAEP_PARAMS>() as CK_ULONG,
+    };
+
+    let rv = C_EncryptInit(session, &mut enc_mech, pub_key);
+    assert_eq!(rv, CKR_OK);
+
+    let mut ciphertext = vec![0u8; 256];
+    let mut ct_len: CK_ULONG = ciphertext.len() as CK_ULONG;
+    let rv = C_Encrypt(
+        session,
+        plaintext.as_ptr() as CK_BYTE_PTR,
+        plaintext.len() as CK_ULONG,
+        ciphertext.as_mut_ptr(),
+        &mut ct_len,
+    );
+    assert_eq!(rv, CKR_OK);
+    ciphertext.truncate(ct_len as usize);
+
+    // Decrypt with a different label ("label-b")
+    let mut label_b = b"label-b".to_vec();
+    let mut dec_params = CK_RSA_PKCS_OAEP_PARAMS {
+        hash_alg: CKM_SHA256,
+        mgf: CKG_MGF1_SHA256,
+        source: CKZ_DATA_SPECIFIED,
+        p_source_data: label_b.as_mut_ptr() as CK_VOID_PTR,
+        source_data_len: label_b.len() as CK_ULONG,
+    };
+    let mut dec_mech = CK_MECHANISM {
+        mechanism: CKM_RSA_PKCS_OAEP,
+        p_parameter: &mut dec_params as *mut _ as CK_VOID_PTR,
+        parameter_len: std::mem::size_of::<CK_RSA_PKCS_OAEP_PARAMS>() as CK_ULONG,
+    };
+
+    let rv = C_DecryptInit(session, &mut dec_mech, priv_key);
+    assert_eq!(rv, CKR_OK);
+
+    let mut decrypted = vec![0u8; 256];
+    let mut dec_len: CK_ULONG = decrypted.len() as CK_ULONG;
+    let rv = C_Decrypt(
+        session,
+        ciphertext.as_ptr() as CK_BYTE_PTR,
+        ciphertext.len() as CK_ULONG,
+        decrypted.as_mut_ptr(),
+        &mut dec_len,
+    );
+    assert_eq!(
+        rv, CKR_ENCRYPTED_DATA_INVALID,
+        "Decryption with different label must fail with CKR_ENCRYPTED_DATA_INVALID"
+    );
+}
+
+// ============================================================================
+// 31. RSA-OAEP matching non-empty label roundtrips successfully
+// ============================================================================
+
+#[test]
+#[cfg_attr(
+    not(any(
+        debug_assertions,
+        feature = "insecure-rustcrypto-rsa-private-ops",
+        all(feature = "awslc-backend", not(feature = "rustcrypto-backend"))
+    )),
+    ignore = "needs a backend providing RSA private-key operations"
+)]
+fn test_rsa_oaep_matching_label_roundtrip() {
+    let session = setup_user_session();
+    let (pub_key, priv_key) = generate_rsa_keypair(session, 2048);
+    let plaintext = b"secret payload with custom label";
+
+    let mut label = b"my-custom-oaep-label".to_vec();
+    let mut enc_params = CK_RSA_PKCS_OAEP_PARAMS {
+        hash_alg: CKM_SHA256,
+        mgf: CKG_MGF1_SHA256,
+        source: CKZ_DATA_SPECIFIED,
+        p_source_data: label.as_mut_ptr() as CK_VOID_PTR,
+        source_data_len: label.len() as CK_ULONG,
+    };
+    let mut enc_mech = CK_MECHANISM {
+        mechanism: CKM_RSA_PKCS_OAEP,
+        p_parameter: &mut enc_params as *mut _ as CK_VOID_PTR,
+        parameter_len: std::mem::size_of::<CK_RSA_PKCS_OAEP_PARAMS>() as CK_ULONG,
+    };
+
+    let rv = C_EncryptInit(session, &mut enc_mech, pub_key);
+    assert_eq!(rv, CKR_OK);
+
+    let mut ciphertext = vec![0u8; 256];
+    let mut ct_len: CK_ULONG = ciphertext.len() as CK_ULONG;
+    let rv = C_Encrypt(
+        session,
+        plaintext.as_ptr() as CK_BYTE_PTR,
+        plaintext.len() as CK_ULONG,
+        ciphertext.as_mut_ptr(),
+        &mut ct_len,
+    );
+    assert_eq!(rv, CKR_OK);
+    ciphertext.truncate(ct_len as usize);
+
+    // Decrypt with the matching label
+    let mut dec_params = CK_RSA_PKCS_OAEP_PARAMS {
+        hash_alg: CKM_SHA256,
+        mgf: CKG_MGF1_SHA256,
+        source: CKZ_DATA_SPECIFIED,
+        p_source_data: label.as_mut_ptr() as CK_VOID_PTR,
+        source_data_len: label.len() as CK_ULONG,
+    };
+    let mut dec_mech = CK_MECHANISM {
+        mechanism: CKM_RSA_PKCS_OAEP,
+        p_parameter: &mut dec_params as *mut _ as CK_VOID_PTR,
+        parameter_len: std::mem::size_of::<CK_RSA_PKCS_OAEP_PARAMS>() as CK_ULONG,
+    };
+
+    let rv = C_DecryptInit(session, &mut dec_mech, priv_key);
+    assert_eq!(rv, CKR_OK);
+
+    let mut decrypted = vec![0u8; 256];
+    let mut dec_len: CK_ULONG = decrypted.len() as CK_ULONG;
+    let rv = C_Decrypt(
+        session,
+        ciphertext.as_ptr() as CK_BYTE_PTR,
+        ciphertext.len() as CK_ULONG,
+        decrypted.as_mut_ptr(),
+        &mut dec_len,
+    );
+    assert_eq!(rv, CKR_OK);
+    decrypted.truncate(dec_len as usize);
+    assert_eq!(&decrypted[..], plaintext);
 }

@@ -316,6 +316,7 @@ pub trait CryptoBackend: Send + Sync {
         public_exponent: &[u8],
         plaintext: &[u8],
         hash_alg: super::sign::OaepHash,
+        label: &[u8],
     ) -> HsmResult<Vec<u8>>;
 
     /// RSA-OAEP encrypt with handle hint.
@@ -328,8 +329,9 @@ pub trait CryptoBackend: Send + Sync {
         public_exponent: &[u8],
         plaintext: &[u8],
         hash_alg: super::sign::OaepHash,
+        label: &[u8],
     ) -> HsmResult<Vec<u8>> {
-        self.rsa_oaep_encrypt(modulus, public_exponent, plaintext, hash_alg)
+        self.rsa_oaep_encrypt(modulus, public_exponent, plaintext, hash_alg, label)
     }
 
     fn rsa_oaep_decrypt(
@@ -337,6 +339,7 @@ pub trait CryptoBackend: Send + Sync {
         private_key_der: &[u8],
         ciphertext: &[u8],
         hash_alg: super::sign::OaepHash,
+        label: &[u8],
     ) -> HsmResult<Vec<u8>>;
 
     /// RSA-OAEP decrypt with handle hint.
@@ -348,8 +351,9 @@ pub trait CryptoBackend: Send + Sync {
         private_key_der: &[u8],
         ciphertext: &[u8],
         hash_alg: super::sign::OaepHash,
+        label: &[u8],
     ) -> HsmResult<Vec<u8>> {
-        self.rsa_oaep_decrypt(private_key_der, ciphertext, hash_alg)
+        self.rsa_oaep_decrypt(private_key_der, ciphertext, hash_alg, label)
     }
 
     // ========================================================================

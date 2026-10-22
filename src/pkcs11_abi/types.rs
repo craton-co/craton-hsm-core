@@ -215,6 +215,23 @@ pub struct CK_GCM_PARAMS_V240 {
     pub tag_bits: CK_ULONG,
 }
 
+// --- CK_RSA_PKCS_OAEP_PARAMS ---
+
+pub type CK_RSA_PKCS_OAEP_MGF_TYPE = CK_ULONG;
+pub type CK_RSA_PKCS_OAEP_SOURCE_TYPE = CK_ULONG;
+
+#[cfg_attr(target_os = "windows", repr(C, packed))]
+#[cfg_attr(not(target_os = "windows"), repr(C))]
+#[derive(Debug, Clone, Copy)]
+pub struct CK_RSA_PKCS_OAEP_PARAMS {
+    pub hash_alg: CK_MECHANISM_TYPE,
+    pub mgf: CK_RSA_PKCS_OAEP_MGF_TYPE,
+    pub source: CK_RSA_PKCS_OAEP_SOURCE_TYPE,
+    pub p_source_data: CK_VOID_PTR,
+    pub source_data_len: CK_ULONG,
+}
+pub type CK_RSA_PKCS_OAEP_PARAMS_PTR = *mut CK_RSA_PKCS_OAEP_PARAMS;
+
 // --- CK_MECHANISM_INFO ---
 
 #[cfg_attr(target_os = "windows", repr(C, packed))]

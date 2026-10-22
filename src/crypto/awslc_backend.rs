@@ -622,6 +622,7 @@ impl CryptoBackend for AwsLcBackend {
         public_exponent: &[u8],
         plaintext: &[u8],
         hash_alg: OaepHash,
+        label: &[u8],
     ) -> HsmResult<Vec<u8>> {
         let oaep_alg = oaep_hash_to_algorithm(&hash_alg);
         let components = awslc_rsa::PublicKeyComponents {
@@ -635,8 +636,9 @@ impl CryptoBackend for AwsLcBackend {
             .map_err(|_| HsmError::GeneralError)?;
 
         let mut ciphertext = vec![0u8; oaep_key.ciphertext_size()];
+        let label_opt = (!label.is_empty()).then_some(label);
         let result = oaep_key
-            .encrypt(oaep_alg, plaintext, &mut ciphertext, None)
+            .encrypt(oaep_alg, plaintext, &mut ciphertext, label_opt)
             .map_err(|_| HsmError::GeneralError)?;
         Ok(result.to_vec())
     }
@@ -646,6 +648,7 @@ impl CryptoBackend for AwsLcBackend {
         private_key_der: &[u8],
         ciphertext: &[u8],
         hash_alg: OaepHash,
+        label: &[u8],
     ) -> HsmResult<Vec<u8>> {
         let oaep_alg = oaep_hash_to_algorithm(&hash_alg);
         let priv_key = awslc_rsa::PrivateDecryptingKey::from_pkcs8(private_key_der)
@@ -654,8 +657,9 @@ impl CryptoBackend for AwsLcBackend {
             .map_err(|_| HsmError::GeneralError)?;
 
         let mut plaintext = vec![0u8; ciphertext.len()];
+        let label_opt = (!label.is_empty()).then_some(label);
         let result = oaep_key
-            .decrypt(oaep_alg, ciphertext, &mut plaintext, None)
+            .decrypt(oaep_alg, ciphertext, &mut plaintext, label_opt)
             .map_err(|_| HsmError::EncryptedDataInvalid)?;
         Ok(result.to_vec())
     }

@@ -281,7 +281,7 @@ fn fuzz_rsa_oaep_roundtrip(data: &[u8]) {
     let plaintext = &remaining[1 + exp_len..];
 
     // Random modulus/exponent — should error, not panic
-    let _ = sign::rsa_oaep_encrypt(modulus, exponent, plaintext, hash_alg);
+    let _ = sign::rsa_oaep_encrypt(modulus, exponent, plaintext, hash_alg, &[]);
 }
 
 /// RSA-OAEP decrypt with random DER key and random ciphertext.
@@ -303,5 +303,5 @@ fn fuzz_rsa_oaep_decrypt_random(data: &[u8]) {
         random_der
     };
 
-    let _ = sign::rsa_oaep_decrypt(random_der, ciphertext, hash_alg);
+    let _ = sign::rsa_oaep_decrypt(random_der, ciphertext, hash_alg, &[]);
 }

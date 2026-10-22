@@ -1676,6 +1676,7 @@ impl HsmService for HsmServiceImpl {
                         pub_exp,
                         &req.data,
                         craton_hsm::crypto::sign::OaepHash::Sha256,
+                        &[],
                     )
                     .map_err(hsm_err_to_status)?
                 }
@@ -1795,6 +1796,7 @@ impl HsmService for HsmServiceImpl {
                         key_bytes,
                         &req.encrypted_data,
                         craton_hsm::crypto::sign::OaepHash::Sha256,
+                        &[],
                     )
                     .map_err(hsm_err_to_status)?
                 }
