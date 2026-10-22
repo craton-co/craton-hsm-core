@@ -1437,7 +1437,10 @@ fn test_rsa_oaep_mismatched_mgf_refused() {
     };
 
     let rv = C_EncryptInit(session, &mut mech, pub_key);
-    assert_eq!(rv, CKR_MECHANISM_PARAM_INVALID, "Mismatched MGF must be refused");
+    assert_eq!(
+        rv, CKR_MECHANISM_PARAM_INVALID,
+        "Mismatched MGF must be refused"
+    );
 }
 
 // ============================================================================

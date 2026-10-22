@@ -335,7 +335,10 @@ impl ObjectStore {
             && obj.extra_attributes.contains_key(&CKA_PRIVATE_EXPONENT)
         {
             let modulus = obj.modulus.as_ref().ok_or(HsmError::TemplateInconsistent)?;
-            let pub_exp = obj.public_exponent.as_ref().ok_or(HsmError::TemplateInconsistent)?;
+            let pub_exp = obj
+                .public_exponent
+                .as_ref()
+                .ok_or(HsmError::TemplateInconsistent)?;
             let priv_exp = obj
                 .extra_attributes
                 .get(&CKA_PRIVATE_EXPONENT)
@@ -1007,14 +1010,14 @@ impl Drop for ZeroizingObjects {
 mod tests {
     use super::*;
 
-
     #[test]
     fn rsa_private_components_sensitivity() {
         let mut obj = StoredObject::new(1, CKO_PRIVATE_KEY);
         obj.key_type = Some(CKK_RSA);
         obj.sensitive = true;
         obj.extractable = false;
-        obj.extra_attributes.insert(CKA_PRIVATE_EXPONENT, vec![1, 2, 3]);
+        obj.extra_attributes
+            .insert(CKA_PRIVATE_EXPONENT, vec![1, 2, 3]);
         obj.extra_attributes.insert(CKA_PRIME_1, vec![4, 5, 6]);
 
         // Sensitive and non-extractable: returns AttributeSensitive
@@ -1049,9 +1052,9 @@ mod tests {
 
     #[test]
     fn rsa_private_key_created_from_components_has_key_material() {
+        use crate::crypto::drbg::DrbgRng;
         use rsa::traits::{PrivateKeyParts, PublicKeyParts};
         use rsa::RsaPrivateKey;
-        use crate::crypto::drbg::DrbgRng;
 
         let mut rng = DrbgRng::new().unwrap();
         let priv_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
@@ -1073,15 +1076,33 @@ mod tests {
             (CKA_DECRYPT, vec![CK_TRUE]),
         ];
 
-        let handle = store.create_object(&template).expect("create_object should succeed");
+        let handle = store
+            .create_object(&template)
+            .expect("create_object should succeed");
         let obj = store.get_object(handle).unwrap();
         let obj = obj.read();
-        assert!(obj.key_material.is_some(), "key_material must be populated from components");
+        assert!(
+            obj.key_material.is_some(),
+            "key_material must be populated from components"
+        );
 
         let priv_der = obj.key_material.as_ref().unwrap().as_bytes();
         let pt = b"RSA discrete component decryption test";
-        let ct = crate::crypto::sign::rsa_oaep_encrypt(&n, &e, pt, crate::crypto::sign::OaepHash::Sha256, &[]).unwrap();
-        let recovered = crate::crypto::sign::rsa_oaep_decrypt(priv_der, &ct, crate::crypto::sign::OaepHash::Sha256, &[]).unwrap();
+        let ct = crate::crypto::sign::rsa_oaep_encrypt(
+            &n,
+            &e,
+            pt,
+            crate::crypto::sign::OaepHash::Sha256,
+            &[],
+        )
+        .unwrap();
+        let recovered = crate::crypto::sign::rsa_oaep_decrypt(
+            priv_der,
+            &ct,
+            crate::crypto::sign::OaepHash::Sha256,
+            &[],
+        )
+        .unwrap();
         assert_eq!(&recovered, pt);
     }
 }

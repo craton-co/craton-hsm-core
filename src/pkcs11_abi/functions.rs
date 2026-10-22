@@ -228,7 +228,8 @@ fn parse_oaep_params(p_mechanism: CK_MECHANISM_PTR) -> Result<Vec<u8>, CK_RV> {
     }
     let param_len = mech.parameter_len as usize;
     if param_len == std::mem::size_of::<CK_RSA_PKCS_OAEP_PARAMS>() {
-        let p = unsafe { std::ptr::read_unaligned(mech.p_parameter as *const CK_RSA_PKCS_OAEP_PARAMS) };
+        let p =
+            unsafe { std::ptr::read_unaligned(mech.p_parameter as *const CK_RSA_PKCS_OAEP_PARAMS) };
         let hash_alg = p.hash_alg;
         let mgf = p.mgf;
         let source = p.source;
@@ -275,7 +276,14 @@ fn parse_oaep_params(p_mechanism: CK_MECHANISM_PTR) -> Result<Vec<u8>, CK_RV> {
         Ok(encoded)
     } else if param_len >= std::mem::size_of::<CK_ULONG>() {
         let hash_mech = CK_ULONG::from_ne_bytes(
-            match unsafe { slice::from_raw_parts(mech.p_parameter as *const u8, std::mem::size_of::<CK_ULONG>()) }.try_into() {
+            match unsafe {
+                slice::from_raw_parts(
+                    mech.p_parameter as *const u8,
+                    std::mem::size_of::<CK_ULONG>(),
+                )
+            }
+            .try_into()
+            {
                 Ok(b) => b,
                 Err(_) => return Err(CKR_MECHANISM_PARAM_INVALID),
             },
