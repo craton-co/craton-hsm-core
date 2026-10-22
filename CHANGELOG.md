@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.10.5] - 2026-10-22
+
+### Fixed
+
+- **Honour label and validate MGF in RSA-OAEP encryption and decryption**: RSA-OAEP
+  encryption and decryption now correctly forward and process OAEP labels and validate
+  mask generation functions (MGF1).
+- **Construct RSA private key from discrete components in `C_CreateObject`**: construct
+  valid RSA private key material from discrete modulus and exponent attributes when creating objects.
+- **Prevent leaking RSA private key components in `C_GetAttributeValue`**: protect sensitive
+  RSA private key attributes from unauthorized extraction via `C_GetAttributeValue`.
+- **Security audit fix**: upgraded `rustls-webpki` to `0.103.16` resolving `RUSTSEC-2026-0382`.
+
 ## [0.10.4] - 2026-10-18
 
 ### Fixed

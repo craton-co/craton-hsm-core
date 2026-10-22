@@ -420,7 +420,14 @@ impl CryptoBackend for RustCryptoBackend {
         hash_alg: super::sign::OaepHash,
         label: &[u8],
     ) -> HsmResult<Vec<u8>> {
-        super::sign::rsa_oaep_decrypt_cached(slot_id, handle, private_key_der, ciphertext, hash_alg, label)
+        super::sign::rsa_oaep_decrypt_cached(
+            slot_id,
+            handle,
+            private_key_der,
+            ciphertext,
+            hash_alg,
+            label,
+        )
     }
 
     // ========================================================================

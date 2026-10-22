@@ -1585,9 +1585,16 @@ mod tests {
         let _lock = CACHE_TEST_LOCK.lock().unwrap();
         let (slot, handle) = unique_ids();
         let (priv_der, modulus, pub_exp) = fresh_rsa_keypair();
-        let ct =
-            rsa_oaep_encrypt_cached(slot, handle, &modulus, &pub_exp, b"test", OaepHash::Sha256, &[])
-                .expect("encrypt");
+        let ct = rsa_oaep_encrypt_cached(
+            slot,
+            handle,
+            &modulus,
+            &pub_exp,
+            b"test",
+            OaepHash::Sha256,
+            &[],
+        )
+        .expect("encrypt");
 
         // Pre-condition: cache miss for private key
         assert!(get_cached_rsa_private_key(slot, handle).is_none());
@@ -1653,9 +1660,16 @@ mod tests {
         let (priv_der, modulus, pub_exp) = fresh_rsa_keypair();
 
         assert!(get_cached_rsa_public_key(slot, handle).is_none());
-        let ct =
-            rsa_oaep_encrypt_cached(slot, handle, &modulus, &pub_exp, b"hello", OaepHash::Sha256, &[])
-                .expect("encrypt");
+        let ct = rsa_oaep_encrypt_cached(
+            slot,
+            handle,
+            &modulus,
+            &pub_exp,
+            b"hello",
+            OaepHash::Sha256,
+            &[],
+        )
+        .expect("encrypt");
         assert!(
             get_cached_rsa_public_key(slot, handle).is_some(),
             "rsa_oaep_encrypt_cached should populate the public-key handle cache"
@@ -1723,10 +1737,26 @@ mod tests {
             .unwrap();
 
         // Populate public-key cache for both slots via OAEP encrypt.
-        let _ = rsa_oaep_encrypt_cached(slot_a, handle_a, &mod_a, &exp_a, b"x", OaepHash::Sha256, &[])
-            .unwrap();
-        let _ = rsa_oaep_encrypt_cached(slot_b, handle_b, &mod_b, &exp_b, b"x", OaepHash::Sha256, &[])
-            .unwrap();
+        let _ = rsa_oaep_encrypt_cached(
+            slot_a,
+            handle_a,
+            &mod_a,
+            &exp_a,
+            b"x",
+            OaepHash::Sha256,
+            &[],
+        )
+        .unwrap();
+        let _ = rsa_oaep_encrypt_cached(
+            slot_b,
+            handle_b,
+            &mod_b,
+            &exp_b,
+            b"x",
+            OaepHash::Sha256,
+            &[],
+        )
+        .unwrap();
 
         assert!(get_cached_rsa_private_key(slot_a, handle_a).is_some());
         assert!(get_cached_rsa_public_key(slot_a, handle_a).is_some());
@@ -1775,8 +1805,16 @@ mod tests {
             .unwrap();
         let _ = rsa_pkcs1v15_sign_cached(slot_b, handle_b, &der_b, b"x", Some(HashAlg::Sha256))
             .unwrap();
-        let _ = rsa_oaep_encrypt_cached(slot_a, handle_a, &mod_a, &exp_a, b"x", OaepHash::Sha256, &[])
-            .unwrap();
+        let _ = rsa_oaep_encrypt_cached(
+            slot_a,
+            handle_a,
+            &mod_a,
+            &exp_a,
+            b"x",
+            OaepHash::Sha256,
+            &[],
+        )
+        .unwrap();
 
         assert!(get_cached_rsa_private_key(slot_a, handle_a).is_some());
         assert!(get_cached_rsa_private_key(slot_b, handle_b).is_some());
