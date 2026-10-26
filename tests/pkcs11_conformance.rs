@@ -2729,3 +2729,38 @@ fn test_edwards_key_pair_gen_mechanism() {
         CKR_CURVE_NOT_SUPPORTED
     );
 }
+
+
+/// Finding A1-25: C_CreateObject for CKK_EC with unsupported curve OID must return CKR_CURVE_NOT_SUPPORTED
+#[test]
+fn test_create_object_unsupported_ec_curve_rejected() {
+    let session = setup_user_session();
+    let mut class_val = CKO_PUBLIC_KEY;
+    let mut key_type_val = CKK_EC;
+    let mut bad_oid: [u8; 5] = [0x06, 0x03, 0x2B, 0x65, 0x71]; // Unsupported curve OID
+    let mut tpl = [
+        CK_ATTRIBUTE {
+            attr_type: CKA_CLASS,
+            p_value: &mut class_val as *mut _ as CK_VOID_PTR,
+            value_len: std::mem::size_of::<CK_ULONG>() as CK_ULONG,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_KEY_TYPE,
+            p_value: &mut key_type_val as *mut _ as CK_VOID_PTR,
+            value_len: std::mem::size_of::<CK_ULONG>() as CK_ULONG,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_EC_PARAMS,
+            p_value: bad_oid.as_mut_ptr() as CK_VOID_PTR,
+            value_len: bad_oid.len() as CK_ULONG,
+        },
+    ];
+    let mut obj_handle: CK_OBJECT_HANDLE = 0;
+    let rv = C_CreateObject(
+        session,
+        tpl.as_mut_ptr(),
+        tpl.len() as CK_ULONG,
+        &mut obj_handle,
+    );
+    assert_eq!(rv, CKR_CURVE_NOT_SUPPORTED);
+}

@@ -1460,6 +1460,23 @@ pub extern "C" fn C_CreateObject(
             Err(rv) => return rv,
         };
 
+        // EC keys must name a supported curve (A1-25): an unusable key is
+        // refused at creation instead of failing at first use.
+        if let Some((_, params)) = template.iter().find(|(t, _)| *t == CKA_EC_PARAMS) {
+            let is_ec = template.iter().any(|(t, v)| {
+                *t == CKA_KEY_TYPE
+                    && v.len() >= std::mem::size_of::<CK_ULONG>()
+                    && CK_ULONG::from_ne_bytes(
+                        v[..std::mem::size_of::<CK_ULONG>()]
+                            .try_into()
+                            .unwrap_or([0; std::mem::size_of::<CK_ULONG>()]),
+                    ) == CKK_EC
+            });
+            if is_ec && !is_p256_params(params) && !is_p384_params(params) {
+                return CKR_CURVE_NOT_SUPPORTED;
+            }
+        }
+
         // PKCS#11 §5.7.1: Creating private/secret key objects requires login.
         let is_key_object = template.iter().any(|(attr_type, value)| {
             *attr_type == CKA_CLASS && value.len() >= std::mem::size_of::<CK_ULONG>() && {
