@@ -562,6 +562,7 @@ pub fn rsa_oaep_encrypt(
 ) -> HsmResult<Vec<u8>> {
     use crate::crypto::drbg::DrbgRng;
 
+    validate_rsa_public_key_size(modulus)?;
     let n = rsa::BigUint::from_bytes_be(modulus);
     let e = rsa::BigUint::from_bytes_be(public_exponent);
     let public_key = RsaPublicKey::new(n, e).map_err(|_| HsmError::KeyHandleInvalid)?;
@@ -1498,6 +1499,17 @@ mod tests {
     }
 
     static CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn rsa_oaep_encrypt_rejects_undersized_modulus() {
+        // 1024-bit modulus (top bit set) is below RSA_MIN_MODULUS_BITS.
+        let mut modulus = vec![0xC5u8; 128];
+        modulus[127] |= 1;
+        assert!(matches!(
+            rsa_oaep_encrypt(&modulus, &[1, 0, 1], b"x", OaepHash::Sha256, &[]),
+            Err(HsmError::KeySizeRange)
+        ));
+    }
 
     #[test]
     #[cfg_attr(
