@@ -353,6 +353,7 @@ impl ObjectStore {
                 .ok_or(HsmError::TemplateInconsistent)?;
 
             use rsa::pkcs8::EncodePrivateKey;
+            use rsa::traits::PublicKeyParts;
             use rsa::{BigUint, RsaPrivateKey};
 
             let n = BigUint::from_bytes_be(modulus);
@@ -373,7 +374,7 @@ impl ObjectStore {
 
             obj.key_material = Some(RawKeyMaterial::new(der.as_bytes().to_vec()));
             if obj.modulus_bits.is_none() {
-                obj.modulus_bits = Some((modulus.len() * 8) as CK_ULONG);
+                obj.modulus_bits = Some(private_key.n().bits() as CK_ULONG);
             }
         }
 
