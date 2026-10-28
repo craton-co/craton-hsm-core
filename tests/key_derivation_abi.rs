@@ -1173,6 +1173,11 @@ fn generate_exportable_ec_keypair(
             p_value: &ck_false as *const _ as CK_VOID_PTR,
             value_len: 1,
         },
+        CK_ATTRIBUTE {
+            attr_type: CKA_EXTRACTABLE,
+            p_value: &ck_true as *const _ as CK_VOID_PTR,
+            value_len: 1,
+        },
     ];
     let mut pub_key: CK_OBJECT_HANDLE = 0;
     let mut priv_key: CK_OBJECT_HANDLE = 0;
@@ -1211,7 +1216,7 @@ fn read_attr(
 }
 
 /// C_DeriveKey with a standard CK_ECDH1_DERIVE_PARAMS. The derived AES key
-/// is non-sensitive when the base key is, so its value can be read back.
+/// is non-sensitive and extractable, so its value can be read back.
 fn derive_with_params(
     session: CK_SESSION_HANDLE,
     base_key: CK_OBJECT_HANDLE,
@@ -1241,6 +1246,7 @@ fn derive_with_params(
         parameter_len: std::mem::size_of::<CK_ECDH1_DERIVE_PARAMS>() as CK_ULONG,
     };
     let ck_false: CK_BBOOL = CK_FALSE;
+    let ck_true: CK_BBOOL = CK_TRUE;
     let key_len_bytes = ck_ulong_bytes(key_len);
     let class_bytes = ck_ulong_bytes(CKO_SECRET_KEY);
     let key_type_bytes = ck_ulong_bytes(CKK_AES);
@@ -1263,6 +1269,11 @@ fn derive_with_params(
         CK_ATTRIBUTE {
             attr_type: CKA_SENSITIVE,
             p_value: &ck_false as *const _ as CK_VOID_PTR,
+            value_len: 1,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_EXTRACTABLE,
+            p_value: &ck_true as *const _ as CK_VOID_PTR,
             value_len: 1,
         },
     ];
