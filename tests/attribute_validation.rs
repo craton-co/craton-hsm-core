@@ -31,14 +31,16 @@ fn test_sensitive_non_extractable_blocks_value_read() {
 }
 
 #[test]
-fn test_sensitive_extractable_allows_value_read() {
+fn test_sensitive_extractable_blocks_value_read() {
+    // PKCS#11 v3.0 §4.10: CKA_SENSITIVE alone blocks the plaintext read;
+    // CKA_EXTRACTABLE only governs export by wrapping.
     let mut obj = StoredObject::new(1, CKO_SECRET_KEY);
     obj.sensitive = true;
     obj.extractable = true;
     obj.key_material = Some(RawKeyMaterial::new(vec![0xBB; 32]));
 
-    let result = read_attribute(&obj, CKA_VALUE, true).unwrap();
-    assert_eq!(result, Some(vec![0xBB; 32]));
+    let result = read_attribute(&obj, CKA_VALUE, true);
+    assert!(matches!(result, Err(HsmError::AttributeSensitive)));
 }
 
 #[test]
@@ -53,15 +55,16 @@ fn test_non_sensitive_allows_value_read() {
 }
 
 #[test]
-fn test_non_sensitive_non_extractable_allows_value_read() {
-    // Per PKCS#11: CKA_SENSITIVE is the primary guard, EXTRACTABLE gates wrap/export
+fn test_non_sensitive_non_extractable_blocks_value_read() {
+    // PKCS#11 v3.0 §4.10: the value cannot be revealed if CKA_SENSITIVE is
+    // true or CKA_EXTRACTABLE is false.
     let mut obj = StoredObject::new(1, CKO_SECRET_KEY);
     obj.sensitive = false;
     obj.extractable = false;
     obj.key_material = Some(RawKeyMaterial::new(vec![0xDD; 32]));
 
-    let result = read_attribute(&obj, CKA_VALUE, true).unwrap();
-    assert_eq!(result, Some(vec![0xDD; 32]));
+    let result = read_attribute(&obj, CKA_VALUE, true);
+    assert!(matches!(result, Err(HsmError::AttributeSensitive)));
 }
 
 // ============================================================================

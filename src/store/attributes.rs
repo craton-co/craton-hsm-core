@@ -840,8 +840,9 @@ pub fn modify_attribute(
 /// - `Err(HsmError::ObjectHandleInvalid)` if the object is private and the
 ///   caller is not logged in (the spec-mandated response — the object should
 ///   appear not to exist).
-/// - `Err(HsmError::AttributeSensitive)` if reading `CKA_VALUE` on a
-///   sensitive, non-extractable object.
+/// - `Err(HsmError::AttributeSensitive)` if reading `CKA_VALUE` (or a
+///   private-key component) of a secret or private key that is sensitive or
+///   non-extractable.
 /// - `Ok(None)` if the attribute is unknown / not present on the object.
 pub fn read_attribute(
     obj: &StoredObject,
@@ -878,13 +879,13 @@ pub fn read_attribute(
         CKA_UNWRAP => Ok(Some(vec![if obj.can_unwrap { 1 } else { 0 }])),
         CKA_DERIVE => Ok(Some(vec![if obj.can_derive { 1 } else { 0 }])),
         CKA_VALUE => {
-            // CKA_VALUE access policy (applies to secret/private keys; data,
-            // certificate, and public key objects have non-sensitive CKA_VALUE
-            // per PKCS#11 v3.0 §4.5–4.7):
-            // - sensitive=true AND extractable=false → block (key is fully protected)
-            // - sensitive=true AND extractable=true  → allow (key is exportable)
-            // - sensitive=false → always allow (regardless of extractable)
-            if crate::store::object::is_secret_class(obj.class) && obj.sensitive && !obj.extractable
+            // CKA_VALUE of a secret or private key cannot be revealed in
+            // plaintext if CKA_SENSITIVE is true or CKA_EXTRACTABLE is false
+            // (PKCS#11 v3.0 §4.9, §4.10). CKA_EXTRACTABLE only governs export
+            // by wrapping. Data, certificate, and public key objects have
+            // non-sensitive CKA_VALUE per PKCS#11 v3.0 §4.5–4.7.
+            if crate::store::object::is_secret_class(obj.class)
+                && (obj.sensitive || !obj.extractable)
             {
                 return Err(HsmError::AttributeSensitive);
             }
@@ -1049,6 +1050,49 @@ mod tests {
             read_attribute(&obj, CKA_PRIME_1, true).unwrap(),
             Some(vec![4, 5, 6])
         );
+    }
+
+    #[test]
+    fn secret_and_private_key_value_sensitivity() {
+        // (class, key type) pairs whose CKA_VALUE is secret key material:
+        // an AES secret key and an EC private key (the private scalar).
+        for (class, key_type) in [(CKO_SECRET_KEY, CKK_AES), (CKO_PRIVATE_KEY, CKK_EC)] {
+            for (sensitive, extractable) in
+                [(true, false), (true, true), (false, false), (false, true)]
+            {
+                let mut obj = StoredObject::new(1, class);
+                obj.key_type = Some(key_type);
+                obj.key_material = Some(RawKeyMaterial::new(vec![7u8; 32]));
+                obj.sensitive = sensitive;
+                obj.extractable = extractable;
+
+                let result = read_attribute(&obj, CKA_VALUE, true);
+                if sensitive || !extractable {
+                    assert!(
+                        matches!(result, Err(HsmError::AttributeSensitive)),
+                        "class {class:#x} sensitive={sensitive} extractable={extractable}                          must not reveal CKA_VALUE"
+                    );
+                } else {
+                    assert_eq!(result.unwrap(), Some(vec![7u8; 32]));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn key_made_sensitive_later_hides_value() {
+        let mut obj = StoredObject::new(1, CKO_SECRET_KEY);
+        obj.key_type = Some(CKK_AES);
+        obj.key_material = Some(RawKeyMaterial::new(vec![9u8; 16]));
+        obj.sensitive = false;
+        obj.extractable = true;
+        assert!(read_attribute(&obj, CKA_VALUE, true).unwrap().is_some());
+
+        obj.sensitive = true;
+        assert!(matches!(
+            read_attribute(&obj, CKA_VALUE, true),
+            Err(HsmError::AttributeSensitive)
+        ));
     }
 
     #[test]
