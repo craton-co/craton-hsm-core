@@ -350,3 +350,73 @@ fn test_gcm_without_params_keeps_legacy_layout() {
         plaintext
     );
 }
+
+/// PKCS#11 v3.0 §5.2: a single-part C_Encrypt that returns
+/// CKR_BUFFER_TOO_SMALL leaves the operation active, and the caller may
+/// retry with a buffer of the reported length. The undersized call must not
+/// consume the IV, or the retry is rejected as an IV reuse.
+#[test]
+fn test_encrypt_retry_after_buffer_too_small() {
+    let session = setup_session();
+    let plaintext = [0x5Au8; 32];
+
+    let cases: [(CK_MECHANISM_TYPE, usize); 4] = [
+        (CKM_AES_GCM, 48),
+        (CKM_AES_CBC_PAD, 48),
+        (CKM_AES_CBC, 32),
+        (CKM_AES_CTR, 32),
+    ];
+    for (i, (mechanism, expected_len)) in cases.into_iter().enumerate() {
+        let key = create_aes_key(session, &[0x60 + i as u8; 32]);
+        let mut iv = [0u8; 16];
+        assert_eq!(C_GenerateRandom(session, iv.as_mut_ptr(), 16), CKR_OK);
+        let mut params = gcm_params(&iv[..12], &[], 128);
+        let mut mech = if mechanism == CKM_AES_GCM {
+            gcm_mechanism(&mut params)
+        } else {
+            CK_MECHANISM {
+                mechanism,
+                p_parameter: iv.as_mut_ptr() as CK_VOID_PTR,
+                parameter_len: iv.len() as CK_ULONG,
+            }
+        };
+        assert_eq!(C_EncryptInit(session, &mut mech, key), CKR_OK);
+
+        let mut out = vec![0u8; 64];
+        let mut len: CK_ULONG = 1;
+        let rv = C_Encrypt(
+            session,
+            plaintext.as_ptr() as *mut _,
+            plaintext.len() as CK_ULONG,
+            out.as_mut_ptr(),
+            &mut len,
+        );
+        assert_eq!(rv, CKR_BUFFER_TOO_SMALL, "mechanism {mechanism:#x}");
+        assert_eq!(len as usize, expected_len, "mechanism {mechanism:#x}");
+
+        let rv = C_Encrypt(
+            session,
+            plaintext.as_ptr() as *mut _,
+            plaintext.len() as CK_ULONG,
+            out.as_mut_ptr(),
+            &mut len,
+        );
+        assert_eq!(rv, CKR_OK, "retry for mechanism {mechanism:#x}");
+        assert_eq!(len as usize, expected_len, "mechanism {mechanism:#x}");
+        out.truncate(len as usize);
+
+        // The ciphertext decrypts back under the same parameters.
+        let mut params = gcm_params(&iv[..12], &[], 128);
+        let mut mech = if mechanism == CKM_AES_GCM {
+            gcm_mechanism(&mut params)
+        } else {
+            CK_MECHANISM {
+                mechanism,
+                p_parameter: iv.as_mut_ptr() as CK_VOID_PTR,
+                parameter_len: iv.len() as CK_ULONG,
+            }
+        };
+        let decrypted = decrypt(session, &mut mech, key, &out).unwrap();
+        assert_eq!(decrypted, plaintext, "mechanism {mechanism:#x}");
+    }
+}
