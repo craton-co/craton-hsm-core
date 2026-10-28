@@ -2097,43 +2097,51 @@ pub extern "C" fn C_Encrypt(
             return CKR_KEY_HANDLE_INVALID;
         }
 
-        // Length query: estimate output size WITHOUT performing the actual
-        // encryption, preserving the operation state for the real call.
-        // This avoids consuming AES-GCM nonces and keeps the two-call idiom sound.
-        if p_encrypted_data.is_null() {
-            let estimated = match mechanism {
-                // CK_GCM_PARAMS: ciphertext || tag.
-                CKM_AES_GCM if !mech_param.is_empty() => data.len() + GCM_TAG_LEN,
-                // Legacy: nonce (12) || ciphertext (= plaintext len) || tag (16).
-                CKM_AES_GCM => data.len() + GCM_IV_LEN + GCM_TAG_LEN,
-                CKM_AES_CBC => {
-                    if data.is_empty() || !data.len().is_multiple_of(16) {
-                        sess.active_operation = None;
-                        return CKR_DATA_LEN_RANGE;
-                    }
-                    data.len()
-                }
-                CKM_AES_CBC_PAD => (data.len() / 16 + 1) * 16,
-                CKM_AES_CTR => data.len(),
-                CKM_RSA_PKCS_OAEP => {
-                    // RSA-OAEP output = modulus size in bytes
-                    match &obj.modulus {
-                        Some(m) => m.len(),
-                        None => {
-                            sess.active_operation = None;
-                            return CKR_KEY_HANDLE_INVALID;
-                        }
-                    }
-                }
-                _ => {
+        // Compute the output size WITHOUT performing the actual encryption,
+        // so a length query (NULL buffer) or an undersized buffer leaves the
+        // operation state intact for the real call. Encrypting first would
+        // record the caller's IV in the reuse tracker and reject the retry
+        // that PKCS#11 v3.0 §5.2 allows after CKR_BUFFER_TOO_SMALL.
+        let estimated = match mechanism {
+            // CK_GCM_PARAMS: ciphertext || tag.
+            CKM_AES_GCM if !mech_param.is_empty() => data.len() + GCM_TAG_LEN,
+            // Legacy: nonce (12) || ciphertext (= plaintext len) || tag (16).
+            CKM_AES_GCM => data.len() + GCM_IV_LEN + GCM_TAG_LEN,
+            CKM_AES_CBC => {
+                if data.is_empty() || !data.len().is_multiple_of(16) {
                     sess.active_operation = None;
-                    return CKR_MECHANISM_INVALID;
+                    return CKR_DATA_LEN_RANGE;
                 }
-            };
+                data.len()
+            }
+            CKM_AES_CBC_PAD => (data.len() / 16 + 1) * 16,
+            CKM_AES_CTR => data.len(),
+            CKM_RSA_PKCS_OAEP => {
+                // RSA-OAEP output = modulus size in bytes
+                match &obj.modulus {
+                    Some(m) => m.len(),
+                    None => {
+                        sess.active_operation = None;
+                        return CKR_KEY_HANDLE_INVALID;
+                    }
+                }
+            }
+            _ => {
+                sess.active_operation = None;
+                return CKR_MECHANISM_INVALID;
+            }
+        };
+        if p_encrypted_data.is_null() {
             unsafe {
                 *pul_encrypted_data_len = estimated as CK_ULONG;
             }
             return CKR_OK;
+        }
+        if (unsafe { *pul_encrypted_data_len } as usize) < estimated {
+            unsafe {
+                *pul_encrypted_data_len = estimated as CK_ULONG;
+            }
+            return CKR_BUFFER_TOO_SMALL;
         }
 
         let result = match mechanism {
