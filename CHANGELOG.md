@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.10.6] - 2026-10-29
+
+### Fixed
+
+- **Refuse EC key creation with unsupported curves (A1-25)**: `C_CreateObject` for `CKK_EC`
+  keys with unsupported curve parameters now immediately returns `CKR_CURVE_NOT_SUPPORTED`.
+- **Pre-check output buffer size in single-shot `C_Encrypt`**: verify `*pulDataLen` before
+  encrypting so the operation remains active and retryable upon `CKR_BUFFER_TOO_SMALL`.
+- **Drop `DashMap` iterator before eviction in RSA key cache**: release the shard reference
+  prior to removal to prevent potential cache eviction deadlock.
+- **Protect plaintext `CKA_VALUE` of sensitive/non-extractable keys**: refuse setting or retrieving
+  unwrapped `CKA_VALUE` on sensitive or non-extractable secret and private key objects.
+- **Derive `CKA_MODULUS_BITS` from significant bits for component-imported RSA keys**: calculate
+  modulus bit length stripping leading zero padding bytes.
+- **Enforce minimum modulus size in RSA-OAEP encryption**: reject undersized RSA keys in OAEP mode.
+- **Security audit updates**: upgraded `ctutils` to 0.4.7 (resolving `RUSTSEC-2026-0385`) and
+  `pulldown-cmark` to 0.13.5 (resolving `RUSTSEC-2026-0414`); tracked `RUSTSEC-2026-0387` in cargo deny/audit.
+
 ## [0.10.5] - 2026-10-22
 
 ### Fixed

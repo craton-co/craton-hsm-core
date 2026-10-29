@@ -34,6 +34,11 @@ ignore = [
     { id = "RUSTSEC-2026-0098", reason = "daemon TLS dep (rustls-webpki); update pending" },
     { id = "RUSTSEC-2026-0099", reason = "daemon TLS dep (rustls-webpki); update pending" },
     { id = "RUSTSEC-2026-0104", reason = "daemon TLS dep (rustls-webpki); update pending" },
+
+    # crypto-bigint 0.5.5 constant-time timing variability. Classical RustCrypto
+    # stack (elliptic-curve 0.13, p256 0.13, p384 0.13, ecdsa 0.16) pins 0.5;
+    # upgrade to crypto-bigint >=0.7 is blocked pending trait ecosystem migration.
+    { id = "RUSTSEC-2026-0387", reason = "transitive via classical RustCrypto (elliptic-curve 0.13); upgrade blocked pending trait migration" },
 ]
 
 [licenses]
