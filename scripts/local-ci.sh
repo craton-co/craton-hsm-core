@@ -251,7 +251,8 @@ job_audit() {
             --ignore RUSTSEC-2026-0098 \
             --ignore RUSTSEC-2026-0099 \
             --ignore RUSTSEC-2026-0104 \
-            --ignore RUSTSEC-2025-0134 2>&1; then
+            --ignore RUSTSEC-2025-0134 \
+            --ignore RUSTSEC-2026-0387 2>&1; then
             echo -e "  ${GREEN}✓${NC} cargo-audit passed"
         else
             echo -e "  ${RED}✗${NC} cargo-audit failed"

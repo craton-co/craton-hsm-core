@@ -2730,7 +2730,6 @@ fn test_edwards_key_pair_gen_mechanism() {
     );
 }
 
-
 /// Finding A1-25: C_CreateObject for CKK_EC with unsupported curve OID must return CKR_CURVE_NOT_SUPPORTED
 #[test]
 fn test_create_object_unsupported_ec_curve_rejected() {

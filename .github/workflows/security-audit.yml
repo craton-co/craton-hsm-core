@@ -54,6 +54,7 @@ jobs:
         #   RUSTSEC-2026-009[8-9]: rustls-webpki — daemon TLS dep, update pending
         #   RUSTSEC-2026-0104: rustls-webpki — daemon TLS dep, update pending
         #   RUSTSEC-2025-0134: rustls-pemfile — daemon TLS dep, update pending
+        #   RUSTSEC-2026-0387: crypto-bigint — classical RustCrypto dep, upgrade pending trait migration
         run: >-
           cargo audit
           --ignore RUSTSEC-2023-0071
@@ -68,3 +69,4 @@ jobs:
           --ignore RUSTSEC-2026-0099
           --ignore RUSTSEC-2026-0104
           --ignore RUSTSEC-2025-0134
+          --ignore RUSTSEC-2026-0387
