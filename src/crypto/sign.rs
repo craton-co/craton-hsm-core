@@ -91,11 +91,16 @@ static RSA_PUB_CACHE: LazyLock<dashmap::DashMap<(u64, u64), Arc<RsaPublicKey>>> 
 /// Evict one arbitrary entry from a `DashMap` when it is at capacity.
 /// This avoids clearing the entire cache (thundering herd) while keeping
 /// the implementation simple (no LRU metadata overhead).
+///
+/// The key is copied out in a statement of its own so that the iterator, and
+/// the shard read guard it holds, is dropped before `remove` takes the write
+/// lock on that same shard. DashMap's locks are not reentrant: removing while
+/// the iterator is alive (e.g. inside `if let Some(e) = map.iter().next()`)
+/// deadlocks.
 fn evict_one_if_full<K: std::hash::Hash + Eq + Clone, V>(map: &dashmap::DashMap<K, V>) {
     if map.len() >= RSA_KEY_CACHE_MAX {
-        if let Some(entry) = map.iter().next() {
-            let key = entry.key().clone();
-            drop(entry); // release the read guard before removing
+        let key = map.iter().next().map(|entry| entry.key().clone());
+        if let Some(key) = key {
             map.remove(&key);
         }
     }
@@ -223,21 +228,11 @@ fn parse_rsa_private_key(der: &[u8]) -> HsmResult<RsaPrivateKey> {
     let private_key = RsaPrivateKey::from_pkcs8_der(der).map_err(|_| HsmError::KeyHandleInvalid)?;
 
     // Evict one arbitrary entry instead of clearing the whole cache.
-    evict_one_if_full_zeroizing(&RSA_KEY_CACHE);
+    // The removed `ZeroizingRsaKey` zeroizes itself on drop.
+    evict_one_if_full(&RSA_KEY_CACHE);
 
     RSA_KEY_CACHE.insert(cache_key, ZeroizingRsaKey::new(private_key.clone()));
     Ok(private_key)
-}
-
-/// Single-entry eviction for the ZeroizingRsaKey DER-hash cache.
-fn evict_one_if_full_zeroizing(map: &dashmap::DashMap<[u8; 32], ZeroizingRsaKey>) {
-    if map.len() >= RSA_KEY_CACHE_MAX {
-        if let Some(entry) = map.iter().next() {
-            let key = *entry.key();
-            drop(entry);
-            map.remove(&key);
-        }
-    }
 }
 
 /// Clear all RSA key caches. Called on C_Finalize / C_InitToken.
@@ -1499,6 +1494,24 @@ mod tests {
     }
 
     static CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn evict_one_if_full_does_not_deadlock() {
+        // Run on a separate thread so a regression fails instead of hanging.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let map = dashmap::DashMap::new();
+            for i in 0..(RSA_KEY_CACHE_MAX as u64 * 2) {
+                evict_one_if_full(&map);
+                map.insert(i, [0u8; 32]);
+            }
+            tx.send(map.len()).unwrap();
+        });
+        let len = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("evict_one_if_full deadlocked on a full cache");
+        assert_eq!(len, RSA_KEY_CACHE_MAX);
+    }
 
     #[test]
     fn rsa_oaep_encrypt_rejects_undersized_modulus() {
