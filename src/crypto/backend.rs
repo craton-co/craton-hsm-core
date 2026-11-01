@@ -138,6 +138,15 @@ pub trait CryptoBackend: Send + Sync {
         signature: &[u8],
     ) -> HsmResult<bool>;
 
+    fn ecdsa_p521_sign(&self, private_key_bytes: &[u8], data: &[u8]) -> HsmResult<Vec<u8>>;
+
+    fn ecdsa_p521_verify(
+        &self,
+        public_key_sec1: &[u8],
+        data: &[u8],
+        signature: &[u8],
+    ) -> HsmResult<bool>;
+
     fn ed25519_sign(&self, private_key_bytes: &[u8], data: &[u8]) -> HsmResult<Vec<u8>>;
 
     fn ed25519_verify(
@@ -259,6 +268,19 @@ pub trait CryptoBackend: Send + Sync {
     ) -> HsmResult<Vec<u8>>;
 
     fn ecdsa_p384_verify_prehashed(
+        &self,
+        public_key_sec1: &[u8],
+        digest: &[u8],
+        signature: &[u8],
+    ) -> HsmResult<bool>;
+
+    fn ecdsa_p521_sign_prehashed(
+        &self,
+        private_key_bytes: &[u8],
+        digest: &[u8],
+    ) -> HsmResult<Vec<u8>>;
+
+    fn ecdsa_p521_verify_prehashed(
         &self,
         public_key_sec1: &[u8],
         digest: &[u8],
@@ -392,6 +414,9 @@ pub trait CryptoBackend: Send + Sync {
     /// Returns (private_key_bytes, public_key_sec1_uncompressed)
     fn generate_ec_p384_key_pair(&self) -> HsmResult<(RawKeyMaterial, Vec<u8>)>;
 
+    /// Returns (private_key_bytes, public_key_sec1_uncompressed)
+    fn generate_ec_p521_key_pair(&self) -> HsmResult<(RawKeyMaterial, Vec<u8>)>;
+
     /// Returns (private_key_bytes, public_key_bytes)
     fn generate_ed25519_key_pair(&self) -> HsmResult<(RawKeyMaterial, Vec<u8>)>;
 
@@ -436,6 +461,12 @@ pub trait CryptoBackend: Send + Sync {
         peer_public_key_sec1: &[u8],
         okm_len: Option<usize>,
     ) -> HsmResult<RawKeyMaterial>;
+    fn ecdh_p521(
+        &self,
+        private_key_bytes: &[u8],
+        peer_public_key_sec1: &[u8],
+        okm_len: Option<usize>,
+    ) -> HsmResult<RawKeyMaterial>;
 
     /// Raw ECDH shared secret `Z` (the x-coordinate, field-size big-endian
     /// bytes) with no KDF applied. Used by the standard
@@ -447,6 +478,11 @@ pub trait CryptoBackend: Send + Sync {
         peer_public_key_sec1: &[u8],
     ) -> HsmResult<RawKeyMaterial>;
     fn ecdh_p384_shared_secret(
+        &self,
+        private_key_bytes: &[u8],
+        peer_public_key_sec1: &[u8],
+    ) -> HsmResult<RawKeyMaterial>;
+    fn ecdh_p521_shared_secret(
         &self,
         private_key_bytes: &[u8],
         peer_public_key_sec1: &[u8],

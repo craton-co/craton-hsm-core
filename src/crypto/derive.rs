@@ -6,6 +6,9 @@ use p256::SecretKey as P256SecretKey;
 use p384::ecdh::diffie_hellman as p384_dh;
 use p384::PublicKey as P384PublicKey;
 use p384::SecretKey as P384SecretKey;
+use p521::ecdh::diffie_hellman as p521_dh;
+use p521::PublicKey as P521PublicKey;
+use p521::SecretKey as P521SecretKey;
 use zeroize::Zeroizing;
 
 use crate::config::config::AlgorithmConfig;
@@ -18,7 +21,7 @@ use crate::store::key_material::RawKeyMaterial;
 
 /// Maximum HKDF-SHA256 output length (255 * 32 = 8160 bytes per RFC 5869).
 /// We cap at a practical limit well below this.
-const MAX_OKM_LEN: usize = 64;
+const MAX_OKM_LEN: usize = 128;
 
 /// ECDH key derivation for P-256.
 ///
@@ -120,6 +123,46 @@ pub fn ecdh_p384(
     Ok(RawKeyMaterial::new(okm))
 }
 
+/// ECDH key derivation for P-521.
+///
+/// `okm_len` specifies the desired derived key length in bytes. If `None`,
+/// defaults to 66 (matching P-521's field size / security level). Common values:
+/// - 16 for AES-128
+/// - 24 for AES-192
+/// - 32 for AES-256
+/// - 66 for full P-521 shared secret length
+pub fn ecdh_p521(
+    private_key_bytes: &[u8],
+    peer_public_key_sec1: &[u8],
+    okm_len: Option<usize>,
+) -> HsmResult<RawKeyMaterial> {
+    let derived_len = okm_len.unwrap_or(66);
+    validate_okm_len(derived_len)?;
+
+    let secret_key =
+        P521SecretKey::from_slice(private_key_bytes).map_err(|_| HsmError::KeyHandleInvalid)?;
+    let peer_public =
+        P521PublicKey::from_sec1_bytes(peer_public_key_sec1).map_err(|_| HsmError::ArgumentsBad)?;
+
+    let shared_secret = p521_dh(secret_key.to_nonzero_scalar(), peer_public.as_affine());
+
+    let raw_bytes = Zeroizing::new(shared_secret.raw_secret_bytes().to_vec());
+
+    let our_public = secret_key.public_key();
+    let our_pk_bytes = elliptic_curve::sec1::ToEncodedPoint::to_encoded_point(&our_public, false);
+    // OID 1.3.132.0.35 (P-521 / secp521r1) DER-encoded
+    const P521_OID: &[u8] = &[0x06, 0x05, 0x2B, 0x81, 0x04, 0x00, 0x23];
+    let mut info =
+        Vec::with_capacity(P521_OID.len() + 4 + our_pk_bytes.len() + peer_public_key_sec1.len());
+    info.extend_from_slice(P521_OID);
+    info.extend_from_slice(&(derived_len as u32).to_be_bytes());
+    info.extend_from_slice(our_pk_bytes.as_bytes());
+    info.extend_from_slice(peer_public_key_sec1);
+
+    let okm = apply_hkdf(&raw_bytes, &info, derived_len)?;
+    Ok(RawKeyMaterial::new(okm))
+}
+
 /// Raw ECDH shared secret `Z` for P-256 (32 bytes), with no KDF applied.
 pub fn ecdh_p256_shared_secret(
     private_key_bytes: &[u8],
@@ -145,6 +188,21 @@ pub fn ecdh_p384_shared_secret(
     let peer_public =
         P384PublicKey::from_sec1_bytes(peer_public_key_sec1).map_err(|_| HsmError::ArgumentsBad)?;
     let shared_secret = p384_dh(secret_key.to_nonzero_scalar(), peer_public.as_affine());
+    Ok(RawKeyMaterial::new(
+        shared_secret.raw_secret_bytes().to_vec(),
+    ))
+}
+
+/// Raw ECDH shared secret `Z` for P-521 (66 bytes), with no KDF applied.
+pub fn ecdh_p521_shared_secret(
+    private_key_bytes: &[u8],
+    peer_public_key_sec1: &[u8],
+) -> HsmResult<RawKeyMaterial> {
+    let secret_key =
+        P521SecretKey::from_slice(private_key_bytes).map_err(|_| HsmError::KeyHandleInvalid)?;
+    let peer_public =
+        P521PublicKey::from_sec1_bytes(peer_public_key_sec1).map_err(|_| HsmError::ArgumentsBad)?;
+    let shared_secret = p521_dh(secret_key.to_nonzero_scalar(), peer_public.as_affine());
     Ok(RawKeyMaterial::new(
         shared_secret.raw_secret_bytes().to_vec(),
     ))

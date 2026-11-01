@@ -922,6 +922,40 @@ pub fn ecdsa_p384_verify(public_key_sec1: &[u8], data: &[u8], signature: &[u8]) 
     Ok(verifying_key.verify(data, &sig).is_ok())
 }
 
+/// ECDSA P-521 sign (hedged — RFC 6979 + DRBG randomness)
+pub fn ecdsa_p521_sign(private_key_bytes: &[u8], data: &[u8]) -> HsmResult<Vec<u8>> {
+    use crate::crypto::drbg::DrbgRng;
+    use p521::ecdsa::signature::RandomizedSigner;
+    use p521::ecdsa::SigningKey;
+
+    validate_data_size(data)?;
+    let signing_key =
+        SigningKey::from_slice(private_key_bytes).map_err(|_| HsmError::KeyHandleInvalid)?;
+    let mut rng = DrbgRng::new()?;
+    let signature: p521::ecdsa::Signature = signing_key.sign_with_rng(&mut rng, data);
+    // PKCS#11 §2.3.1: ECDSA signature format is raw r || s (fixed-size, no ASN.1 DER).
+    // P-521: 132 bytes (66-byte r + 66-byte s).
+    Ok(signature.to_bytes().to_vec())
+}
+
+/// ECDSA P-521 verify
+pub fn ecdsa_p521_verify(public_key_sec1: &[u8], data: &[u8], signature: &[u8]) -> HsmResult<bool> {
+    use p521::ecdsa::signature::Verifier;
+    use p521::ecdsa::VerifyingKey;
+
+    validate_data_size(data)?;
+    // PKCS#11 §2.3.1: ECDSA signature format is raw r || s (fixed-size, no ASN.1 DER).
+    // P-521: exactly 132 bytes (66-byte r + 66-byte s).
+    if signature.len() != 132 {
+        return Err(HsmError::SignatureInvalid);
+    }
+    let verifying_key =
+        VerifyingKey::from_sec1_bytes(public_key_sec1).map_err(|_| HsmError::KeyHandleInvalid)?;
+    let sig =
+        p521::ecdsa::Signature::from_slice(signature).map_err(|_| HsmError::SignatureInvalid)?;
+    Ok(verifying_key.verify(data, &sig).is_ok())
+}
+
 // ============================================================================
 // Ed25519 EdDSA
 // ============================================================================
@@ -1448,6 +1482,50 @@ pub(crate) fn ecdsa_p384_verify_prehashed(
         VerifyingKey::from_sec1_bytes(public_key_sec1).map_err(|_| HsmError::KeyHandleInvalid)?;
     let sig =
         p384::ecdsa::Signature::from_slice(signature).map_err(|_| HsmError::SignatureInvalid)?;
+    Ok(verifying_key.verify_prehash(digest, &sig).is_ok())
+}
+
+/// ECDSA P-521 sign with a pre-computed digest (hedged).
+pub(crate) fn ecdsa_p521_sign_prehashed(
+    private_key_bytes: &[u8],
+    digest: &[u8],
+) -> HsmResult<Vec<u8>> {
+    use crate::crypto::drbg::DrbgRng;
+    use p521::ecdsa::signature::hazmat::RandomizedPrehashSigner;
+    use p521::ecdsa::SigningKey;
+
+    let signing_key =
+        SigningKey::from_slice(private_key_bytes).map_err(|_| HsmError::KeyHandleInvalid)?;
+    let mut rng = DrbgRng::new()?;
+    let signature: p521::ecdsa::Signature = signing_key
+        .sign_prehash_with_rng(&mut rng, digest)
+        .map_err(|_| HsmError::DataLenRange)?;
+    // PKCS#11 §2.3.1: ECDSA signature format is raw r || s (fixed-size, no ASN.1 DER).
+    // P-521: 132 bytes (66-byte r + 66-byte s).
+    Ok(signature.to_bytes().to_vec())
+}
+
+/// ECDSA P-521 verify with a pre-computed digest.
+pub(crate) fn ecdsa_p521_verify_prehashed(
+    public_key_sec1: &[u8],
+    digest: &[u8],
+    signature: &[u8],
+) -> HsmResult<bool> {
+    use p521::ecdsa::signature::hazmat::PrehashVerifier;
+    use p521::ecdsa::VerifyingKey;
+
+    if digest.len() < 24 {
+        return Err(HsmError::DataLenRange);
+    }
+    // PKCS#11 §2.3.1: ECDSA signature format is raw r || s (fixed-size, no ASN.1 DER).
+    // P-521: exactly 132 bytes (66-byte r + 66-byte s).
+    if signature.len() != 132 {
+        return Err(HsmError::SignatureInvalid);
+    }
+    let verifying_key =
+        VerifyingKey::from_sec1_bytes(public_key_sec1).map_err(|_| HsmError::KeyHandleInvalid)?;
+    let sig =
+        p521::ecdsa::Signature::from_slice(signature).map_err(|_| HsmError::SignatureInvalid)?;
     Ok(verifying_key.verify_prehash(digest, &sig).is_ok())
 }
 

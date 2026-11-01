@@ -114,6 +114,35 @@ pub fn ecdsa_p384_pairwise_test(
     Ok(())
 }
 
+/// ECDSA P-521 pairwise consistency test.
+pub fn ecdsa_p521_pairwise_test(
+    backend: &dyn CryptoBackend,
+    private_key: &RawKeyMaterial,
+    public_key: &[u8],
+) -> HsmResult<()> {
+    let signature = backend
+        .ecdsa_p521_sign(private_key.as_bytes(), PAIRWISE_TEST_DATA)
+        .map_err(|_| {
+            tracing::error!("ECDSA P-521 pairwise test: signing failed");
+            HsmError::GeneralError
+        })?;
+
+    let valid = backend
+        .ecdsa_p521_verify(public_key, PAIRWISE_TEST_DATA, &signature)
+        .map_err(|_| {
+            tracing::error!("ECDSA P-521 pairwise test: verification call failed");
+            HsmError::GeneralError
+        })?;
+
+    if !valid {
+        tracing::error!("ECDSA P-521 pairwise test: signature verification returned false");
+        return Err(HsmError::GeneralError);
+    }
+
+    tracing::debug!("ECDSA P-521 pairwise consistency test passed");
+    Ok(())
+}
+
 /// Ed25519 pairwise consistency test.
 pub fn ed25519_pairwise_test(
     backend: &dyn CryptoBackend,
