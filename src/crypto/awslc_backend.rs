@@ -218,6 +218,37 @@ impl CryptoBackend for AwsLcBackend {
         Ok(pub_key.verify(data, signature).is_ok())
     }
 
+    fn ecdsa_p521_sign(&self, private_key_bytes: &[u8], data: &[u8]) -> HsmResult<Vec<u8>> {
+        let pub_key = derive_ec_public_key(private_key_bytes, &agreement::ECDH_P521)?;
+        let key_pair = EcdsaKeyPair::from_private_key_and_public_key(
+            // PKCS#11 §2.3.1: ECDSA signature format is raw r || s (fixed-size, no ASN.1 DER).
+            // Use FIXED_SIGNING so aws-lc-rs emits 132-byte r || s directly.
+            &signature::ECDSA_P521_SHA512_FIXED_SIGNING,
+            private_key_bytes,
+            &pub_key,
+        )
+        .map_err(|_| HsmError::KeyHandleInvalid)?;
+
+        let rng = awslc_rand::SystemRandom::new();
+        let sig = key_pair
+            .sign(&rng, data)
+            .map_err(|_| HsmError::GeneralError)?;
+        Ok(sig.as_ref().to_vec())
+    }
+
+    fn ecdsa_p521_verify(
+        &self,
+        public_key_sec1: &[u8],
+        data: &[u8],
+        signature: &[u8],
+    ) -> HsmResult<bool> {
+        // PKCS#11 §2.3.1: ECDSA signature format is raw r || s (fixed-size, no ASN.1 DER).
+        // Use FIXED so aws-lc-rs accepts 132-byte r || s directly.
+        let pub_key =
+            signature::UnparsedPublicKey::new(&signature::ECDSA_P521_SHA512_FIXED, public_key_sec1);
+        Ok(pub_key.verify(data, signature).is_ok())
+    }
+
     fn ed25519_sign(&self, private_key_bytes: &[u8], data: &[u8]) -> HsmResult<Vec<u8>> {
         if private_key_bytes.len() != 32 {
             return Err(HsmError::KeyHandleInvalid);
@@ -457,6 +488,45 @@ impl CryptoBackend for AwsLcBackend {
         let verifying_key = VerifyingKey::from_sec1_bytes(public_key_sec1)
             .map_err(|_| HsmError::KeyHandleInvalid)?;
         let sig = p384::ecdsa::Signature::from_slice(signature)
+            .map_err(|_| HsmError::SignatureInvalid)?;
+        Ok(verifying_key.verify_prehash(digest, &sig).is_ok())
+    }
+
+    fn ecdsa_p521_sign_prehashed(
+        &self,
+        private_key_bytes: &[u8],
+        digest: &[u8],
+    ) -> HsmResult<Vec<u8>> {
+        use p521::ecdsa::signature::hazmat::PrehashSigner;
+        use p521::ecdsa::SigningKey;
+
+        let signing_key =
+            SigningKey::from_slice(private_key_bytes).map_err(|_| HsmError::KeyHandleInvalid)?;
+        let signature: p521::ecdsa::Signature = signing_key
+            .sign_prehash(digest)
+            .map_err(|_| HsmError::DataLenRange)?;
+        // PKCS#11 §2.3.1: ECDSA signature format is raw r || s (fixed-size, no ASN.1 DER).
+        // P-521: 132 bytes (66-byte r + 66-byte s).
+        Ok(signature.to_bytes().to_vec())
+    }
+
+    fn ecdsa_p521_verify_prehashed(
+        &self,
+        public_key_sec1: &[u8],
+        digest: &[u8],
+        signature: &[u8],
+    ) -> HsmResult<bool> {
+        use p521::ecdsa::signature::hazmat::PrehashVerifier;
+        use p521::ecdsa::VerifyingKey;
+
+        // PKCS#11 §2.3.1: ECDSA signature format is raw r || s (fixed-size, no ASN.1 DER).
+        // P-521: exactly 132 bytes (66-byte r + 66-byte s).
+        if signature.len() != 132 {
+            return Err(HsmError::SignatureInvalid);
+        }
+        let verifying_key = VerifyingKey::from_sec1_bytes(public_key_sec1)
+            .map_err(|_| HsmError::KeyHandleInvalid)?;
+        let sig = p521::ecdsa::Signature::from_slice(signature)
             .map_err(|_| HsmError::SignatureInvalid)?;
         Ok(verifying_key.verify_prehash(digest, &sig).is_ok())
     }
@@ -746,6 +816,25 @@ impl CryptoBackend for AwsLcBackend {
         ))
     }
 
+    fn generate_ec_p521_key_pair(&self) -> HsmResult<(RawKeyMaterial, Vec<u8>)> {
+        let private_key = agreement::PrivateKey::generate(&agreement::ECDH_P521)
+            .map_err(|_| HsmError::GeneralError)?;
+        let public_key = private_key
+            .compute_public_key()
+            .map_err(|_| HsmError::GeneralError)?;
+
+        use aws_lc_rs::encoding::AsBigEndian;
+        use aws_lc_rs::encoding::EcPrivateKeyBin;
+        let priv_bytes: EcPrivateKeyBin = private_key
+            .as_be_bytes()
+            .map_err(|_| HsmError::GeneralError)?;
+
+        Ok((
+            RawKeyMaterial::new(priv_bytes.as_ref().to_vec()),
+            public_key.as_ref().to_vec(),
+        ))
+    }
+
     fn generate_ed25519_key_pair(&self) -> HsmResult<(RawKeyMaterial, Vec<u8>)> {
         let mut seed = [0u8; 32];
         awslc_rand::fill(&mut seed).map_err(|_| HsmError::GeneralError)?;
@@ -888,6 +977,31 @@ impl CryptoBackend for AwsLcBackend {
         })
     }
 
+    fn ecdh_p521(
+        &self,
+        private_key_bytes: &[u8],
+        peer_public_key_sec1: &[u8],
+        okm_len: Option<usize>,
+    ) -> HsmResult<RawKeyMaterial> {
+        let my_private =
+            agreement::PrivateKey::from_private_key(&agreement::ECDH_P521, private_key_bytes)
+                .map_err(|_| HsmError::KeyHandleInvalid)?;
+
+        let peer_public =
+            agreement::UnparsedPublicKey::new(&agreement::ECDH_P521, peer_public_key_sec1);
+
+        agreement::agree(&my_private, peer_public, HsmError::GeneralError, |shared| {
+            let mut key_bytes = shared.to_vec();
+            if let Some(len) = okm_len {
+                if len > key_bytes.len() {
+                    return Err(HsmError::KeySizeRange);
+                }
+                key_bytes.truncate(len);
+            }
+            Ok(RawKeyMaterial::new(key_bytes))
+        })
+    }
+
     fn ecdh_p256_shared_secret(
         &self,
         private_key_bytes: &[u8],
@@ -907,6 +1021,18 @@ impl CryptoBackend for AwsLcBackend {
     ) -> HsmResult<RawKeyMaterial> {
         awslc_ecdh_shared_secret(
             &agreement::ECDH_P384,
+            private_key_bytes,
+            peer_public_key_sec1,
+        )
+    }
+
+    fn ecdh_p521_shared_secret(
+        &self,
+        private_key_bytes: &[u8],
+        peer_public_key_sec1: &[u8],
+    ) -> HsmResult<RawKeyMaterial> {
+        awslc_ecdh_shared_secret(
+            &agreement::ECDH_P521,
             private_key_bytes,
             peer_public_key_sec1,
         )

@@ -43,6 +43,7 @@ pub enum AlgorithmFamily {
     RsaPss,
     EcdsaP256,
     EcdsaP384,
+    EcdsaP521,
     Ed25519,
     // RSA encryption
     RsaOaep,
@@ -51,6 +52,7 @@ pub enum AlgorithmFamily {
     // Key derivation
     EcdhP256,
     EcdhP384,
+    EcdhP521,
     // Post-quantum
     MlDsa44,
     MlDsa65,
@@ -189,12 +191,14 @@ impl ConditionalSelfTest {
 
             AlgorithmFamily::EcdsaP256 => self.kat_ecdsa_p256(backend),
             AlgorithmFamily::EcdsaP384 => self.kat_ecdsa_p384(backend),
+            AlgorithmFamily::EcdsaP521 => self.kat_ecdsa_p521(backend),
             AlgorithmFamily::Ed25519 => self.kat_ed25519(backend),
 
             AlgorithmFamily::AesKeyWrap => self.kat_aes_key_wrap(backend),
 
             AlgorithmFamily::EcdhP256 => self.kat_ecdh(backend, false),
             AlgorithmFamily::EcdhP384 => self.kat_ecdh(backend, true),
+            AlgorithmFamily::EcdhP521 => self.kat_ecdh_p521(backend),
 
             AlgorithmFamily::MlDsa44 => {
                 self.kat_ml_dsa(backend, crate::crypto::pqc::MlDsaVariant::MlDsa44)
@@ -354,6 +358,17 @@ impl ConditionalSelfTest {
         Ok(())
     }
 
+    fn kat_ecdsa_p521(&self, backend: &dyn CryptoBackend) -> HsmResult<()> {
+        let (priv_key, pub_key) = backend.generate_ec_p521_key_pair()?;
+        let test_data = b"FIPS 140-3 ECDSA P-521 CST";
+        let signature = backend.ecdsa_p521_sign(priv_key.as_bytes(), test_data)?;
+        let valid = backend.ecdsa_p521_verify(&pub_key, test_data, &signature)?;
+        if !valid {
+            return Err(HsmError::GeneralError);
+        }
+        Ok(())
+    }
+
     fn kat_ed25519(&self, backend: &dyn CryptoBackend) -> HsmResult<()> {
         let (priv_key, pub_key) = backend.generate_ed25519_key_pair()?;
         let test_data = b"FIPS 140-3 Ed25519 CST";
@@ -394,6 +409,17 @@ impl ConditionalSelfTest {
             if ss_a.as_bytes() != ss_b.as_bytes() {
                 return Err(HsmError::GeneralError);
             }
+        }
+        Ok(())
+    }
+
+    fn kat_ecdh_p521(&self, backend: &dyn CryptoBackend) -> HsmResult<()> {
+        let (sk_a, pk_a) = backend.generate_ec_p521_key_pair()?;
+        let (sk_b, pk_b) = backend.generate_ec_p521_key_pair()?;
+        let ss_a = backend.ecdh_p521(sk_a.as_bytes(), &pk_b, None)?;
+        let ss_b = backend.ecdh_p521(sk_b.as_bytes(), &pk_a, None)?;
+        if ss_a.as_bytes() != ss_b.as_bytes() {
+            return Err(HsmError::GeneralError);
         }
         Ok(())
     }
@@ -534,6 +560,14 @@ pub fn mechanism_to_family(
             && params.contains(&0x04)
             && params.contains(&0x81)
     });
+    // Helper: check if EC params indicate P-521
+    let is_p521 = ec_params.is_some_and(|params| {
+        // OID for secp521r1: 06 05 2b 81 04 00 23
+        params.len() >= 7
+            && params.contains(&0x23)
+            && params.contains(&0x04)
+            && params.contains(&0x81)
+    });
 
     match mechanism {
         CKM_SHA256 | CKM_SHA256_RSA_PKCS | CKM_SHA256_RSA_PKCS_PSS | CKM_ECDSA_SHA256 => {
@@ -556,7 +590,9 @@ pub fn mechanism_to_family(
         CKM_RSA_PKCS_PSS => Some(AlgorithmFamily::RsaPss),
         CKM_RSA_PKCS_OAEP => Some(AlgorithmFamily::RsaOaep),
         CKM_ECDSA => {
-            if is_p384 {
+            if is_p521 {
+                Some(AlgorithmFamily::EcdsaP521)
+            } else if is_p384 {
                 Some(AlgorithmFamily::EcdsaP384)
             } else {
                 Some(AlgorithmFamily::EcdsaP256)
@@ -565,7 +601,9 @@ pub fn mechanism_to_family(
         CKM_EDDSA => Some(AlgorithmFamily::Ed25519),
         CKM_AES_KEY_WRAP | CKM_AES_KEY_WRAP_KWP => Some(AlgorithmFamily::AesKeyWrap),
         CKM_ECDH1_DERIVE => {
-            if is_p384 {
+            if is_p521 {
+                Some(AlgorithmFamily::EcdhP521)
+            } else if is_p384 {
                 Some(AlgorithmFamily::EcdhP384)
             } else {
                 Some(AlgorithmFamily::EcdhP256)

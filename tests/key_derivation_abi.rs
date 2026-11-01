@@ -75,6 +75,8 @@ fn setup_user_session() -> CK_SESSION_HANDLE {
 const P256_OID: [u8; 10] = [0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07];
 /// P-384 OID (DER-encoded)
 const P384_OID: [u8; 7] = [0x06, 0x05, 0x2B, 0x81, 0x04, 0x00, 0x22];
+/// P-521 OID (DER-encoded)
+const P521_OID: [u8; 7] = [0x06, 0x05, 0x2B, 0x81, 0x04, 0x00, 0x23];
 
 fn generate_ec_keypair(
     session: CK_SESSION_HANDLE,
@@ -449,6 +451,39 @@ fn test_ecdh_p384_derived_key_usable() {
     };
     let rv = C_EncryptInit(session, &mut mech, derived);
     assert_eq!(rv, CKR_OK, "Derived P-384 key should be usable");
+}
+
+// ============================================================================
+// ECDH P-521 derivation
+// ============================================================================
+
+#[test]
+fn test_ecdh_p521_derive_succeeds() {
+    let session = setup_user_session();
+    let (_pub_a, priv_a) = generate_ec_keypair(session, &P521_OID);
+    let (pub_b, _priv_b) = generate_ec_keypair(session, &P521_OID);
+
+    let ec_point_b = read_ec_point(session, pub_b);
+    let _derived = do_ecdh_derive(session, priv_a, &ec_point_b);
+}
+
+#[test]
+fn test_ecdh_p521_derived_key_usable() {
+    let session = setup_user_session();
+    let (_pub_a, priv_a) = generate_ec_keypair(session, &P521_OID);
+    let (pub_b, _priv_b) = generate_ec_keypair(session, &P521_OID);
+
+    let ec_point_b = read_ec_point(session, pub_b);
+    let derived = do_ecdh_derive(session, priv_a, &ec_point_b);
+
+    let iv = [0u8; 12];
+    let mut mech = CK_MECHANISM {
+        mechanism: CKM_AES_GCM,
+        p_parameter: iv.as_ptr() as CK_VOID_PTR,
+        parameter_len: iv.len() as CK_ULONG,
+    };
+    let rv = C_EncryptInit(session, &mut mech, derived);
+    assert_eq!(rv, CKR_OK, "Derived P-521 key should be usable");
 }
 
 // ============================================================================

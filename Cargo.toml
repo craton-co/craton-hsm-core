@@ -34,6 +34,7 @@ insecure-rustcrypto-rsa-private-ops = []
 rsa = { version = "0.9", features = ["sha2"] }
 p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
 p384 = { version = "0.13", features = ["ecdh", "ecdsa"] }
+p521 = { version = "0.13", features = ["ecdh", "ecdsa"] }
 ecdsa = { version = "0.16", features = ["signing", "verifying", "hazmat"] }
 elliptic-curve = { version = "0.13", features = ["sec1"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }

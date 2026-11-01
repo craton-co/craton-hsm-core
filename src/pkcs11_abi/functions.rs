@@ -42,7 +42,8 @@
 //   SAFETY: Both output pointers are checked for null at function entry.
 //   The caller must provide valid, aligned, writable CK_OBJECT_HANDLE pointers.
 //
-// Total: 43 unsafe blocks (41 in this file, 2 in mlock.rs).
+// Total: 43 unsafe blocks (41 in this file, 2 in mlock.rs), plus the
+// register-only inline asm in crypto/vector_scrub.rs.
 
 use std::cell::RefCell;
 use std::panic::catch_unwind;
@@ -527,7 +528,7 @@ fn ensure_default_tracing_subscriber() {
 #[no_mangle]
 pub extern "C" fn C_Initialize(p_init_args: CK_VOID_PTR) -> CK_RV {
     catch_unwind(|| {
-        let mut guard = HSM.lock();
+            let mut guard = HSM.lock();
 
         if guard.is_some() {
             return CKR_CRYPTOKI_ALREADY_INITIALIZED;
@@ -612,7 +613,7 @@ pub extern "C" fn C_Initialize(p_init_args: CK_VOID_PTR) -> CK_RV {
 #[no_mangle]
 pub extern "C" fn C_Finalize(p_reserved: CK_VOID_PTR) -> CK_RV {
     catch_unwind(|| {
-        if !p_reserved.is_null() {
+            if !p_reserved.is_null() {
             return CKR_ARGUMENTS_BAD;
         }
 
@@ -648,7 +649,7 @@ pub extern "C" fn C_Finalize(p_reserved: CK_VOID_PTR) -> CK_RV {
 #[no_mangle]
 pub extern "C" fn C_GetInfo(p_info: CK_INFO_PTR) -> CK_RV {
     catch_unwind(|| {
-        if get_hsm().is_err() {
+            if get_hsm().is_err() {
             return CKR_CRYPTOKI_NOT_INITIALIZED;
         }
         if p_info.is_null() {
@@ -680,7 +681,7 @@ pub extern "C" fn C_GetInfo(p_info: CK_INFO_PTR) -> CK_RV {
 #[no_mangle]
 pub extern "C" fn C_GetFunctionList(pp_function_list: *mut *mut CK_FUNCTION_LIST) -> CK_RV {
     catch_unwind(|| {
-        if pp_function_list.is_null() {
+            if pp_function_list.is_null() {
             return CKR_ARGUMENTS_BAD;
         }
         unsafe {
@@ -702,7 +703,7 @@ pub extern "C" fn C_GetSlotList(
     pul_count: CK_ULONG_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -746,7 +747,7 @@ pub extern "C" fn C_GetSlotList(
 #[no_mangle]
 pub extern "C" fn C_GetSlotInfo(slot_id: CK_SLOT_ID, p_info: CK_SLOT_INFO_PTR) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -781,7 +782,7 @@ pub extern "C" fn C_GetSlotInfo(slot_id: CK_SLOT_ID, p_info: CK_SLOT_INFO_PTR) -
 #[no_mangle]
 pub extern "C" fn C_GetTokenInfo(slot_id: CK_SLOT_ID, p_info: CK_TOKEN_INFO_PTR) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -836,7 +837,7 @@ pub extern "C" fn C_InitToken(
     p_label: CK_UTF8CHAR_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -890,7 +891,7 @@ pub extern "C" fn C_InitPIN(
     pin_len: CK_ULONG,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -933,7 +934,7 @@ pub extern "C" fn C_SetPIN(
     new_len: CK_ULONG,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -971,7 +972,7 @@ pub extern "C" fn C_GetMechanismList(
     pul_count: CK_ULONG_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -1019,7 +1020,7 @@ pub extern "C" fn C_GetMechanismInfo(
     p_info: CK_MECHANISM_INFO_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -1058,19 +1059,19 @@ pub extern "C" fn C_GetMechanismInfo(
             },
             CKM_EC_KEY_PAIR_GEN => CK_MECHANISM_INFO {
                 min_key_size: 256 as CK_ULONG,
-                max_key_size: 384 as CK_ULONG,
+                max_key_size: 521 as CK_ULONG,
                 flags: CKF_GENERATE_KEY_PAIR_FLAG,
             },
             CKM_ECDSA | CKM_ECDSA_SHA256 | CKM_ECDSA_SHA384 | CKM_ECDSA_SHA512 => {
                 CK_MECHANISM_INFO {
                     min_key_size: 256 as CK_ULONG,
-                    max_key_size: 384 as CK_ULONG,
+                    max_key_size: 521 as CK_ULONG,
                     flags: CKF_SIGN_FLAG | CKF_VERIFY_FLAG,
                 }
             }
             CKM_ECDH1_DERIVE | CKM_ECDH1_COFACTOR_DERIVE => CK_MECHANISM_INFO {
                 min_key_size: 256 as CK_ULONG,
-                max_key_size: 384 as CK_ULONG,
+                max_key_size: 521 as CK_ULONG,
                 flags: CKF_DERIVE_FLAG,
             },
             CKM_EC_EDWARDS_KEY_PAIR_GEN => CK_MECHANISM_INFO {
@@ -1179,7 +1180,7 @@ pub extern "C" fn C_OpenSession(
     ph_session: CK_SESSION_HANDLE_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -1208,7 +1209,7 @@ pub extern "C" fn C_OpenSession(
 #[no_mangle]
 pub extern "C" fn C_CloseSession(session: CK_SESSION_HANDLE) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -1235,7 +1236,7 @@ pub extern "C" fn C_CloseSession(session: CK_SESSION_HANDLE) -> CK_RV {
 #[no_mangle]
 pub extern "C" fn C_CloseAllSessions(slot_id: CK_SLOT_ID) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -1256,7 +1257,7 @@ pub extern "C" fn C_GetSessionInfo(
     p_info: CK_SESSION_INFO_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -1285,7 +1286,7 @@ pub extern "C" fn C_Login(
     pin_len: CK_ULONG,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -1377,7 +1378,7 @@ pub extern "C" fn C_Login(
 #[no_mangle]
 pub extern "C" fn C_Logout(session: CK_SESSION_HANDLE) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -1437,7 +1438,7 @@ pub extern "C" fn C_CreateObject(
     ph_object: CK_OBJECT_HANDLE_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -1472,7 +1473,7 @@ pub extern "C" fn C_CreateObject(
                             .unwrap_or([0; std::mem::size_of::<CK_ULONG>()]),
                     ) == CKK_EC
             });
-            if is_ec && !is_p256_params(params) && !is_p384_params(params) {
+            if is_ec && !is_p256_params(params) && !is_p384_params(params) && !is_p521_params(params) {
                 return CKR_CURVE_NOT_SUPPORTED;
             }
         }
@@ -1515,7 +1516,7 @@ pub extern "C" fn C_CreateObject(
 #[no_mangle]
 pub extern "C" fn C_DestroyObject(session: CK_SESSION_HANDLE, object: CK_OBJECT_HANDLE) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -1576,7 +1577,7 @@ pub extern "C" fn C_GetObjectSize(
     pul_size: CK_ULONG_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -1618,7 +1619,7 @@ pub extern "C" fn C_GetAttributeValue(
     count: CK_ULONG,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -1699,7 +1700,7 @@ pub extern "C" fn C_SetAttributeValue(
     count: CK_ULONG,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -1788,7 +1789,7 @@ pub extern "C" fn C_FindObjectsInit(
     count: CK_ULONG,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -1833,7 +1834,7 @@ pub extern "C" fn C_FindObjects(
     pul_count: CK_ULONG_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -1877,7 +1878,7 @@ pub extern "C" fn C_FindObjects(
 #[no_mangle]
 pub extern "C" fn C_FindObjectsFinal(session: CK_SESSION_HANDLE) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -1908,7 +1909,7 @@ pub extern "C" fn C_EncryptInit(
     key: CK_OBJECT_HANDLE,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -2045,7 +2046,7 @@ pub extern "C" fn C_Encrypt(
     pul_encrypted_data_len: CK_ULONG_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -2286,7 +2287,7 @@ pub extern "C" fn C_DecryptInit(
     key: CK_OBJECT_HANDLE,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -2376,7 +2377,7 @@ pub extern "C" fn C_Decrypt(
     pul_data_len: CK_ULONG_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -2565,7 +2566,7 @@ pub extern "C" fn C_SignInit(
     key: CK_OBJECT_HANDLE,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -2660,7 +2661,7 @@ pub extern "C" fn C_Sign(
     pul_signature_len: CK_ULONG_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -2795,6 +2796,13 @@ fn is_p384_params(ec_params: &[u8]) -> bool {
     ec_params == P384_OID
 }
 
+/// Helper to check if EC params correspond to P-521 (secp521r1)
+fn is_p521_params(ec_params: &[u8]) -> bool {
+    // OID for secp521r1: 1.3.132.0.35 = 06 05 2B 81 04 00 23
+    const P521_OID: &[u8] = &[0x06, 0x05, 0x2B, 0x81, 0x04, 0x00, 0x23];
+    ec_params == P521_OID
+}
+
 /// Single-shot sign: hash + sign in one step (used by C_Sign and C_SignFinal for non-hashed mechanisms).
 ///
 /// `slot_id` and `key_handle` identify the PKCS#11 object backing `key_bytes`;
@@ -2835,7 +2843,9 @@ fn sign_single_shot(
                     None => data,
                 };
                 let ec_params = obj.ec_params.as_deref().unwrap_or(&[]);
-                if is_p384_params(ec_params) {
+                if is_p521_params(ec_params) {
+                    backend.ecdsa_p521_sign_prehashed(key_bytes, digest)
+                } else if is_p384_params(ec_params) {
                     backend.ecdsa_p384_sign_prehashed(key_bytes, digest)
                 } else {
                     backend.ecdsa_p256_sign_prehashed(key_bytes, digest)
@@ -2888,7 +2898,9 @@ fn sign_prehashed(
         match key_type {
             CKK_EC => {
                 let ec_params = obj.ec_params.as_deref().unwrap_or(&[]);
-                if is_p384_params(ec_params) {
+                if is_p521_params(ec_params) {
+                    backend.ecdsa_p521_sign_prehashed(key_bytes, digest)
+                } else if is_p384_params(ec_params) {
                     backend.ecdsa_p384_sign_prehashed(key_bytes, digest)
                 } else {
                     backend.ecdsa_p256_sign_prehashed(key_bytes, digest)
@@ -2950,7 +2962,9 @@ fn verify_single_shot(
             None => data,
         };
         let ec_params = obj.ec_params.as_deref().unwrap_or(&[]);
-        if is_p384_params(ec_params) {
+        if is_p521_params(ec_params) {
+            backend.ecdsa_p521_verify_prehashed(ec_point, digest, signature)
+        } else if is_p384_params(ec_params) {
             backend.ecdsa_p384_verify_prehashed(ec_point, digest, signature)
         } else {
             backend.ecdsa_p256_verify_prehashed(ec_point, digest, signature)
@@ -3029,7 +3043,9 @@ fn verify_prehashed(
     } else if sign::is_ecdsa_mechanism(mechanism) {
         let ec_point = obj.ec_point.as_deref().ok_or(HsmError::KeyHandleInvalid)?;
         let ec_params = obj.ec_params.as_deref().unwrap_or(&[]);
-        if is_p384_params(ec_params) {
+        if is_p521_params(ec_params) {
+            backend.ecdsa_p521_verify_prehashed(ec_point, digest, signature)
+        } else if is_p384_params(ec_params) {
             backend.ecdsa_p384_verify_prehashed(ec_point, digest, signature)
         } else {
             backend.ecdsa_p256_verify_prehashed(ec_point, digest, signature)
@@ -3055,7 +3071,7 @@ pub extern "C" fn C_VerifyInit(
     key: CK_OBJECT_HANDLE,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -3140,7 +3156,7 @@ pub extern "C" fn C_Verify(
     signature_len: CK_ULONG,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -3248,7 +3264,7 @@ pub extern "C" fn C_GenerateKey(
     ph_key: CK_OBJECT_HANDLE_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -3461,7 +3477,7 @@ pub extern "C" fn C_GenerateKeyPair(
     ph_private_key: CK_OBJECT_HANDLE_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -3671,40 +3687,45 @@ fn generate_ec_keypair(
         }
     }
 
-    let is_p384 = if is_p384_params(&ec_params) {
-        true
-    } else if is_p256_params(&ec_params) {
-        false
-    } else {
-        return Err(CKR_CURVE_NOT_SUPPORTED);
-    };
-    let (private_key, public_key, key_bits) = if is_p384 {
+    let (private_key, public_key, key_bits, curve_id) = if is_p521_params(&ec_params) {
+        let (priv_key, pub_key) = hsm
+            .crypto_backend
+            .generate_ec_p521_key_pair()
+            .map_err(err_to_rv)?;
+        (priv_key, pub_key, 521u32, 521)
+    } else if is_p384_params(&ec_params) {
         let (priv_key, pub_key) = hsm
             .crypto_backend
             .generate_ec_p384_key_pair()
             .map_err(err_to_rv)?;
-        (priv_key, pub_key, 384u32)
-    } else {
+        (priv_key, pub_key, 384u32, 384)
+    } else if is_p256_params(&ec_params) {
         let (priv_key, pub_key) = hsm
             .crypto_backend
             .generate_ec_p256_key_pair()
             .map_err(err_to_rv)?;
-        (priv_key, pub_key, 256u32)
+        (priv_key, pub_key, 256u32, 256)
+    } else {
+        return Err(CKR_CURVE_NOT_SUPPORTED);
     };
 
     // FIPS 140-3 §9.6: Pairwise consistency test
-    let pairwise_result = if is_p384 {
-        pairwise_test::ecdsa_p384_pairwise_test(
+    let pairwise_result = match curve_id {
+        521 => pairwise_test::ecdsa_p521_pairwise_test(
             hsm.crypto_backend.as_ref(),
             &private_key,
             &public_key,
-        )
-    } else {
-        pairwise_test::ecdsa_p256_pairwise_test(
+        ),
+        384 => pairwise_test::ecdsa_p384_pairwise_test(
             hsm.crypto_backend.as_ref(),
             &private_key,
             &public_key,
-        )
+        ),
+        _ => pairwise_test::ecdsa_p256_pairwise_test(
+            hsm.crypto_backend.as_ref(),
+            &private_key,
+            &public_key,
+        ),
     };
     if pairwise_result.is_err() {
         tracing::error!("ECDSA pairwise consistency test failed — entering error state");
@@ -4129,7 +4150,7 @@ pub extern "C" fn C_SeedRandom(
     _seed_len: CK_ULONG,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -4150,7 +4171,7 @@ pub extern "C" fn C_GenerateRandom(
     random_len: CK_ULONG,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -4202,7 +4223,7 @@ pub extern "C" fn C_GetOperationState(
     pulOperationStateLen: CK_ULONG_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -4274,7 +4295,7 @@ pub extern "C" fn C_SetOperationState(
     hAuthenticationKey: CK_OBJECT_HANDLE,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -4410,7 +4431,7 @@ pub extern "C" fn C_CopyObject(
     ph_new_object: CK_OBJECT_HANDLE_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -4659,7 +4680,9 @@ fn estimated_signature_len(mechanism: CK_MECHANISM_TYPE, obj: &StoredObject) -> 
         obj.key_material.as_ref().map(|km| km.as_bytes().len())
     } else if sign::is_ecdsa_mechanism(mechanism) {
         let ec_params = obj.ec_params.as_deref().unwrap_or(&[]);
-        if is_p384_params(ec_params) {
+        if is_p521_params(ec_params) {
+            Some(142) // DER-encoded P-521 ECDSA: up to ~142 bytes (raw: 132 bytes)
+        } else if is_p384_params(ec_params) {
             Some(104) // DER-encoded P-384 ECDSA: up to ~104 bytes
         } else {
             Some(72) // DER-encoded P-256 ECDSA: up to ~72 bytes
@@ -4696,7 +4719,7 @@ pub extern "C" fn C_EncryptUpdate(
     pul_encrypted_part_len: CK_ULONG_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -4745,7 +4768,7 @@ pub extern "C" fn C_EncryptFinal(
     pul_last_encrypted_part_len: CK_ULONG_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -4939,7 +4962,7 @@ pub extern "C" fn C_DecryptUpdate(
     pul_part_len: CK_ULONG_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -4989,7 +5012,7 @@ pub extern "C" fn C_DecryptFinal(
     pul_last_part_len: CK_ULONG_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -5153,7 +5176,7 @@ pub extern "C" fn C_DecryptFinal(
 #[no_mangle]
 pub extern "C" fn C_DigestInit(session: CK_SESSION_HANDLE, p_mechanism: CK_MECHANISM_PTR) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -5206,7 +5229,7 @@ pub extern "C" fn C_Digest(
     pul_digest_len: CK_ULONG_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -5285,7 +5308,7 @@ pub extern "C" fn C_DigestUpdate(
     part_len: CK_ULONG,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -5331,7 +5354,7 @@ pub extern "C" fn C_DigestUpdate(
 #[no_mangle]
 pub extern "C" fn C_DigestKey(session: CK_SESSION_HANDLE, key: CK_OBJECT_HANDLE) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -5404,7 +5427,7 @@ pub extern "C" fn C_DigestFinal(
     pul_digest_len: CK_ULONG_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -5487,7 +5510,7 @@ pub extern "C" fn C_SignUpdate(
     part_len: CK_ULONG,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -5542,7 +5565,7 @@ pub extern "C" fn C_SignFinal(
     pul_signature_len: CK_ULONG_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -5718,7 +5741,7 @@ pub extern "C" fn C_VerifyUpdate(
     part_len: CK_ULONG,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -5773,7 +5796,7 @@ pub extern "C" fn C_VerifyFinal(
     signature_len: CK_ULONG,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -5975,7 +5998,7 @@ pub extern "C" fn C_WrapKey(
     pul_wrapped_key_len: CK_ULONG_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -6114,7 +6137,7 @@ pub extern "C" fn C_UnwrapKey(
     ph_key: CK_OBJECT_HANDLE_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -6383,7 +6406,7 @@ pub extern "C" fn C_DeriveKey(
     ph_key: CK_OBJECT_HANDLE_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-        let hsm = match get_hsm() {
+            let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -6471,6 +6494,7 @@ pub extern "C" fn C_DeriveKey(
         let is_aes = derived_tpl.key_type == CKK_AES;
 
         let backend = hsm.crypto_backend.as_ref();
+        let is_p521 = is_p521_params(&ec_params);
         let is_p384 = is_p384_params(&ec_params);
         let derived = match (kem_ciphertext, ecdh_params) {
             (Some(ct), _) => {
@@ -6485,7 +6509,9 @@ pub extern "C" fn C_DeriveKey(
             }
             (None, Some(params)) => match params.kdf {
                 Some(kdf) => {
-                    let z = if is_p384 {
+                    let z = if is_p521 {
+                        backend.ecdh_p521_shared_secret(&bk_bytes, &params.public_data)
+                    } else if is_p384 {
                         backend.ecdh_p384_shared_secret(&bk_bytes, &params.public_data)
                     } else {
                         backend.ecdh_p256_shared_secret(&bk_bytes, &params.public_data)
@@ -6521,7 +6547,9 @@ pub extern "C" fn C_DeriveKey(
                     } else {
                         derived_tpl.value_len
                     };
-                    if is_p384 {
+                    if is_p521 {
+                        backend.ecdh_p521(&bk_bytes, &params.public_data, okm_len)
+                    } else if is_p384 {
                         backend.ecdh_p384(&bk_bytes, &params.public_data, okm_len)
                     } else {
                         backend.ecdh_p256(&bk_bytes, &params.public_data, okm_len)

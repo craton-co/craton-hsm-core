@@ -112,6 +112,22 @@ pub fn generate_ec_p384_key_pair() -> HsmResult<(RawKeyMaterial, Vec<u8>)> {
     ))
 }
 
+/// Generate EC key pair for P-521. Returns (private_key_bytes, public_key_sec1_uncompressed).
+pub fn generate_ec_p521_key_pair() -> HsmResult<(RawKeyMaterial, Vec<u8>)> {
+    use elliptic_curve::sec1::ToEncodedPoint;
+    use p521::SecretKey;
+
+    let mut rng = DrbgRng::new()?;
+    let secret_key = SecretKey::random(&mut rng);
+    let public_key = secret_key.public_key();
+    let pub_point = public_key.to_encoded_point(false);
+
+    Ok((
+        RawKeyMaterial::new(secret_key.to_bytes().to_vec()),
+        pub_point.as_bytes().to_vec(),
+    ))
+}
+
 /// Generate Ed25519 key pair. Returns (private_key_bytes, public_key_bytes).
 pub fn generate_ed25519_key_pair() -> HsmResult<(RawKeyMaterial, Vec<u8>)> {
     use ed25519_dalek::SigningKey;

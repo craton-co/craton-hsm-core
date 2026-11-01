@@ -148,6 +148,19 @@ impl CryptoBackend for RustCryptoBackend {
         super::sign::ecdsa_p384_verify(public_key_sec1, data, signature_der)
     }
 
+    fn ecdsa_p521_sign(&self, private_key_bytes: &[u8], data: &[u8]) -> HsmResult<Vec<u8>> {
+        super::sign::ecdsa_p521_sign(private_key_bytes, data)
+    }
+
+    fn ecdsa_p521_verify(
+        &self,
+        public_key_sec1: &[u8],
+        data: &[u8],
+        signature_der: &[u8],
+    ) -> HsmResult<bool> {
+        super::sign::ecdsa_p521_verify(public_key_sec1, data, signature_der)
+    }
+
     fn ed25519_sign(&self, private_key_bytes: &[u8], data: &[u8]) -> HsmResult<Vec<u8>> {
         super::sign::ed25519_sign(private_key_bytes, data)
     }
@@ -321,6 +334,23 @@ impl CryptoBackend for RustCryptoBackend {
         super::sign::ecdsa_p384_verify_prehashed(public_key_sec1, digest, signature_der)
     }
 
+    fn ecdsa_p521_sign_prehashed(
+        &self,
+        private_key_bytes: &[u8],
+        digest: &[u8],
+    ) -> HsmResult<Vec<u8>> {
+        super::sign::ecdsa_p521_sign_prehashed(private_key_bytes, digest)
+    }
+
+    fn ecdsa_p521_verify_prehashed(
+        &self,
+        public_key_sec1: &[u8],
+        digest: &[u8],
+        signature_der: &[u8],
+    ) -> HsmResult<bool> {
+        super::sign::ecdsa_p521_verify_prehashed(public_key_sec1, digest, signature_der)
+    }
+
     // ========================================================================
     // Encryption
     // ========================================================================
@@ -458,6 +488,10 @@ impl CryptoBackend for RustCryptoBackend {
         super::keygen::generate_ec_p384_key_pair()
     }
 
+    fn generate_ec_p521_key_pair(&self) -> HsmResult<(RawKeyMaterial, Vec<u8>)> {
+        super::keygen::generate_ec_p521_key_pair()
+    }
+
     fn generate_ed25519_key_pair(&self) -> HsmResult<(RawKeyMaterial, Vec<u8>)> {
         super::keygen::generate_ed25519_key_pair()
     }
@@ -522,6 +556,15 @@ impl CryptoBackend for RustCryptoBackend {
         super::derive::ecdh_p384(private_key_bytes, peer_public_key_sec1, okm_len)
     }
 
+    fn ecdh_p521(
+        &self,
+        private_key_bytes: &[u8],
+        peer_public_key_sec1: &[u8],
+        okm_len: Option<usize>,
+    ) -> HsmResult<RawKeyMaterial> {
+        super::derive::ecdh_p521(private_key_bytes, peer_public_key_sec1, okm_len)
+    }
+
     fn ecdh_p256_shared_secret(
         &self,
         private_key_bytes: &[u8],
@@ -536,5 +579,13 @@ impl CryptoBackend for RustCryptoBackend {
         peer_public_key_sec1: &[u8],
     ) -> HsmResult<RawKeyMaterial> {
         super::derive::ecdh_p384_shared_secret(private_key_bytes, peer_public_key_sec1)
+    }
+
+    fn ecdh_p521_shared_secret(
+        &self,
+        private_key_bytes: &[u8],
+        peer_public_key_sec1: &[u8],
+    ) -> HsmResult<RawKeyMaterial> {
+        super::derive::ecdh_p521_shared_secret(private_key_bytes, peer_public_key_sec1)
     }
 }

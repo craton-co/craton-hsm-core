@@ -609,3 +609,104 @@ fn post_failed_not_set_after_successful_keygen() {
     let _ = functions::C_DestroyObject(session, priv_key);
     cleanup(session);
 }
+
+/// Generate ECDSA P-521 key pair -> pairwise test runs -> sign/verify roundtrip succeeds.
+#[test]
+fn ecdsa_p521_keygen_with_pairwise_test() {
+    let session = init_and_login();
+
+    // secp521r1 OID: 1.3.132.0.35 = 06 05 2b 81 04 00 23
+    let ec_params: Vec<u8> = vec![0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x23];
+    let true_val: CK_BBOOL = CK_TRUE;
+
+    let mut pub_template = [
+        CK_ATTRIBUTE {
+            attr_type: CKA_EC_PARAMS,
+            p_value: ec_params.as_ptr() as *mut _,
+            value_len: ec_params.len() as CK_ULONG,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_VERIFY,
+            p_value: &true_val as *const _ as *mut _,
+            value_len: 1,
+        },
+    ];
+
+    let mut priv_template = [
+        CK_ATTRIBUTE {
+            attr_type: CKA_SIGN,
+            p_value: &true_val as *const _ as *mut _,
+            value_len: 1,
+        },
+    ];
+
+    let mut mechanism = CK_MECHANISM {
+        mechanism: CKM_EC_KEY_PAIR_GEN,
+        p_parameter: std::ptr::null_mut(),
+        parameter_len: 0,
+    };
+
+    let mut pub_key: CK_OBJECT_HANDLE = 0;
+    let mut priv_key: CK_OBJECT_HANDLE = 0;
+
+    let rv = functions::C_GenerateKeyPair(
+        session,
+        &mut mechanism,
+        pub_template.as_mut_ptr(),
+        pub_template.len() as CK_ULONG,
+        priv_template.as_mut_ptr(),
+        priv_template.len() as CK_ULONG,
+        &mut pub_key,
+        &mut priv_key,
+    );
+    assert_eq!(
+        rv, CKR_OK,
+        "EC P-521 key generation (with pairwise test) should succeed"
+    );
+
+    // Sign and verify roundtrip with CKM_ECDSA_SHA512
+    let mut sign_mechanism = CK_MECHANISM {
+        mechanism: CKM_ECDSA_SHA512,
+        p_parameter: std::ptr::null_mut(),
+        parameter_len: 0,
+    };
+
+    let data = b"ecdsa p521 pairwise roundtrip";
+    let mut signature = [0u8; 256];
+    let mut sig_len = signature.len() as CK_ULONG;
+
+    let rv = functions::C_SignInit(session, &mut sign_mechanism, priv_key);
+    assert_eq!(rv, CKR_OK);
+
+    let rv = functions::C_Sign(
+        session,
+        data.as_ptr() as *mut _,
+        data.len() as CK_ULONG,
+        signature.as_mut_ptr(),
+        &mut sig_len,
+    );
+    assert_eq!(rv, CKR_OK, "C_Sign should succeed");
+    assert_eq!(
+        sig_len, 132,
+        "P-521 ECDSA signature must be 132 bytes (raw r || s: 66 + 66)"
+    );
+
+    let rv = functions::C_VerifyInit(session, &mut sign_mechanism, pub_key);
+    assert_eq!(rv, CKR_OK);
+
+    let rv = functions::C_Verify(
+        session,
+        data.as_ptr() as *mut _,
+        data.len() as CK_ULONG,
+        signature.as_mut_ptr(),
+        sig_len,
+    );
+    assert_eq!(
+        rv, CKR_OK,
+        "ECDSA P-521 signature verification should succeed"
+    );
+
+    let _ = functions::C_DestroyObject(session, pub_key);
+    let _ = functions::C_DestroyObject(session, priv_key);
+    cleanup(session);
+}
