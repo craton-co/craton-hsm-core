@@ -17,31 +17,11 @@
 //   * `AuditEvent.format_version` field (serde-default 0 for legacy).
 //   * `AuditEventPayload.format_version` so downgrade flips the MAC.
 //   * `AuditLog.audit_chain_key` field (zero placeholder, see TODOs).
-//
-// STILL TO DO before this branch is production-ready:
-//   1. Thread `state_hmac_key` (or an HKDF-derived subkey) through
-//      `AuditLog::new()` / `new_with_path()`. Replace the zero-placeholder
-//      `audit_chain_key` assignments marked TODO(security/hmac-audit-chain).
-//   2. Rewrite `compute_chain_hash()` to use HMAC keyed by
-//      `audit_chain_key` instead of plain `Sha256`. Use `initial_chain_hash`
-//      for the H_0 case.
-//   3. Bump `AUDIT_LOG_FORMAT_VERSION` to 2 (version 1 is now taken by the
-//      canonical binary payload encoding -- see `encode_payload_v1`). The
-//      HMAC should be computed over those same canonical bytes, not over
-//      JSON: `encode_payload_v1` is already injective and allocation-free,
-//      which is exactly what a MAC input wants.
-//   4. Update `verify_chain` / recovery to use HMAC for v2 records. Note
-//      that `compute_chain_hash_with` already dispatches on each record's
-//      own `format_version`, so adding a v2 arm is additive and does not
-//      break verification of existing v0/v1 files.
-//   5. Update `HsmCore::try_new[_with_backend]` to pass the derived key
-//      to the new `AuditLog::new` signature.
-//   6. Add tests: valid chain, tampered record, wrong-key verification,
-//      legacy-file rejection.
-//
-// Until those steps land the audit chain still uses plain SHA-256 and the
-// new fields are inert. The branch compiles and is safe to merge as a
-// stepping stone, but does NOT yet close the original vulnerability.
+// The audit chain is keyed via HMAC-SHA-256 using an HKDF-derived subkey of
+// `state_hmac_key`:
+//   * Format version 2 records use `HMAC-SHA-256(audit_chain_key, previous_hash || canonical_binary_payload)`.
+//   * Initial chain value H_0 is `HMAC-SHA-256(audit_chain_key, "audit-chain-init")`.
+//   * Legacy v0 (JSON payload) and v1 (unkeyed SHA-256 binary) records remain verifiable for backwards compatibility.
 //
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
@@ -65,21 +45,16 @@ type HmacSha256 = Hmac<Sha256>;
 ///
 /// - `0`: legacy chain — `SHA-256(previous_hash || serde_json(payload))`.
 ///   Accepted for verification of pre-existing logs; never written.
-/// - `1`: current chain — `SHA-256(previous_hash || canonical(payload))`,
+/// - `1`: legacy chain — `SHA-256(previous_hash || canonical(payload))`,
 ///   where `canonical` is the fixed-width binary encoding implemented by
-///   [`encode_payload_v1`]. The JSON payload encoding it replaces cost
-///   ~2.2 us per event to produce and inflated the hashed input from
-///   ~40 to ~148 bytes; the binary encoding roughly halves the audit
-///   worker's per-event CPU.
-/// - `2`: RESERVED for the in-flight HMAC-SHA-256 chain migration (see the
-///   module-level `security/hmac-audit-chain` notes). That migration
-///   should MAC over the same [`encode_payload_v1`] canonical bytes
-///   rather than over JSON.
+///   [`encode_payload_v1`].
+/// - `2`: current chain — `HMAC-SHA-256(audit_key, previous_hash || canonical(payload))`.
+///   Keyed by a per-instance subkey derived from `state_hmac_key` via HKDF-SHA-256.
 ///
 /// Records are always written at [`AUDIT_LOG_FORMAT_VERSION`]; the verifier
 /// dispatches on each record's own `format_version` so mixed-version files
 /// (an upgrade appending to an existing log) verify end to end.
-pub const AUDIT_LOG_FORMAT_VERSION: u32 = 1;
+pub const AUDIT_LOG_FORMAT_VERSION: u32 = 2;
 
 /// HKDF "info" string used to derive the audit chain subkey from
 /// `state_hmac_key`. Domain-separates audit-chain from operation-state HMAC.
@@ -558,30 +533,63 @@ fn encode_operation_v1(op: &AuditOperation, out: &mut Vec<u8>) {
 }
 
 /// Compute the chain hash for an event:
-/// `SHA-256(previous_hash || encode(payload))`
+/// - `0`: legacy `SHA-256(previous_hash || serde_json(payload))`
+/// - `1`: legacy `SHA-256(previous_hash || canonical_binary(payload))`
+/// - `2`: `HMAC-SHA-256(audit_key, previous_hash || canonical_binary(payload))`
 ///
 /// The payload excludes `previous_hash` to avoid circularity. `encode` is
 /// selected by the event's own `format_version` so that a file containing both
-/// legacy (`0`, JSON) and current (`1`, canonical binary) records — which is
-/// exactly what an in-place upgrade produces — verifies end to end.
+/// legacy (`0`, `1`) and current (`2`, HMAC) records verifies end to end.
 ///
 /// `scratch` is a caller-owned buffer reused across events; it is cleared on
 /// entry. [`compute_chain_hash`] wraps this for callers that do not have one.
 fn compute_chain_hash_with(
     previous_hash: &[u8; 32],
     event: &AuditEvent,
+    audit_key: &[u8; 32],
     scratch: &mut Vec<u8>,
 ) -> Result<[u8; 32], crate::error::HsmError> {
     scratch.clear();
     match event.format_version {
-        // Legacy: the payload was hashed in its `serde_json` encoding.
+        // Legacy: the payload was hashed in its `serde_json` encoding with Sha256.
         0 => {
             serde_json::to_writer(&mut *scratch, &event.payload()).map_err(|e| {
                 tracing::error!("Audit event payload serialization failed: {}", e);
                 crate::error::HsmError::GeneralError
             })?;
+            let mut hasher = Sha256::new();
+            hasher.update(previous_hash);
+            hasher.update(&*scratch);
+            let hash = hasher.finalize();
+            let mut result = [0u8; 32];
+            result.copy_from_slice(&hash);
+            Ok(result)
         }
-        1 => encode_payload_v1(event, scratch),
+        // Legacy v1: canonical binary encoding with plain Sha256.
+        1 => {
+            encode_payload_v1(event, scratch);
+            let mut hasher = Sha256::new();
+            hasher.update(previous_hash);
+            hasher.update(&*scratch);
+            let hash = hasher.finalize();
+            let mut result = [0u8; 32];
+            result.copy_from_slice(&hash);
+            Ok(result)
+        }
+        // Current v2: canonical binary encoding with HMAC-SHA-256.
+        2 => {
+            encode_payload_v1(event, scratch);
+            let mut mac = HmacSha256::new_from_slice(audit_key).map_err(|_| {
+                tracing::error!("Audit HMAC key initialization failed");
+                crate::error::HsmError::GeneralError
+            })?;
+            mac.update(previous_hash);
+            mac.update(&*scratch);
+            let tag = mac.finalize().into_bytes();
+            let mut result = [0u8; 32];
+            result.copy_from_slice(&tag);
+            Ok(result)
+        }
         other => {
             tracing::error!(
                 "Audit event carries unsupported format_version {} (this build \
@@ -596,14 +604,6 @@ fn compute_chain_hash_with(
             )));
         }
     }
-
-    let mut hasher = Sha256::new();
-    hasher.update(previous_hash);
-    hasher.update(&*scratch);
-    let hash = hasher.finalize();
-    let mut result = [0u8; 32];
-    result.copy_from_slice(&hash);
-    Ok(result)
 }
 
 /// Allocating convenience wrapper around [`compute_chain_hash_with`] for
@@ -611,9 +611,10 @@ fn compute_chain_hash_with(
 fn compute_chain_hash(
     previous_hash: &[u8; 32],
     event: &AuditEvent,
+    audit_key: &[u8; 32],
 ) -> Result<[u8; 32], crate::error::HsmError> {
     let mut scratch = Vec::with_capacity(64);
-    compute_chain_hash_with(previous_hash, event, &mut scratch)
+    compute_chain_hash_with(previous_hash, event, audit_key, &mut scratch)
 }
 
 /// Validate and canonicalize the audit log path.
@@ -749,6 +750,8 @@ struct AuditWorker {
     batch_head: [u8; 32],
     /// `record_sync` waiters for the current batch.
     waiters: Vec<DoneTx>,
+    /// Audit chain HMAC subkey.
+    audit_chain_key: Arc<Zeroizing<[u8; 32]>>,
 }
 
 impl AuditWorker {
@@ -875,7 +878,8 @@ impl AuditWorker {
             previous_hash,
         };
 
-        let new_head = compute_chain_hash_with(&previous_hash, &event, &mut self.hash_buf)?;
+        let new_head =
+            compute_chain_hash_with(&previous_hash, &event, &self.audit_chain_key, &mut self.hash_buf)?;
 
         // Serialize into the reusable buffer. A serialization failure must not
         // leave a partial line behind, so truncate back to the mark.
@@ -1023,6 +1027,7 @@ impl AuditLog {
         receiver: std::sync::mpsc::Receiver<AuditCommand>,
         initial_hash: [u8; 32],
         initial_timestamp: u64,
+        audit_chain_key: Arc<Zeroizing<[u8; 32]>>,
     ) -> std::thread::JoinHandle<()> {
         std::thread::Builder::new()
             .name("audit-worker".to_string())
@@ -1040,16 +1045,20 @@ impl AuditLog {
                     batch: Vec::new(),
                     batch_head: initial_hash,
                     waiters: Vec::new(),
+                    audit_chain_key,
                 };
                 worker.run(&receiver);
             })
             .expect("failed to spawn audit worker thread")
     }
 
-    pub fn new() -> Self {
+    /// Create an in-memory audit log with a caller-supplied audit chain key.
+    pub fn new_with_key(audit_chain_key: Zeroizing<[u8; 32]>) -> Self {
+        let key_arc = Arc::new(audit_chain_key);
+        let init_hash = initial_chain_hash(&key_arc);
         let state = Arc::new(RwLock::new(AuditLogState {
             entries: Vec::new(),
-            last_hash: [0u8; 32],
+            last_hash: init_hash,
             tamper_detected: false,
             last_timestamp: 0,
         }));
@@ -1061,44 +1070,40 @@ impl AuditLog {
             None,
             Arc::clone(&tamper_flag),
             receiver,
-            [0u8; 32],
+            init_hash,
             0,
+            Arc::clone(&key_arc),
         );
 
-        // TODO(security/hmac-audit-chain): wire the audit_chain_key through
-        // from HsmCore::state_hmac_key so `compute_chain_hash` can switch to
-        // HMAC-SHA-256. Today the constructor still uses a zero placeholder
-        // and `compute_chain_hash` still emits plain SHA-256 -- the field
-        // exists but is dead until that refactor lands. See module-level
-        // doc comment for the full migration plan.
         Self {
             state,
             log_path: None,
             sender: Some(sender),
             tamper_flag,
             worker: Some(worker),
-            audit_chain_key: Arc::new(Zeroizing::new([0u8; 32])),
+            audit_chain_key: key_arc,
         }
     }
 
-    /// Create an audit log with disk persistence enabled.
-    /// Events are appended to the file as NDJSON (one JSON object per line).
+    /// Create an in-memory audit log.
     ///
-    /// The path is validated and canonicalized to prevent symlink/path traversal
-    /// attacks. Returns an error if the path is invalid (symlink, not a regular
-    /// file, parent directory unresolvable).
-    ///
-    /// If an existing log file is found, the hash chain is recovered **and
-    /// verified** so that new events are correctly chained to the previous
-    /// entries. If the chain is broken or the file is corrupt, the
-    /// `tamper_detected` flag is set permanently and `record()` will refuse
-    /// to append new events. Callers should check `is_tamper_detected()` after
-    /// construction.
-    pub fn new_with_path(path: PathBuf) -> Result<Self, crate::error::HsmError> {
-        let path = validate_log_path(&path)?;
+    /// Uses a default zero key suitable for testing or standalone use.
+    /// Production instances initialize via [`HsmCore`] which provides an
+    /// HKDF-derived subkey of `state_hmac_key`.
+    pub fn new() -> Self {
+        Self::new_with_key(Zeroizing::new([0u8; 32]))
+    }
 
-        let (recovered_hash, tampered) = match Self::recover_chain_from_file(&path) {
-            ChainRecoveryResult::NoFile => ([0u8; 32], false),
+    /// Create an audit log with disk persistence enabled and a caller-supplied audit chain key.
+    pub fn new_with_path_and_key(
+        path: PathBuf,
+        audit_chain_key: Zeroizing<[u8; 32]>,
+    ) -> Result<Self, crate::error::HsmError> {
+        let path = validate_log_path(&path)?;
+        let key_arc = Arc::new(audit_chain_key);
+
+        let (recovered_hash, tampered) = match Self::recover_chain_from_file(&path, &key_arc) {
+            ChainRecoveryResult::NoFile => (initial_chain_hash(&key_arc), false),
             ChainRecoveryResult::Verified(hash) => (hash, false),
             ChainRecoveryResult::Broken(reason) => {
                 tracing::error!(
@@ -1107,7 +1112,7 @@ impl AuditLog {
                     path.display(),
                     reason,
                 );
-                ([0u8; 32], true)
+                (initial_chain_hash(&key_arc), true)
             }
         };
 
@@ -1127,19 +1132,39 @@ impl AuditLog {
             receiver,
             recovered_hash,
             0,
+            Arc::clone(&key_arc),
         );
 
-        // TODO(security/hmac-audit-chain): see Self::new() -- the chain key
-        // is still a zero placeholder pending the constructor-signature
-        // change that threads HsmCore::state_hmac_key through here.
         Ok(Self {
             state,
             log_path: Some(path),
             sender: Some(sender),
             tamper_flag,
             worker: Some(worker),
-            audit_chain_key: Arc::new(Zeroizing::new([0u8; 32])),
+            audit_chain_key: key_arc,
         })
+    }
+
+    /// Create an audit log with disk persistence enabled.
+    /// Events are appended to the file as NDJSON (one JSON object per line).
+    ///
+    /// The path is validated and canonicalized to prevent symlink/path traversal
+    /// attacks. Returns an error if the path is invalid (symlink, not a regular
+    /// file, parent directory unresolvable).
+    ///
+    /// If an existing log file is found, the hash chain is recovered **and
+    /// verified** so that new events are correctly chained to the previous
+    /// entries. If the chain is broken or the file is corrupt, the
+    /// `tamper_detected` flag is set permanently and `record()` will refuse
+    /// to append new events. Callers should check `is_tamper_detected()` after
+    /// construction.
+    pub fn new_with_path(path: PathBuf) -> Result<Self, crate::error::HsmError> {
+        Self::new_with_path_and_key(path, Zeroizing::new([0u8; 32]))
+    }
+
+    /// Returns a reference to the audit chain HMAC key.
+    pub fn audit_chain_key(&self) -> &Arc<Zeroizing<[u8; 32]>> {
+        &self.audit_chain_key
     }
 
     /// Returns `true` if the audit log chain was found to be corrupt or
@@ -1149,9 +1174,9 @@ impl AuditLog {
         self.tamper_flag.load(Ordering::Acquire)
     }
 
-    /// Read the existing NDJSON audit log file, recompute the SHA-256
+    /// Read the existing NDJSON audit log file, recompute the SHA-256 / HMAC-SHA-256
     /// hash chain, and **verify each link** to detect tampering.
-    fn recover_chain_from_file(path: &Path) -> ChainRecoveryResult {
+    fn recover_chain_from_file(path: &Path, audit_chain_key: &[u8; 32]) -> ChainRecoveryResult {
         let file = match std::fs::File::open(path) {
             Ok(f) => f,
             Err(e) => {
@@ -1169,6 +1194,7 @@ impl AuditLog {
         let reader = std::io::BufReader::new(file);
         let mut running_hash = [0u8; 32];
         let mut scratch = Vec::with_capacity(64);
+        let mut has_records = false;
 
         for (line_num, line_result) in reader.lines().enumerate() {
             let line = match line_result {
@@ -1198,6 +1224,15 @@ impl AuditLog {
                 }
             };
 
+            if !has_records {
+                running_hash = if event.format_version >= 2 {
+                    initial_chain_hash(audit_chain_key)
+                } else {
+                    [0u8; 32]
+                };
+                has_records = true;
+            }
+
             // Verify that this event's previous_hash matches our running chain.
             if event.previous_hash != running_hash {
                 return ChainRecoveryResult::Broken(format!(
@@ -1208,9 +1243,9 @@ impl AuditLog {
                 ));
             }
 
-            // Recompute the chain hash: SHA-256(previous_hash || payload),
-            // using the encoding this record was written with.
-            match compute_chain_hash_with(&running_hash, &event, &mut scratch) {
+            // Recompute the chain hash: SHA-256 or HMAC-SHA-256,
+            // using the encoding and MAC this record was written with.
+            match compute_chain_hash_with(&running_hash, &event, audit_chain_key, &mut scratch) {
                 Ok(h) => running_hash = h,
                 Err(_) => {
                     return ChainRecoveryResult::Broken(format!(
@@ -1221,7 +1256,7 @@ impl AuditLog {
             }
         }
 
-        if running_hash == [0u8; 32] {
+        if !has_records {
             // File existed but was empty — treat as fresh start.
             ChainRecoveryResult::NoFile
         } else {
@@ -1556,7 +1591,7 @@ impl AuditLog {
     /// Returns `Ok(count)` if the chain is valid,
     /// `Err(index)` with the index of the first broken link.
     pub fn verify_chain(&self) -> Result<usize, usize> {
-        verify_chain_entries(&self.state.read().entries)
+        verify_chain_entries_with_key(&self.state.read().entries, &self.audit_chain_key)
     }
 }
 
@@ -1620,7 +1655,16 @@ pub fn load_entries_from_file(path: &Path) -> Result<Vec<AuditEvent>, crate::err
     Ok(entries)
 }
 
-/// Verify the SHA-256 hash chain over a slice of [`AuditEvent`]s.
+/// Verify the SHA-256 / HMAC-SHA-256 hash chain over a slice of [`AuditEvent`]s.
+///
+/// Uses default zero key for format_version >= 2. If records are keyed with a
+/// non-zero key, use [`verify_chain_entries_with_key`].
+pub fn verify_chain_entries(entries: &[AuditEvent]) -> Result<usize, usize> {
+    verify_chain_entries_with_key(entries, &[0u8; 32])
+}
+
+/// Verify the SHA-256 / HMAC-SHA-256 hash chain over a slice of [`AuditEvent`]s
+/// using a caller-supplied audit chain HMAC key.
 ///
 /// Returns `Ok(count)` if every event's `previous_hash` matches the running
 /// chain and serialization succeeds, `Err(index)` with the zero-based index
@@ -1628,14 +1672,24 @@ pub fn load_entries_from_file(path: &Path) -> Result<Vec<AuditEvent>, crate::err
 ///
 /// Used by both the in-memory [`AuditLog::verify_chain`] method and off-line
 /// consumers that loaded entries via [`load_entries_from_file`].
-pub fn verify_chain_entries(entries: &[AuditEvent]) -> Result<usize, usize> {
-    let mut expected_hash = [0u8; 32];
+pub fn verify_chain_entries_with_key(
+    entries: &[AuditEvent],
+    audit_key: &[u8; 32],
+) -> Result<usize, usize> {
+    if entries.is_empty() {
+        return Ok(0);
+    }
+    let mut expected_hash = if entries[0].format_version >= 2 {
+        initial_chain_hash(audit_key)
+    } else {
+        [0u8; 32]
+    };
     let mut scratch = Vec::with_capacity(64);
     for (i, entry) in entries.iter().enumerate() {
         if entry.previous_hash != expected_hash {
             return Err(i);
         }
-        match compute_chain_hash_with(&expected_hash, entry, &mut scratch) {
+        match compute_chain_hash_with(&expected_hash, entry, audit_key, &mut scratch) {
             Ok(h) => expected_hash = h,
             Err(_) => return Err(i),
         }
@@ -1997,19 +2051,24 @@ mod codec_tests {
     }
 
     /// The chain hash must dispatch on the record's own version, so the same
-    /// event chained as v0 and as v1 produces different links. Otherwise the
+    /// event chained as v0, v1, and v2 produces different links. Otherwise the
     /// version field would be advisory rather than binding.
     #[test]
     fn chain_hash_dispatches_on_format_version() {
         let prev = [0u8; 32];
-        let mut v1 = event(AuditOperation::Logout, None, AuditResult::Success);
+        let key = [0x5Au8; 32];
+        let mut v2 = event(AuditOperation::Logout, None, AuditResult::Success);
+        v2.format_version = 2;
+        let mut v1 = v2.clone();
         v1.format_version = 1;
-        let mut v0 = v1.clone();
+        let mut v0 = v2.clone();
         v0.format_version = 0;
 
-        let h1 = compute_chain_hash(&prev, &v1).expect("v1 hashes");
-        let h0 = compute_chain_hash(&prev, &v0).expect("v0 hashes");
+        let h2 = compute_chain_hash(&prev, &v2, &key).expect("v2 hashes");
+        let h1 = compute_chain_hash(&prev, &v1, &key).expect("v1 hashes");
+        let h0 = compute_chain_hash(&prev, &v0, &key).expect("v0 hashes");
         assert_ne!(h0, h1, "v0 and v1 encodings must produce different links");
+        assert_ne!(h1, h2, "v1 and v2 encodings must produce different links");
     }
 
     /// An unknown future version must be rejected rather than silently hashed
@@ -2019,7 +2078,7 @@ mod codec_tests {
         let mut ev = event(AuditOperation::Logout, None, AuditResult::Success);
         ev.format_version = 99;
         assert!(
-            compute_chain_hash(&[0u8; 32], &ev).is_err(),
+            compute_chain_hash(&[0u8; 32], &ev, &[0u8; 32]).is_err(),
             "an unrecognised format_version must not verify",
         );
     }
@@ -2035,11 +2094,12 @@ mod codec_tests {
         );
         let short = event(AuditOperation::Logout, None, AuditResult::Success);
         let prev = [0u8; 32];
+        let key = [0x33u8; 32];
 
         let mut scratch = Vec::new();
-        let _ = compute_chain_hash_with(&prev, &long, &mut scratch).expect("long hashes");
-        let reused = compute_chain_hash_with(&prev, &short, &mut scratch).expect("short hashes");
-        let fresh = compute_chain_hash(&prev, &short).expect("short hashes standalone");
+        let _ = compute_chain_hash_with(&prev, &long, &key, &mut scratch).expect("long hashes");
+        let reused = compute_chain_hash_with(&prev, &short, &key, &mut scratch).expect("short hashes");
+        let fresh = compute_chain_hash(&prev, &short, &key).expect("short hashes standalone");
 
         assert_eq!(
             reused, fresh,

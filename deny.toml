@@ -84,8 +84,6 @@ wildcards = "deny"
 highlight = "all"
 
 # Explicitly-accepted duplicate trees. Each entry is justified inline.
-# When removing an entry, also remove the corresponding alias in
-# Cargo.toml (e.g. `rand_core_new`, `getrandom_new`) if applicable.
 skip-tree = [
     # The PQC crates (ml-kem / ml-dsa / slh-dsa) depend on the next-generation
     # RustCrypto trait crates (rand_core 0.10, signature 3.0-rc, digest 0.11,
@@ -93,9 +91,7 @@ skip-tree = [
     # pkcs8 0.11-rc, der next, const-oid next, getrandom 0.4, etc.) while the
     # classical RustCrypto crates (rsa, ecdsa, ed25519-dalek, p256, p384,
     # elliptic-curve) still pin the 0.6/0.10/0.7/0.10/0.12/0.13 series.
-    # Cargo.toml aliases `rand_core_new` and `getrandom_new` exist for this
-    # reason — see the top-of-file comment there. Remove this skip-tree once
-    # the RustCrypto ecosystem converges (track:
+    # Remove this skip-tree once the RustCrypto ecosystem converges (track:
     # https://github.com/RustCrypto/traits/issues/1438).
     { crate = "ml-kem", reason = "PQC migration: RustCrypto 0.x vs RC trait split" },
     { crate = "ml-dsa", reason = "PQC migration: RustCrypto 0.x vs RC trait split" },

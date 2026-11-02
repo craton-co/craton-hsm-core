@@ -197,25 +197,26 @@ impl HsmCore {
     /// seeded (e.g., OS entropy source unavailable).
     pub fn try_new(config: &HsmConfig) -> Result<Self, crate::error::HsmError> {
         let drbg = HmacDrbg::new().map_err(|_| crate::error::HsmError::GeneralError)?;
+        let state_hmac_key = Self::generate_state_hmac_key();
+        let audit_chain_key = crate::audit::log::derive_audit_chain_key(&state_hmac_key);
+        let audit_log = if config.audit.enabled {
+            AuditLog::new_with_path_and_key(config.audit.log_path.clone(), audit_chain_key)?
+        } else {
+            AuditLog::new_with_key(audit_chain_key)
+        };
+        let audit_log = Arc::new(audit_log);
+        audit_log.register_global_logger();
+
         Ok(Self {
             slot_manager: SlotManager::new_with_config(config),
             session_manager: SessionManager::new(),
             object_store: Self::build_object_store(config)?,
-            audit_log: {
-                let log = if config.audit.enabled {
-                    AuditLog::new_with_path(config.audit.log_path.clone())?
-                } else {
-                    AuditLog::new()
-                };
-                let log = Arc::new(log);
-                log.register_global_logger();
-                log
-            },
+            audit_log,
             crypto_backend: Self::select_crypto_backend(config),
             drbg: parking_lot::Mutex::new(drbg),
             algorithm_config: config.algorithms.clone(),
             serial_number: Self::make_serial(config),
-            state_hmac_key: Self::generate_state_hmac_key(),
+            state_hmac_key,
             conditional_self_test: ConditionalSelfTest::new(),
             metrics: MetricsCollector::new(true),
             rate_limiter: RateLimiter::new(&crate::crypto::rate_limit::RateLimitConfig::default()),
@@ -244,25 +245,26 @@ impl HsmCore {
         backend: Arc<dyn CryptoBackend>,
     ) -> Result<Self, crate::error::HsmError> {
         let drbg = HmacDrbg::new().map_err(|_| crate::error::HsmError::GeneralError)?;
+        let state_hmac_key = Self::generate_state_hmac_key();
+        let audit_chain_key = crate::audit::log::derive_audit_chain_key(&state_hmac_key);
+        let audit_log = if config.audit.enabled {
+            AuditLog::new_with_path_and_key(config.audit.log_path.clone(), audit_chain_key)?
+        } else {
+            AuditLog::new_with_key(audit_chain_key)
+        };
+        let audit_log = Arc::new(audit_log);
+        audit_log.register_global_logger();
+
         Ok(Self {
             slot_manager: SlotManager::new_with_config(config),
             session_manager: SessionManager::new(),
             object_store: Self::build_object_store(config)?,
-            audit_log: {
-                let log = if config.audit.enabled {
-                    AuditLog::new_with_path(config.audit.log_path.clone())?
-                } else {
-                    AuditLog::new()
-                };
-                let log = Arc::new(log);
-                log.register_global_logger();
-                log
-            },
+            audit_log,
             crypto_backend: backend,
             drbg: parking_lot::Mutex::new(drbg),
             algorithm_config: config.algorithms.clone(),
             serial_number: Self::make_serial(config),
-            state_hmac_key: Self::generate_state_hmac_key(),
+            state_hmac_key,
             conditional_self_test: ConditionalSelfTest::new(),
             metrics: MetricsCollector::new(true),
             rate_limiter: RateLimiter::new(&crate::crypto::rate_limit::RateLimitConfig::default()),
