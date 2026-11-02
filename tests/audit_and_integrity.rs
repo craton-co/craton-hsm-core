@@ -720,7 +720,7 @@ fn test_audit_records_are_written_at_current_format_version() {
 
     let contents = std::fs::read_to_string(&path).expect("log file should be readable");
     assert!(
-        contents.contains("\"format_version\":1"),
+        contents.contains("\"format_version\":2"),
         "new records must carry the current format version, got: {:?}",
         contents,
     );
@@ -966,4 +966,73 @@ fn test_audit_group_commit_preserves_order_and_chain() {
 
     drop(reopened);
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn test_hsm_core_wires_derived_audit_chain_key() {
+    let mut config = craton_hsm::config::HsmConfig::default();
+    config.token.storage_path = std::env::temp_dir().join(format!("craton_audit_key_test_{}", std::process::id()));
+    let core = craton_hsm::core::HsmCore::try_new(&config).expect("core init");
+
+    // Verify the audit chain key in AuditLog is non-zero (derived from state_hmac_key)
+    let audit_key = core.audit_log().audit_chain_key();
+    assert_ne!(***audit_key, [0u8; 32], "Audit chain key must not be a zero placeholder in HsmCore");
+
+    // Verify derive_audit_chain_key produces a deterministic distinct key from state_hmac_key
+    let dummy_state_key = [0x42u8; 32];
+    let derived1 = craton_hsm::audit::log::derive_audit_chain_key(&dummy_state_key);
+    let derived2 = craton_hsm::audit::log::derive_audit_chain_key(&dummy_state_key);
+    assert_eq!(*derived1, *derived2);
+    assert_ne!(*derived1, dummy_state_key);
+    assert_ne!(*derived1, [0u8; 32]);
+
+    let _ = std::fs::remove_dir_all(&config.token.storage_path);
+}
+
+#[test]
+fn test_hsm_core_audit_chain_with_derived_key_verifies() {
+    let mut config = craton_hsm::config::HsmConfig::default();
+    let temp_dir = std::env::temp_dir().join(format!("craton_audit_chain_test_{}", std::process::id()));
+    std::fs::create_dir_all(&temp_dir).expect("create temp dir");
+    config.token.storage_path = temp_dir.clone();
+    let log_file = temp_dir.join("audit.log");
+    config.audit.log_path = log_file.clone();
+
+    let saved_key;
+    {
+        let core = craton_hsm::core::HsmCore::try_new(&config).expect("core init");
+        saved_key = core.audit_log().audit_chain_key().as_ref().clone();
+        core.audit_log()
+            .record_sync(
+                1,
+                craton_hsm::audit::log::AuditOperation::Initialize,
+                craton_hsm::audit::log::AuditResult::Success,
+                None,
+            )
+            .expect("record");
+        assert_eq!(core.audit_log().verify_chain(), Ok(1));
+    }
+
+    // Reopening with the same audit chain key must verify
+    {
+        let reopened = craton_hsm::audit::log::AuditLog::new_with_path_and_key(
+            log_file.clone(),
+            saved_key.clone(),
+        )
+        .expect("audit log reopen");
+        assert!(!reopened.is_tamper_detected());
+    }
+
+    // Reopening with a wrong audit chain key must detect tamper
+    {
+        let wrong_key = [0xEEu8; 32];
+        let tampered = craton_hsm::audit::log::AuditLog::new_with_path_and_key(
+            log_file.clone(),
+            zeroize::Zeroizing::new(wrong_key),
+        )
+        .expect("audit log reopen with wrong key");
+        assert!(tampered.is_tamper_detected());
+    }
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
 }

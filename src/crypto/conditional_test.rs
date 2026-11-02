@@ -157,6 +157,22 @@ impl ConditionalSelfTest {
         }
     }
 
+    /// Ensure all algorithm families required by a PKCS#11 mechanism have passed their CST.
+    ///
+    /// For composite mechanisms (such as CKM_ECDSA_SHA256 or CKM_SHA256_RSA_PKCS),
+    /// tests both the digest and asymmetric signature algorithm families.
+    pub fn ensure_mechanism_tested(
+        &self,
+        mechanism: CK_MECHANISM_TYPE,
+        ec_params: Option<&[u8]>,
+        backend: &dyn CryptoBackend,
+    ) -> HsmResult<()> {
+        for family in mechanism_to_families(mechanism, ec_params) {
+            self.ensure_tested(family, backend)?;
+        }
+        Ok(())
+    }
+
     /// Run the KAT for a specific algorithm family.
     fn run_kat(&self, family: AlgorithmFamily, backend: &dyn CryptoBackend) -> HsmResult<()> {
         match family {
@@ -541,44 +557,46 @@ impl ConditionalSelfTest {
     }
 }
 
-/// Map a PKCS#11 mechanism to its algorithm family for CST lookup.
+/// Map a PKCS#11 mechanism to its primary algorithm family for CST lookup.
+///
+/// For composite mechanisms (CKM_ECDSA_SHA*, CKM_SHA*_RSA_PKCS*), this maps
+/// to the primary asymmetric algorithm family (ECDSA / RSA) rather than the
+/// digest algorithm, avoiding CST bypass of the signature algorithm.
+/// To test both the digest and asymmetric algorithm families, use
+/// [`mechanism_to_families`].
 ///
 /// `ec_params` should be provided for mechanisms that are curve-agnostic
-/// (CKM_ECDSA, CKM_ECDH1_DERIVE) to select the correct algorithm family.
-/// When `None`, defaults to P-256 for backwards compatibility.
+/// (CKM_ECDSA, CKM_ECDSA_SHA*, CKM_ECDH1_DERIVE) to select the correct
+/// algorithm family. When `None`, defaults to P-256 for backwards compatibility.
 pub fn mechanism_to_family(
     mechanism: CK_MECHANISM_TYPE,
     ec_params: Option<&[u8]>,
 ) -> Option<AlgorithmFamily> {
     use crate::pkcs11_abi::constants::*;
 
-    // Helper: check if EC params indicate P-384
-    let is_p384 = ec_params.is_some_and(|params| {
-        // OID for secp384r1: 06 05 2b 81 04 00 22
-        params.len() >= 7
-            && params.contains(&0x22)
-            && params.contains(&0x04)
-            && params.contains(&0x81)
-    });
-    // Helper: check if EC params indicate P-521
-    let is_p521 = ec_params.is_some_and(|params| {
-        // OID for secp521r1: 06 05 2b 81 04 00 23
-        params.len() >= 7
-            && params.contains(&0x23)
-            && params.contains(&0x04)
-            && params.contains(&0x81)
-    });
+    // Canonical DER-encoded OIDs
+    const P256_OID: &[u8] = &[0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07];
+    const P384_OID: &[u8] = &[0x06, 0x05, 0x2B, 0x81, 0x04, 0x00, 0x22];
+    const P521_OID: &[u8] = &[0x06, 0x05, 0x2B, 0x81, 0x04, 0x00, 0x23];
+
+    let is_p521 = ec_params == Some(P521_OID);
+    let is_p384 = ec_params == Some(P384_OID);
+    let is_p256 = ec_params == Some(P256_OID) || ec_params.is_none();
+
+    let ecdsa_family = if is_p521 {
+        Some(AlgorithmFamily::EcdsaP521)
+    } else if is_p384 {
+        Some(AlgorithmFamily::EcdsaP384)
+    } else if is_p256 {
+        Some(AlgorithmFamily::EcdsaP256)
+    } else {
+        None
+    };
 
     match mechanism {
-        CKM_SHA256 | CKM_SHA256_RSA_PKCS | CKM_SHA256_RSA_PKCS_PSS | CKM_ECDSA_SHA256 => {
-            Some(AlgorithmFamily::Sha256)
-        }
-        CKM_SHA384 | CKM_SHA384_RSA_PKCS | CKM_SHA384_RSA_PKCS_PSS | CKM_ECDSA_SHA384 => {
-            Some(AlgorithmFamily::Sha384)
-        }
-        CKM_SHA512 | CKM_SHA512_RSA_PKCS | CKM_SHA512_RSA_PKCS_PSS | CKM_ECDSA_SHA512 => {
-            Some(AlgorithmFamily::Sha512)
-        }
+        CKM_SHA256 => Some(AlgorithmFamily::Sha256),
+        CKM_SHA384 => Some(AlgorithmFamily::Sha384),
+        CKM_SHA512 => Some(AlgorithmFamily::Sha512),
         CKM_SHA_1 => Some(AlgorithmFamily::Sha1),
         CKM_SHA3_256 => Some(AlgorithmFamily::Sha3_256),
         CKM_SHA3_384 => Some(AlgorithmFamily::Sha3_384),
@@ -586,18 +604,15 @@ pub fn mechanism_to_family(
         CKM_AES_GCM => Some(AlgorithmFamily::AesGcm),
         CKM_AES_CBC | CKM_AES_CBC_PAD => Some(AlgorithmFamily::AesCbc),
         CKM_AES_CTR => Some(AlgorithmFamily::AesCtr),
-        CKM_RSA_PKCS => Some(AlgorithmFamily::RsaPkcs1),
-        CKM_RSA_PKCS_PSS => Some(AlgorithmFamily::RsaPss),
-        CKM_RSA_PKCS_OAEP => Some(AlgorithmFamily::RsaOaep),
-        CKM_ECDSA => {
-            if is_p521 {
-                Some(AlgorithmFamily::EcdsaP521)
-            } else if is_p384 {
-                Some(AlgorithmFamily::EcdsaP384)
-            } else {
-                Some(AlgorithmFamily::EcdsaP256)
-            }
+        CKM_RSA_PKCS | CKM_SHA256_RSA_PKCS | CKM_SHA384_RSA_PKCS | CKM_SHA512_RSA_PKCS => {
+            Some(AlgorithmFamily::RsaPkcs1)
         }
+        CKM_RSA_PKCS_PSS
+        | CKM_SHA256_RSA_PKCS_PSS
+        | CKM_SHA384_RSA_PKCS_PSS
+        | CKM_SHA512_RSA_PKCS_PSS => Some(AlgorithmFamily::RsaPss),
+        CKM_RSA_PKCS_OAEP => Some(AlgorithmFamily::RsaOaep),
+        CKM_ECDSA | CKM_ECDSA_SHA256 | CKM_ECDSA_SHA384 | CKM_ECDSA_SHA512 => ecdsa_family,
         CKM_EDDSA => Some(AlgorithmFamily::Ed25519),
         CKM_AES_KEY_WRAP | CKM_AES_KEY_WRAP_KWP => Some(AlgorithmFamily::AesKeyWrap),
         CKM_ECDH1_DERIVE => {
@@ -605,8 +620,10 @@ pub fn mechanism_to_family(
                 Some(AlgorithmFamily::EcdhP521)
             } else if is_p384 {
                 Some(AlgorithmFamily::EcdhP384)
-            } else {
+            } else if is_p256 {
                 Some(AlgorithmFamily::EcdhP256)
+            } else {
+                None
             }
         }
         CKM_ML_DSA_44 => Some(AlgorithmFamily::MlDsa44),
@@ -619,6 +636,100 @@ pub fn mechanism_to_family(
         CKM_SLH_DSA_SHA2_256S => Some(AlgorithmFamily::SlhDsaSha2_256s),
         CKM_HYBRID_ML_DSA_ECDSA => Some(AlgorithmFamily::HybridMlDsaEcdsa),
         _ => None,
+    }
+}
+
+/// Map a PKCS#11 mechanism to all algorithm families required for CST verification.
+///
+/// Composite mechanisms return both the digest algorithm family and the
+/// asymmetric algorithm family to satisfy FIPS 140-3 conditional self-test
+/// requirements.
+pub fn mechanism_to_families(
+    mechanism: CK_MECHANISM_TYPE,
+    ec_params: Option<&[u8]>,
+) -> Vec<AlgorithmFamily> {
+    use crate::pkcs11_abi::constants::*;
+
+    const P256_OID: &[u8] = &[0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07];
+    const P384_OID: &[u8] = &[0x06, 0x05, 0x2B, 0x81, 0x04, 0x00, 0x22];
+    const P521_OID: &[u8] = &[0x06, 0x05, 0x2B, 0x81, 0x04, 0x00, 0x23];
+
+    let is_p521 = ec_params == Some(P521_OID);
+    let is_p384 = ec_params == Some(P384_OID);
+    let is_p256 = ec_params == Some(P256_OID) || ec_params.is_none();
+
+    let ecdsa_family = if is_p521 {
+        Some(AlgorithmFamily::EcdsaP521)
+    } else if is_p384 {
+        Some(AlgorithmFamily::EcdsaP384)
+    } else if is_p256 {
+        Some(AlgorithmFamily::EcdsaP256)
+    } else {
+        None
+    };
+
+    match mechanism {
+        CKM_SHA256 => vec![AlgorithmFamily::Sha256],
+        CKM_SHA384 => vec![AlgorithmFamily::Sha384],
+        CKM_SHA512 => vec![AlgorithmFamily::Sha512],
+        CKM_SHA256_RSA_PKCS => vec![AlgorithmFamily::Sha256, AlgorithmFamily::RsaPkcs1],
+        CKM_SHA384_RSA_PKCS => vec![AlgorithmFamily::Sha384, AlgorithmFamily::RsaPkcs1],
+        CKM_SHA512_RSA_PKCS => vec![AlgorithmFamily::Sha512, AlgorithmFamily::RsaPkcs1],
+        CKM_SHA256_RSA_PKCS_PSS => vec![AlgorithmFamily::Sha256, AlgorithmFamily::RsaPss],
+        CKM_SHA384_RSA_PKCS_PSS => vec![AlgorithmFamily::Sha384, AlgorithmFamily::RsaPss],
+        CKM_SHA512_RSA_PKCS_PSS => vec![AlgorithmFamily::Sha512, AlgorithmFamily::RsaPss],
+        CKM_ECDSA_SHA256 => {
+            let mut f = vec![AlgorithmFamily::Sha256];
+            if let Some(ef) = ecdsa_family { f.push(ef); }
+            f
+        }
+        CKM_ECDSA_SHA384 => {
+            let mut f = vec![AlgorithmFamily::Sha384];
+            if let Some(ef) = ecdsa_family { f.push(ef); }
+            f
+        }
+        CKM_ECDSA_SHA512 => {
+            let mut f = vec![AlgorithmFamily::Sha512];
+            if let Some(ef) = ecdsa_family { f.push(ef); }
+            f
+        }
+        CKM_SHA_1 => vec![AlgorithmFamily::Sha1],
+        CKM_SHA3_256 => vec![AlgorithmFamily::Sha3_256],
+        CKM_SHA3_384 => vec![AlgorithmFamily::Sha3_384],
+        CKM_SHA3_512 => vec![AlgorithmFamily::Sha3_512],
+        CKM_AES_GCM => vec![AlgorithmFamily::AesGcm],
+        CKM_AES_CBC | CKM_AES_CBC_PAD => vec![AlgorithmFamily::AesCbc],
+        CKM_AES_CTR => vec![AlgorithmFamily::AesCtr],
+        CKM_RSA_PKCS => vec![AlgorithmFamily::RsaPkcs1],
+        CKM_RSA_PKCS_PSS => vec![AlgorithmFamily::RsaPss],
+        CKM_RSA_PKCS_OAEP => vec![AlgorithmFamily::RsaOaep],
+        CKM_ECDSA => match ecdsa_family {
+            Some(ef) => vec![ef],
+            None => Vec::new(),
+        },
+        CKM_EDDSA => vec![AlgorithmFamily::Ed25519],
+        CKM_AES_KEY_WRAP | CKM_AES_KEY_WRAP_KWP => vec![AlgorithmFamily::AesKeyWrap],
+        CKM_ECDH1_DERIVE => {
+            if is_p521 {
+                vec![AlgorithmFamily::EcdhP521]
+            } else if is_p384 {
+                vec![AlgorithmFamily::EcdhP384]
+            } else if is_p256 {
+                vec![AlgorithmFamily::EcdhP256]
+            } else {
+                Vec::new()
+            }
+        }
+        CKM_ML_DSA_44 => vec![AlgorithmFamily::MlDsa44],
+        CKM_ML_DSA_65 => vec![AlgorithmFamily::MlDsa65],
+        CKM_ML_DSA_87 => vec![AlgorithmFamily::MlDsa87],
+        CKM_ML_KEM_512 => vec![AlgorithmFamily::MlKem512],
+        CKM_ML_KEM_768 => vec![AlgorithmFamily::MlKem768],
+        CKM_ML_KEM_1024 => vec![AlgorithmFamily::MlKem1024],
+        CKM_SLH_DSA_SHA2_128S => vec![AlgorithmFamily::SlhDsaSha2_128s],
+        CKM_SLH_DSA_SHA2_256S => vec![AlgorithmFamily::SlhDsaSha2_256s],
+        CKM_HYBRID_ML_DSA_ECDSA => vec![AlgorithmFamily::HybridMlDsaEcdsa],
+        _ => Vec::new(),
     }
 }
 
@@ -728,6 +839,37 @@ mod tests {
             mechanism_to_family(CKM_ECDH1_DERIVE, Some(p384_oid)),
             Some(AlgorithmFamily::EcdhP384)
         );
+    }
+
+    #[test]
+    fn test_mechanism_to_family_ecdsa_sha_composite() {
+        use crate::pkcs11_abi::constants::*;
+        let p384_oid = &[0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x22];
+        let p521_oid = &[0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x23];
+
+        // Primary family check: maps to ECDSA, not Sha256/384/512
+        assert_eq!(
+            mechanism_to_family(CKM_ECDSA_SHA256, None),
+            Some(AlgorithmFamily::EcdsaP256)
+        );
+        assert_eq!(
+            mechanism_to_family(CKM_ECDSA_SHA384, Some(p384_oid)),
+            Some(AlgorithmFamily::EcdsaP384)
+        );
+        assert_eq!(
+            mechanism_to_family(CKM_ECDSA_SHA512, Some(p521_oid)),
+            Some(AlgorithmFamily::EcdsaP521)
+        );
+
+        // Full families check: returns both digest and ECDSA
+        let f256 = mechanism_to_families(CKM_ECDSA_SHA256, None);
+        assert_eq!(f256, vec![AlgorithmFamily::Sha256, AlgorithmFamily::EcdsaP256]);
+
+        let f384 = mechanism_to_families(CKM_ECDSA_SHA384, Some(p384_oid));
+        assert_eq!(f384, vec![AlgorithmFamily::Sha384, AlgorithmFamily::EcdsaP384]);
+
+        let f521 = mechanism_to_families(CKM_ECDSA_SHA512, Some(p521_oid));
+        assert_eq!(f521, vec![AlgorithmFamily::Sha512, AlgorithmFamily::EcdsaP521]);
     }
 
     #[cfg(feature = "rustcrypto-backend")]
