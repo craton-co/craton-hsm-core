@@ -55,6 +55,7 @@ use crate::audit::log::{AuditOperation, AuditResult};
 use crate::core::HsmCore;
 use crate::crypto::backend::CryptoBackend;
 use crate::crypto::encrypt::{GCM_IV_LEN, GCM_TAG_LEN};
+use crate::crypto::vector_scrub::ScrubOnDrop;
 use crate::crypto::{approved_services, derive, mechanisms, pairwise_test, pqc, sign};
 use crate::error::{HsmError, HsmResult};
 use crate::pkcs11_abi::constants::*;
@@ -528,7 +529,8 @@ fn ensure_default_tracing_subscriber() {
 #[no_mangle]
 pub extern "C" fn C_Initialize(p_init_args: CK_VOID_PTR) -> CK_RV {
     catch_unwind(|| {
-            let mut guard = HSM.lock();
+        let _scrub = ScrubOnDrop;
+        let mut guard = HSM.lock();
 
         if guard.is_some() {
             return CKR_CRYPTOKI_ALREADY_INITIALIZED;
@@ -613,7 +615,8 @@ pub extern "C" fn C_Initialize(p_init_args: CK_VOID_PTR) -> CK_RV {
 #[no_mangle]
 pub extern "C" fn C_Finalize(p_reserved: CK_VOID_PTR) -> CK_RV {
     catch_unwind(|| {
-            if !p_reserved.is_null() {
+        let _scrub = ScrubOnDrop;
+        if !p_reserved.is_null() {
             return CKR_ARGUMENTS_BAD;
         }
 
@@ -649,7 +652,8 @@ pub extern "C" fn C_Finalize(p_reserved: CK_VOID_PTR) -> CK_RV {
 #[no_mangle]
 pub extern "C" fn C_GetInfo(p_info: CK_INFO_PTR) -> CK_RV {
     catch_unwind(|| {
-            if get_hsm().is_err() {
+        let _scrub = ScrubOnDrop;
+        if get_hsm().is_err() {
             return CKR_CRYPTOKI_NOT_INITIALIZED;
         }
         if p_info.is_null() {
@@ -681,7 +685,8 @@ pub extern "C" fn C_GetInfo(p_info: CK_INFO_PTR) -> CK_RV {
 #[no_mangle]
 pub extern "C" fn C_GetFunctionList(pp_function_list: *mut *mut CK_FUNCTION_LIST) -> CK_RV {
     catch_unwind(|| {
-            if pp_function_list.is_null() {
+        let _scrub = ScrubOnDrop;
+        if pp_function_list.is_null() {
             return CKR_ARGUMENTS_BAD;
         }
         unsafe {
@@ -703,7 +708,8 @@ pub extern "C" fn C_GetSlotList(
     pul_count: CK_ULONG_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -747,7 +753,8 @@ pub extern "C" fn C_GetSlotList(
 #[no_mangle]
 pub extern "C" fn C_GetSlotInfo(slot_id: CK_SLOT_ID, p_info: CK_SLOT_INFO_PTR) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -782,7 +789,8 @@ pub extern "C" fn C_GetSlotInfo(slot_id: CK_SLOT_ID, p_info: CK_SLOT_INFO_PTR) -
 #[no_mangle]
 pub extern "C" fn C_GetTokenInfo(slot_id: CK_SLOT_ID, p_info: CK_TOKEN_INFO_PTR) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -837,7 +845,8 @@ pub extern "C" fn C_InitToken(
     p_label: CK_UTF8CHAR_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -891,7 +900,8 @@ pub extern "C" fn C_InitPIN(
     pin_len: CK_ULONG,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -934,7 +944,8 @@ pub extern "C" fn C_SetPIN(
     new_len: CK_ULONG,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -972,7 +983,8 @@ pub extern "C" fn C_GetMechanismList(
     pul_count: CK_ULONG_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -1020,7 +1032,8 @@ pub extern "C" fn C_GetMechanismInfo(
     p_info: CK_MECHANISM_INFO_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -1180,7 +1193,8 @@ pub extern "C" fn C_OpenSession(
     ph_session: CK_SESSION_HANDLE_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -1209,7 +1223,8 @@ pub extern "C" fn C_OpenSession(
 #[no_mangle]
 pub extern "C" fn C_CloseSession(session: CK_SESSION_HANDLE) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -1236,7 +1251,8 @@ pub extern "C" fn C_CloseSession(session: CK_SESSION_HANDLE) -> CK_RV {
 #[no_mangle]
 pub extern "C" fn C_CloseAllSessions(slot_id: CK_SLOT_ID) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -1257,7 +1273,8 @@ pub extern "C" fn C_GetSessionInfo(
     p_info: CK_SESSION_INFO_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -1286,7 +1303,8 @@ pub extern "C" fn C_Login(
     pin_len: CK_ULONG,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -1378,7 +1396,8 @@ pub extern "C" fn C_Login(
 #[no_mangle]
 pub extern "C" fn C_Logout(session: CK_SESSION_HANDLE) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -1438,7 +1457,8 @@ pub extern "C" fn C_CreateObject(
     ph_object: CK_OBJECT_HANDLE_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -1516,7 +1536,8 @@ pub extern "C" fn C_CreateObject(
 #[no_mangle]
 pub extern "C" fn C_DestroyObject(session: CK_SESSION_HANDLE, object: CK_OBJECT_HANDLE) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -1577,7 +1598,8 @@ pub extern "C" fn C_GetObjectSize(
     pul_size: CK_ULONG_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -1619,7 +1641,8 @@ pub extern "C" fn C_GetAttributeValue(
     count: CK_ULONG,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -1700,7 +1723,8 @@ pub extern "C" fn C_SetAttributeValue(
     count: CK_ULONG,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -1789,7 +1813,8 @@ pub extern "C" fn C_FindObjectsInit(
     count: CK_ULONG,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -1834,7 +1859,8 @@ pub extern "C" fn C_FindObjects(
     pul_count: CK_ULONG_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -1878,7 +1904,8 @@ pub extern "C" fn C_FindObjects(
 #[no_mangle]
 pub extern "C" fn C_FindObjectsFinal(session: CK_SESSION_HANDLE) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -1909,7 +1936,8 @@ pub extern "C" fn C_EncryptInit(
     key: CK_OBJECT_HANDLE,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -2046,7 +2074,8 @@ pub extern "C" fn C_Encrypt(
     pul_encrypted_data_len: CK_ULONG_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -2287,7 +2316,8 @@ pub extern "C" fn C_DecryptInit(
     key: CK_OBJECT_HANDLE,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -2377,7 +2407,8 @@ pub extern "C" fn C_Decrypt(
     pul_data_len: CK_ULONG_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -2566,7 +2597,8 @@ pub extern "C" fn C_SignInit(
     key: CK_OBJECT_HANDLE,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -2661,7 +2693,8 @@ pub extern "C" fn C_Sign(
     pul_signature_len: CK_ULONG_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -3071,7 +3104,8 @@ pub extern "C" fn C_VerifyInit(
     key: CK_OBJECT_HANDLE,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -3156,7 +3190,8 @@ pub extern "C" fn C_Verify(
     signature_len: CK_ULONG,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -3264,7 +3299,8 @@ pub extern "C" fn C_GenerateKey(
     ph_key: CK_OBJECT_HANDLE_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -3477,7 +3513,8 @@ pub extern "C" fn C_GenerateKeyPair(
     ph_private_key: CK_OBJECT_HANDLE_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -4150,7 +4187,8 @@ pub extern "C" fn C_SeedRandom(
     _seed_len: CK_ULONG,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -4171,7 +4209,8 @@ pub extern "C" fn C_GenerateRandom(
     random_len: CK_ULONG,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -4223,7 +4262,8 @@ pub extern "C" fn C_GetOperationState(
     pulOperationStateLen: CK_ULONG_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -4295,7 +4335,8 @@ pub extern "C" fn C_SetOperationState(
     hAuthenticationKey: CK_OBJECT_HANDLE,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -4431,7 +4472,8 @@ pub extern "C" fn C_CopyObject(
     ph_new_object: CK_OBJECT_HANDLE_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -4719,7 +4761,8 @@ pub extern "C" fn C_EncryptUpdate(
     pul_encrypted_part_len: CK_ULONG_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -4768,7 +4811,8 @@ pub extern "C" fn C_EncryptFinal(
     pul_last_encrypted_part_len: CK_ULONG_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -4962,7 +5006,8 @@ pub extern "C" fn C_DecryptUpdate(
     pul_part_len: CK_ULONG_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -5012,7 +5057,8 @@ pub extern "C" fn C_DecryptFinal(
     pul_last_part_len: CK_ULONG_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -5176,7 +5222,8 @@ pub extern "C" fn C_DecryptFinal(
 #[no_mangle]
 pub extern "C" fn C_DigestInit(session: CK_SESSION_HANDLE, p_mechanism: CK_MECHANISM_PTR) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -5229,7 +5276,8 @@ pub extern "C" fn C_Digest(
     pul_digest_len: CK_ULONG_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -5308,7 +5356,8 @@ pub extern "C" fn C_DigestUpdate(
     part_len: CK_ULONG,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -5354,7 +5403,8 @@ pub extern "C" fn C_DigestUpdate(
 #[no_mangle]
 pub extern "C" fn C_DigestKey(session: CK_SESSION_HANDLE, key: CK_OBJECT_HANDLE) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -5427,7 +5477,8 @@ pub extern "C" fn C_DigestFinal(
     pul_digest_len: CK_ULONG_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -5510,7 +5561,8 @@ pub extern "C" fn C_SignUpdate(
     part_len: CK_ULONG,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -5565,7 +5617,8 @@ pub extern "C" fn C_SignFinal(
     pul_signature_len: CK_ULONG_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -5741,7 +5794,8 @@ pub extern "C" fn C_VerifyUpdate(
     part_len: CK_ULONG,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -5796,7 +5850,8 @@ pub extern "C" fn C_VerifyFinal(
     signature_len: CK_ULONG,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -5998,7 +6053,8 @@ pub extern "C" fn C_WrapKey(
     pul_wrapped_key_len: CK_ULONG_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -6137,7 +6193,8 @@ pub extern "C" fn C_UnwrapKey(
     ph_key: CK_OBJECT_HANDLE_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };
@@ -6406,7 +6463,8 @@ pub extern "C" fn C_DeriveKey(
     ph_key: CK_OBJECT_HANDLE_PTR,
 ) -> CK_RV {
     catch_unwind(|| {
-            let hsm = match get_hsm() {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
             Ok(h) => h,
             Err(rv) => return rv,
         };

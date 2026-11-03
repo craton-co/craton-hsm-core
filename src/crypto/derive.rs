@@ -136,6 +136,7 @@ pub fn ecdh_p521(
     peer_public_key_sec1: &[u8],
     okm_len: Option<usize>,
 ) -> HsmResult<RawKeyMaterial> {
+    let _scrub = crate::crypto::vector_scrub::ScrubOnDrop::new();
     let derived_len = okm_len.unwrap_or(66);
     validate_okm_len(derived_len)?;
 
@@ -198,6 +199,7 @@ pub fn ecdh_p521_shared_secret(
     private_key_bytes: &[u8],
     peer_public_key_sec1: &[u8],
 ) -> HsmResult<RawKeyMaterial> {
+    let _scrub = crate::crypto::vector_scrub::ScrubOnDrop::new();
     let secret_key =
         P521SecretKey::from_slice(private_key_bytes).map_err(|_| HsmError::KeyHandleInvalid)?;
     let peer_public =

@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **AVX-512 Vector Acceleration for Cryptographic Algorithms**: Implemented 512-bit vector acceleration
+  across AES-CTR (2.30x speedup, >11.5 GB/s), AES-CBC decrypt (2.89x speedup, >16.1 GB/s),
+  ML-KEM polynomial arithmetic (6.49x speedup on Montgomery multiplication, 1.62x on poly add),
+  ML-DSA polynomial arithmetic (1.78x speedup on poly add), and RSA-2048 Montgomery multiplication
+  with AVX-512 IFMA (4.47x speedup). Configurable via `VectorConfig` and `CRATON_HSM_AVX512_*` env vars.
+- **Empirical Default Selection**: Features with proven speedups enabled by default; Keccak-p[1600] / SHA-3
+  empirically defaulted to disabled (`default = false`) because 64-bit scalar registers outperform
+  SIMD lane transposition on single-stream hashes.
+- **Confidential Computing Support**: Dynamic verification of XSAVE / XCR0 vector enablement
+  (opmask bit 5, ZMM_Hi256 bit 6, Hi16_ZMM bit 7) for safe execution inside AWS Nitro Enclaves,
+  AMD SEV-SNP, and Intel TDX / SGX guest environments.
+- **No Frequency Penalty Verification**: Real-time clock probe confirming modern Zen 4/5 (Turin)
+  and Sapphire Rapids CPUs maintain full boost clock without downclocking under sustained AVX-512 load.
+
+### Security
+
+- **Scrub SIMD registers after every PKCS#11 call**: wipe `zmm0`–`zmm31` and `k0`–`k7`
+  on AVX-512 hosts (`ymm0`–`ymm15` / `xmm0`–`xmm15` otherwise) via RAII `ScrubOnDrop` guards
+  before returning, so sensitive key-derived data and intermediate states do not linger in vector registers.
+
 ## [0.10.6] - 2026-10-29
 
 ### Fixed

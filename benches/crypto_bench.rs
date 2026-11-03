@@ -736,9 +736,119 @@ fn bench_audit_record_sync(c: &mut Criterion) {
 }
 
 // ============================================================================
+
+// ============================================================================
+// AVX-512 Vector Acceleration Benchmarks
+// ============================================================================
+
+fn bench_vector_aes_ctr(c: &mut Criterion) {
+    let mut group = c.benchmark_group("vector_aes_ctr");
+    let key = [0x42u8; 32];
+    let iv = [0x24u8; 16];
+    let data_64k = vec![0x5au8; 64 * 1024];
+
+    // AVX-512 Vector
+    craton_hsm::crypto::vector_accel::set_config(craton_hsm::crypto::vector_accel::VectorConfig::default());
+    group.bench_function("avx512_64k", |b| {
+        b.iter(|| {
+            black_box(craton_hsm::crypto::encrypt::aes_ctr_decrypt(
+                black_box(&key),
+                black_box(&iv),
+                black_box(&data_64k),
+            ).unwrap())
+        })
+    });
+
+    // Scalar baseline
+    let mut cfg = craton_hsm::crypto::vector_accel::active_config();
+    cfg.aes_ctr_enabled = false;
+    craton_hsm::crypto::vector_accel::set_config(cfg);
+    group.bench_function("scalar_64k", |b| {
+        b.iter(|| {
+            black_box(craton_hsm::crypto::encrypt::aes_ctr_decrypt(
+                black_box(&key),
+                black_box(&iv),
+                black_box(&data_64k),
+            ).unwrap())
+        })
+    });
+    group.finish();
+}
+
+mod pqc_bench {
+    pub const MLKEM_Q: i16 = 3329;
+    pub const MLKEM_N: usize = 256;
+
+    pub fn poly_mul_montgomery(out: &mut [i16; MLKEM_N], a: &[i16; MLKEM_N], b: &[i16; MLKEM_N], vector: bool) {
+        #[cfg(target_arch = "x86_64")]
+        if vector && is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+            unsafe { poly_mul_montgomery_avx512(out, a, b) };
+            return;
+        }
+        for i in 0..MLKEM_N {
+            let prod = (a[i] as i32) * (b[i] as i32);
+            let t = (prod as i16).wrapping_mul(-3327) as i32;
+            let res = (prod - t * (MLKEM_Q as i32)) >> 16;
+            out[i] = res as i16;
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw")]
+    unsafe fn poly_mul_montgomery_avx512(out: &mut [i16; MLKEM_N], a: &[i16; MLKEM_N], b: &[i16; MLKEM_N]) {
+        use std::arch::x86_64::*;
+        let v_q = _mm512_set1_epi16(MLKEM_Q);
+        let v_qinv = _mm512_set1_epi16(-3327);
+        for i in 0..8 {
+            let offset = i * 32;
+            let va = _mm512_loadu_si512(a.as_ptr().add(offset) as *const __m512i);
+            let vb = _mm512_loadu_si512(b.as_ptr().add(offset) as *const __m512i);
+            let prod_lo = _mm512_mullo_epi16(va, vb);
+            let prod_hi = _mm512_mulhi_epi16(va, vb);
+            let t = _mm512_mullo_epi16(prod_lo, v_qinv);
+            let t_q_hi = _mm512_mulhi_epi16(t, v_q);
+            let res = _mm512_sub_epi16(prod_hi, t_q_hi);
+            _mm512_storeu_si512(out.as_mut_ptr().add(offset) as *mut __m512i, res);
+        }
+    }
+}
+
+fn bench_vector_pqc_mlkem(c: &mut Criterion) {
+    let mut group = c.benchmark_group("vector_pqc_mlkem");
+    let a = [1234i16; 256];
+    let b = [2345i16; 256];
+    let mut out = [0i16; 256];
+
+    // Vector
+    group.bench_function("avx512_montgomery_mul", |bench| {
+        bench.iter(|| {
+            pqc_bench::poly_mul_montgomery(
+                black_box(&mut out),
+                black_box(&a),
+                black_box(&b),
+                true,
+            )
+        })
+    });
+
+    // Scalar
+    group.bench_function("scalar_montgomery_mul", |bench| {
+        bench.iter(|| {
+            pqc_bench::poly_mul_montgomery(
+                black_box(&mut out),
+                black_box(&a),
+                black_box(&b),
+                false,
+            )
+        })
+    });
+    group.finish();
+}
+
 // Criterion Groups
 // ============================================================================
 
+criterion_group!(vector_benches, bench_vector_aes_ctr, bench_vector_pqc_mlkem,);
 criterion_group!(rsa_benches, bench_rsa_sign, bench_rsa_verify,);
 
 criterion_group!(
@@ -783,6 +893,7 @@ criterion_group!(
 );
 
 criterion_main!(
+    vector_benches,
     rsa_benches,
     ecdsa_benches,
     ed25519_benches,

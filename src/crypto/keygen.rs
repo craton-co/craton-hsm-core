@@ -98,6 +98,7 @@ pub fn generate_ec_p256_key_pair() -> HsmResult<(RawKeyMaterial, Vec<u8>)> {
 
 /// Generate EC key pair for P-384. Returns (private_key_bytes, public_key_sec1_uncompressed).
 pub fn generate_ec_p384_key_pair() -> HsmResult<(RawKeyMaterial, Vec<u8>)> {
+    let _scrub = crate::crypto::vector_scrub::ScrubOnDrop::new();
     use elliptic_curve::sec1::ToEncodedPoint;
     use p384::SecretKey;
 
@@ -114,6 +115,7 @@ pub fn generate_ec_p384_key_pair() -> HsmResult<(RawKeyMaterial, Vec<u8>)> {
 
 /// Generate EC key pair for P-521. Returns (private_key_bytes, public_key_sec1_uncompressed).
 pub fn generate_ec_p521_key_pair() -> HsmResult<(RawKeyMaterial, Vec<u8>)> {
+    let _scrub = crate::crypto::vector_scrub::ScrubOnDrop::new();
     use elliptic_curve::sec1::ToEncodedPoint;
     use p521::SecretKey;
 

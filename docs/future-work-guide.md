@@ -29,7 +29,7 @@ Look for versions without `-rc` or `-pre` suffixes (e.g., `ml-kem 0.3.0` or `1.0
    - `ml_kem::kem::{Encapsulate, Decapsulate}` trait usage
    - `ml_dsa::{SigningKey, VerifyingKey}` API
    - `slh_dsa::{SigningKey, VerifyingKey}` API
-   - RNG bridging (`rand_core_new` / `getrandom_new`) may change
+   - RNG bridging (`rand_core`) may change
 
 3. Run the PQC test suites:
    ```bash
@@ -47,7 +47,7 @@ Look for versions without `-rc` or `-pre` suffixes (e.g., `ml-kem 0.3.0` or `1.0
 
 **Current state:** The project uses **two** `rand_core` versions simultaneously:
 - `rand_core 0.6` — used by `ed25519-dalek`, `rsa`, `ecdsa`, `p256`, `p384`, `aes-gcm`
-- `rand_core 0.10` (aliased as `rand_core_new`) — required by `ml-kem`, `ml-dsa`, `slh-dsa`
+- `rand_core 0.10` — used by `ml-kem`, `ml-dsa`, `slh-dsa` (direct dependency in `Cargo.toml`)
 
 This dual-version situation exists because the PQC crates adopted `rand_core 0.10` before the rest of the RustCrypto ecosystem.
 
