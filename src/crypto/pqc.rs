@@ -35,7 +35,7 @@ impl PqcDrbgRng {
 /// across the FFI boundary into the host application, which is undefined
 /// behavior. Aborting is the only safe response to a catastrophic RNG failure
 /// in a shared library context.
-impl rand_core_new::TryRng for PqcDrbgRng {
+impl rand_core::TryRng for PqcDrbgRng {
     type Error = core::convert::Infallible;
 
     fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
@@ -68,7 +68,7 @@ impl rand_core_new::TryRng for PqcDrbgRng {
     }
 }
 
-impl rand_core_new::TryCryptoRng for PqcDrbgRng {}
+impl rand_core::TryCryptoRng for PqcDrbgRng {}
 
 /// Create a rand_core 0.10 CryptoRng backed by the FIPS HMAC_DRBG.
 ///
@@ -757,4 +757,91 @@ pub fn is_slh_dsa_mechanism(mechanism: crate::pkcs11_abi::types::CK_MECHANISM_TY
 
 pub fn is_hybrid_mechanism(mechanism: crate::pkcs11_abi::types::CK_MECHANISM_TYPE) -> bool {
     mechanism == crate::pkcs11_abi::constants::CKM_HYBRID_ML_DSA_ECDSA
+}
+
+// ============================================================================
+// SIMD Accelerated Polynomial Arithmetic (ML-KEM & ML-DSA)
+// ============================================================================
+
+/// Accelerated polynomial addition for ML-KEM ($q = 3329$).
+/// Dispatches to AVX-512BW vector acceleration when enabled, otherwise falls back to scalar.
+pub fn mlkem_poly_add(a: &mut [i16; 256], b: &[i16; 256]) {
+    crate::crypto::vector_accel::pqc_mlkem::poly_add(a, b);
+}
+
+/// Accelerated polynomial subtraction for ML-KEM ($q = 3329$).
+/// Dispatches to AVX-512BW vector acceleration when enabled, otherwise falls back to scalar.
+pub fn mlkem_poly_sub(a: &mut [i16; 256], b: &[i16; 256]) {
+    crate::crypto::vector_accel::pqc_mlkem::poly_sub(a, b);
+}
+
+/// Accelerated polynomial addition for ML-DSA ($q = 8380417$).
+/// Dispatches to AVX-512F vector acceleration when enabled, otherwise falls back to scalar.
+pub fn mldsa_poly_add(a: &mut [i32; 256], b: &[i32; 256]) {
+    crate::crypto::vector_accel::pqc_mldsa::poly_add(a, b);
+}
+
+/// Accelerated polynomial subtraction for ML-DSA ($q = 8380417$).
+/// Dispatches to AVX-512F vector acceleration when enabled, otherwise falls back to scalar.
+pub fn mldsa_poly_sub(a: &mut [i32; 256], b: &[i32; 256]) {
+    crate::crypto::vector_accel::pqc_mldsa::poly_sub(a, b);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mlkem_poly_arithmetic_differential() {
+        let mut a = [0i16; 256];
+        let mut b = [0i16; 256];
+        for i in 0..256 {
+            a[i] = ((i * 17) % 3329) as i16;
+            b[i] = ((i * 31 + 5) % 3329) as i16;
+        }
+
+        let mut a_scalar = a;
+        crate::crypto::vector_accel::pqc_mlkem::poly_add_scalar(&mut a_scalar, &b);
+
+        let mut a_vector = a;
+        mlkem_poly_add(&mut a_vector, &b);
+
+        assert_eq!(a_scalar, a_vector, "mlkem_poly_add must match scalar reference");
+
+        let mut sub_scalar = a_scalar;
+        crate::crypto::vector_accel::pqc_mlkem::poly_sub_scalar(&mut sub_scalar, &b);
+
+        let mut sub_vector = a_vector;
+        mlkem_poly_sub(&mut sub_vector, &b);
+
+        assert_eq!(sub_scalar, sub_vector, "mlkem_poly_sub must match scalar reference");
+        assert_eq!(sub_vector, a, "poly_add followed by poly_sub must recover original");
+    }
+
+    #[test]
+    fn test_mldsa_poly_arithmetic_differential() {
+        let mut a = [0i32; 256];
+        let mut b = [0i32; 256];
+        for i in 0..256 {
+            a[i] = (i as i32 * 7919) % 8380417;
+            b[i] = (i as i32 * 104729 + 13) % 8380417;
+        }
+
+        let mut a_scalar = a;
+        crate::crypto::vector_accel::pqc_mldsa::poly_add_scalar(&mut a_scalar, &b);
+
+        let mut a_vector = a;
+        mldsa_poly_add(&mut a_vector, &b);
+
+        assert_eq!(a_scalar, a_vector, "mldsa_poly_add must match scalar reference");
+
+        let mut sub_scalar = a_scalar;
+        crate::crypto::vector_accel::pqc_mldsa::poly_sub_scalar(&mut sub_scalar, &b);
+
+        let mut sub_vector = a_vector;
+        mldsa_poly_sub(&mut sub_vector, &b);
+
+        assert_eq!(sub_scalar, sub_vector, "mldsa_poly_sub must match scalar reference");
+        assert_eq!(sub_vector, a, "poly_add followed by poly_sub must recover original");
+    }
 }

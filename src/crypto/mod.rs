@@ -22,4 +22,6 @@ pub mod rate_limit;
 pub mod rustcrypto_backend;
 pub mod self_test;
 pub mod sign;
+pub mod vector_scrub;
+pub mod vector_accel;
 pub mod wrap;

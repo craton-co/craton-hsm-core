@@ -108,6 +108,25 @@ Generate / Import
 - Windows: `VirtualLock` / `VirtualUnlock` via `windows-sys`
 - Failure is non-fatal (logged, continues) — may lack privileges for large buffers
 
+### Vector register scrubbing
+
+`zeroize` clears memory but not CPU registers, and AES-NI / SHA-NI / AVX2 /
+AVX-512 code paths leave key-derived data there. Every PKCS#11 entry point
+binds a `ScrubOnDrop` guard ([`crypto/vector_scrub.rs`](../src/crypto/vector_scrub.rs))
+that, before returning (or unwinding), wipes:
+
+- AVX-512 hosts: `zmm0`–`zmm31` (`vpxord`) and `k0`–`k7` (`kxorw`)
+- AVX hosts: `ymm0`–`ymm15` (`vzeroall`)
+- Otherwise: `xmm0`–`xmm15` (`pxor`)
+
+The ISA is picked at runtime via cached CPUID. The wipe is inline `asm!`, which
+the compiler cannot elide. On Windows x64 the low 128 bits of `xmm6`–`xmm15` are
+callee-saved, so they hold the caller's own values on return.
+
+AVX-512 works inside AWS Nitro Enclaves, AMD SEV-SNP and Intel TDX guests, and
+Zen 4/5 and Sapphire Rapids+ do not downclock under 512-bit vector code, so the
+scrub costs a few dozen register ops per call.
+
 ### Access control model
 
 PKCS#11 objects have three levels of protection:

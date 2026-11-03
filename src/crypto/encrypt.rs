@@ -677,6 +677,7 @@ pub fn aes_cbc_encrypt(key: &[u8], iv: &[u8], plaintext: &[u8]) -> HsmResult<Vec
 /// decryption succeeded or failed. The caller MUST verify a MAC (encrypt-then-MAC)
 /// over the IV + ciphertext BEFORE calling this function.
 pub fn aes_cbc_decrypt(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> HsmResult<Vec<u8>> {
+    let _scrub = crate::crypto::vector_scrub::ScrubOnDrop;
     use cbc::cipher::{BlockDecryptMut, KeyIvInit};
 
     // SECURITY: All decryption errors (padding, key size, IV size, etc.) return
@@ -708,6 +709,13 @@ pub fn aes_cbc_decrypt(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> HsmResult<Ve
 
     let result: HsmResult<Vec<u8>> = if iv.len() != 16 {
         Err(HsmError::MechanismParamInvalid)
+    } else if let Some(mut avx_out) = crate::crypto::vector_accel::avx512_aes_cbc_decrypt(key, iv, ciphertext) {
+        // Constant-time PKCS#7 unpadding to avoid padding oracle leakage
+        if pkcs7_unpad_ct(&mut avx_out) {
+            Ok(avx_out)
+        } else {
+            Err(HsmError::EncryptedDataInvalid)
+        }
     } else {
         match key.len() {
             16 => {
@@ -767,7 +775,7 @@ pub fn aes_cbc_encrypt_unpadded(key: &[u8], iv: &[u8], plaintext: &[u8]) -> HsmR
     tracing::warn!("AES-CBC encrypt: unauthenticated mode — prefer AES-GCM for new applications");
 
     if plaintext.is_empty()
-        || !plaintext.len().is_multiple_of(16)
+        || plaintext.len() % 16 != 0
         || plaintext.len() > AES_CBC_CTR_MAX_PLAINTEXT
     {
         return Err(HsmError::DataLenRange);
@@ -819,18 +827,54 @@ pub fn aes_cbc_encrypt_unpadded(key: &[u8], iv: &[u8], plaintext: &[u8]) -> HsmR
     }
 }
 
+/// Constant-time PKCS#7 unpadding to prevent padding oracle timing attacks.
+fn pkcs7_unpad_ct(data: &mut Vec<u8>) -> bool {
+    if data.is_empty() || data.len() % 16 != 0 {
+        return false;
+    }
+    let pad_len = *data.last().unwrap() as usize;
+    let mut valid: u8 = if pad_len > 0 && pad_len <= 16 && pad_len <= data.len() {
+        1
+    } else {
+        0
+    };
+    for i in 1..=16 {
+        let expected = pad_len as u8;
+        let actual = if i <= data.len() {
+            data[data.len() - i]
+        } else {
+            0
+        };
+        let mask = if i <= pad_len { 1u8 } else { 0u8 };
+        let mismatch = (actual ^ expected) & (0u8.wrapping_sub(mask));
+        if mismatch != 0 {
+            valid = 0;
+        }
+    }
+    if valid == 1 {
+        data.truncate(data.len() - pad_len);
+        true
+    } else {
+        false
+    }
+}
+
 /// Unpadded AES-CBC decrypt (`CKM_AES_CBC`, PKCS#11 v3.0 §6.7.4).
 ///
 /// Input must be a non-empty multiple of 16 bytes; output has the exact same length.
 pub fn aes_cbc_decrypt_unpadded(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> HsmResult<Vec<u8>> {
-    use cbc::cipher::{BlockDecryptMut, KeyIvInit};
-
+    let _scrub = crate::crypto::vector_scrub::ScrubOnDrop;
     if iv.len() != 16 {
         return Err(HsmError::MechanismParamInvalid);
     }
-    if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(16) {
+    if ciphertext.is_empty() || ciphertext.len() % 16 != 0 {
         return Err(HsmError::EncryptedDataLenRange);
     }
+
+    if let Some(avx_out) = crate::crypto::vector_accel::avx512_aes_cbc_decrypt(key, iv, ciphertext) {
+        return Ok(avx_out);
+    }
+    use cbc::cipher::{BlockDecryptMut, KeyIvInit};
 
     match key.len() {
         16 => {
@@ -974,6 +1018,10 @@ fn aes_ctr_validate(key: &[u8], iv: &[u8], data: &[u8]) -> HsmResult<()> {
 
 /// Shared AES-CTR keystream application (encrypt and decrypt are identical in CTR mode).
 fn aes_ctr_apply(key: &[u8], iv: &[u8], data: &[u8]) -> HsmResult<Vec<u8>> {
+    let _scrub = crate::crypto::vector_scrub::ScrubOnDrop;
+    if let Some(avx_out) = crate::crypto::vector_accel::avx512_aes_ctr_crypt(key, iv, data) {
+        return Ok(avx_out);
+    }
     use ctr::cipher::{KeyIvInit, StreamCipher};
 
     let mut output = data.to_vec();

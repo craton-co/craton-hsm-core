@@ -924,6 +924,7 @@ pub fn ecdsa_p384_verify(public_key_sec1: &[u8], data: &[u8], signature: &[u8]) 
 
 /// ECDSA P-521 sign (hedged — RFC 6979 + DRBG randomness)
 pub fn ecdsa_p521_sign(private_key_bytes: &[u8], data: &[u8]) -> HsmResult<Vec<u8>> {
+    let _scrub = crate::crypto::vector_scrub::ScrubOnDrop::new();
     use crate::crypto::drbg::DrbgRng;
     use p521::ecdsa::signature::RandomizedSigner;
     use p521::ecdsa::SigningKey;
@@ -940,6 +941,7 @@ pub fn ecdsa_p521_sign(private_key_bytes: &[u8], data: &[u8]) -> HsmResult<Vec<u
 
 /// ECDSA P-521 verify
 pub fn ecdsa_p521_verify(public_key_sec1: &[u8], data: &[u8], signature: &[u8]) -> HsmResult<bool> {
+    let _scrub = crate::crypto::vector_scrub::ScrubOnDrop::new();
     use p521::ecdsa::signature::Verifier;
     use p521::ecdsa::VerifyingKey;
 
@@ -1490,6 +1492,7 @@ pub(crate) fn ecdsa_p521_sign_prehashed(
     private_key_bytes: &[u8],
     digest: &[u8],
 ) -> HsmResult<Vec<u8>> {
+    let _scrub = crate::crypto::vector_scrub::ScrubOnDrop::new();
     use crate::crypto::drbg::DrbgRng;
     use p521::ecdsa::signature::hazmat::RandomizedPrehashSigner;
     use p521::ecdsa::SigningKey;
@@ -1511,6 +1514,7 @@ pub(crate) fn ecdsa_p521_verify_prehashed(
     digest: &[u8],
     signature: &[u8],
 ) -> HsmResult<bool> {
+    let _scrub = crate::crypto::vector_scrub::ScrubOnDrop::new();
     use p521::ecdsa::signature::hazmat::PrehashVerifier;
     use p521::ecdsa::VerifyingKey;
 
