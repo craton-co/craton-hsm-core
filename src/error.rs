@@ -117,11 +117,14 @@ pub enum HsmError {
     AuditChainBroken(String),
     #[error("session closed")]
     SessionClosed,
+    #[error("state unsaveable")]
+    StateUnsaveable,
 }
 
 impl From<HsmError> for CK_RV {
     fn from(e: HsmError) -> CK_RV {
         match e {
+            HsmError::StateUnsaveable => CKR_STATE_UNSAVEABLE,
             HsmError::NotInitialized => CKR_CRYPTOKI_NOT_INITIALIZED,
             HsmError::AlreadyInitialized => CKR_CRYPTOKI_ALREADY_INITIALIZED,
             HsmError::ArgumentsBad => CKR_ARGUMENTS_BAD,
