@@ -115,6 +115,24 @@ pub enum ActiveOperation {
         /// and can reconstruct the hasher by re-feeding it.
         accumulated_input: Zeroizing<Vec<u8>>,
     },
+    /// Digital signature operation with data recovery (PKCS#11 C_SignRecover).
+    SignRecover {
+        /// Mechanism type (CKM_RSA_PKCS).
+        mechanism: CK_MECHANISM_TYPE,
+        /// Handle to the key used for signing.
+        key_handle: CK_OBJECT_HANDLE,
+        /// Cached object reference from C_SignRecoverInit.
+        cached_object: Option<Arc<parking_lot::RwLock<StoredObject>>>,
+    },
+    /// Signature verification operation with data recovery (PKCS#11 C_VerifyRecover).
+    VerifyRecover {
+        /// Mechanism type (CKM_RSA_PKCS).
+        mechanism: CK_MECHANISM_TYPE,
+        /// Handle to the key used for verification.
+        key_handle: CK_OBJECT_HANDLE,
+        /// Cached object reference from C_VerifyRecoverInit.
+        cached_object: Option<Arc<parking_lot::RwLock<StoredObject>>>,
+    },
 }
 
 // ── Operation state serialization constants ──
@@ -258,6 +276,9 @@ impl ActiveOperation {
                 buf.extend_from_slice(&0u64.to_le_bytes()); // key_handle = 0
                 buf.extend_from_slice(&0u32.to_le_bytes()); // no mechanism_param
                 write_field(&mut buf, accumulated_input, OP_STATE_MAX_DATA_LEN)?;
+            }
+            ActiveOperation::SignRecover { .. } | ActiveOperation::VerifyRecover { .. } => {
+                return Err(HsmError::StateUnsaveable);
             }
         }
 
@@ -446,6 +467,24 @@ impl std::fmt::Debug for ActiveOperation {
                 .debug_struct("Digest")
                 .field("mechanism", mechanism)
                 .finish(),
+            ActiveOperation::SignRecover {
+                mechanism,
+                key_handle,
+                ..
+            } => f
+                .debug_struct("SignRecover")
+                .field("mechanism", mechanism)
+                .field("key_handle", key_handle)
+                .finish(),
+            ActiveOperation::VerifyRecover {
+                mechanism,
+                key_handle,
+                ..
+            } => f
+                .debug_struct("VerifyRecover")
+                .field("mechanism", mechanism)
+                .field("key_handle", key_handle)
+                .finish(),
         }
     }
 }
@@ -463,6 +502,8 @@ pub struct Session {
     pub flags: CK_FLAGS,
     pub state: SessionState,
     pub active_operation: Option<ActiveOperation>,
+    pub active_digest: Option<ActiveOperation>,
+    pub active_sign_verify: Option<ActiveOperation>,
     pub find_context: Option<FindContext>,
     /// FIPS 140-3 IG 2.4.C: Algorithm indicator for the last completed operation.
     /// `Some(true)` = approved, `Some(false)` = non-approved, `None` = no operation yet.
@@ -481,6 +522,8 @@ impl Drop for Session {
         // Explicitly clear crypto state to trigger Zeroizing drop on any
         // intermediate CSPs held in ActiveOperation fields.
         self.active_operation = None;
+        self.active_digest = None;
+        self.active_sign_verify = None;
         self.find_context = None;
     }
 }
@@ -500,6 +543,8 @@ impl Session {
             flags,
             state,
             active_operation: None,
+            active_digest: None,
+            active_sign_verify: None,
             find_context: None,
             last_operation_fips_approved: None,
             last_activity: Instant::now(),
@@ -557,6 +602,8 @@ impl Session {
         };
         // Clear active operations on logout
         self.active_operation = None;
+        self.active_digest = None;
+        self.active_sign_verify = None;
         self.find_context = None;
         Ok(())
     }

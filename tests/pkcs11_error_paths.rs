@@ -1318,3 +1318,96 @@ fn test_unavailable_rsa_keygen_does_not_enter_error_state() {
     let _ = C_DestroyObject(session, aes_key);
     let _ = C_CloseSession(session);
 }
+
+#[test]
+fn test_ecdsa_signature_length_query_exact_raw_size() {
+    let session = setup_user_session();
+    let ec_params = hex::decode("06082a8648ce3d030107").unwrap();
+    let ck_true: CK_BBOOL = CK_TRUE;
+
+    let mut pub_template = vec![
+        CK_ATTRIBUTE {
+            attr_type: CKA_EC_PARAMS,
+            p_value: ec_params.as_ptr() as CK_VOID_PTR,
+            value_len: ec_params.len() as CK_ULONG,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_VERIFY,
+            p_value: &ck_true as *const _ as CK_VOID_PTR,
+            value_len: 1,
+        },
+    ];
+    let mut priv_template = vec![CK_ATTRIBUTE {
+        attr_type: CKA_SIGN,
+        p_value: &ck_true as *const _ as CK_VOID_PTR,
+        value_len: 1,
+    }];
+
+    let mut pub_key: CK_OBJECT_HANDLE = 0;
+    let mut priv_key: CK_OBJECT_HANDLE = 0;
+    let mut mechanism = CK_MECHANISM {
+        mechanism: CKM_EC_KEY_PAIR_GEN,
+        p_parameter: ptr::null_mut(),
+        parameter_len: 0,
+    };
+
+    let rv = C_GenerateKeyPair(
+        session,
+        &mut mechanism,
+        pub_template.as_mut_ptr(),
+        pub_template.len() as CK_ULONG,
+        priv_template.as_mut_ptr(),
+        priv_template.len() as CK_ULONG,
+        &mut pub_key,
+        &mut priv_key,
+    );
+    assert_eq!(rv, CKR_OK);
+
+    let mut sign_mechanism = CK_MECHANISM {
+        mechanism: CKM_ECDSA,
+        p_parameter: ptr::null_mut(),
+        parameter_len: 0,
+    };
+    assert_eq!(C_SignInit(session, &mut sign_mechanism, priv_key), CKR_OK);
+
+    // Query signature length with p_signature = NULL
+    let dummy_hash = [0xaa; 32];
+    let mut query_len: CK_ULONG = 0;
+    let rv = C_Sign(
+        session,
+        dummy_hash.as_ptr() as *mut _,
+        dummy_hash.len() as CK_ULONG,
+        ptr::null_mut(),
+        &mut query_len,
+    );
+    assert_eq!(rv, CKR_OK);
+    // Must return exact raw r || s size (64 bytes for P-256), not oversized DER estimate (72)
+    assert_eq!(query_len, 64, "P-256 ECDSA length query must return exact raw size (64 bytes)");
+
+    let _ = C_DestroyObject(session, pub_key);
+    let _ = C_DestroyObject(session, priv_key);
+    let _ = C_CloseSession(session);
+}
+
+#[test]
+fn test_unsupported_function_stubs_return_ckr_function_not_supported() {
+    let session = setup_user_session();
+    let mut mech = CK_MECHANISM {
+        mechanism: CKM_RSA_PKCS,
+        p_parameter: ptr::null_mut(),
+        parameter_len: 0,
+    };
+    let mut buf = [0u8; 32];
+    let mut out_len = buf.len() as CK_ULONG;
+
+    assert_eq!(C_SignRecoverInit(session, &mut mech, 1), CKR_FUNCTION_NOT_SUPPORTED);
+    assert_eq!(C_SignRecover(session, buf.as_mut_ptr(), 32, buf.as_mut_ptr(), &mut out_len), CKR_FUNCTION_NOT_SUPPORTED);
+    assert_eq!(C_VerifyRecoverInit(session, &mut mech, 1), CKR_FUNCTION_NOT_SUPPORTED);
+    assert_eq!(C_VerifyRecover(session, buf.as_mut_ptr(), 32, buf.as_mut_ptr(), &mut out_len), CKR_FUNCTION_NOT_SUPPORTED);
+    assert_eq!(C_DigestEncryptUpdate(session, buf.as_mut_ptr(), 32, buf.as_mut_ptr(), &mut out_len), CKR_FUNCTION_NOT_SUPPORTED);
+    assert_eq!(C_DecryptDigestUpdate(session, buf.as_mut_ptr(), 32, buf.as_mut_ptr(), &mut out_len), CKR_FUNCTION_NOT_SUPPORTED);
+    assert_eq!(C_SignEncryptUpdate(session, buf.as_mut_ptr(), 32, buf.as_mut_ptr(), &mut out_len), CKR_FUNCTION_NOT_SUPPORTED);
+    assert_eq!(C_DecryptVerifyUpdate(session, buf.as_mut_ptr(), 32, buf.as_mut_ptr(), &mut out_len), CKR_FUNCTION_NOT_SUPPORTED);
+
+    let _ = C_CloseSession(session);
+}

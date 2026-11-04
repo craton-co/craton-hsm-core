@@ -1951,8 +1951,28 @@ pub extern "C" fn C_EncryptInit(
         };
         let mut sess = sess.write();
 
-        if sess.active_operation.is_some() {
+        if matches!(
+            &sess.active_operation,
+            Some(ActiveOperation::Encrypt { .. } | ActiveOperation::Decrypt { .. })
+        ) {
             return CKR_OPERATION_ACTIVE;
+        }
+        if sess
+            .active_operation
+            .as_ref()
+            .map_or(false, |op| matches!(op, ActiveOperation::Digest { .. }))
+        {
+            sess.active_digest = sess.active_operation.take();
+        } else if sess.active_operation.as_ref().map_or(false, |op| {
+            matches!(
+                op,
+                ActiveOperation::Sign { .. }
+                    | ActiveOperation::Verify { .. }
+                    | ActiveOperation::SignRecover { .. }
+                    | ActiveOperation::VerifyRecover { .. }
+            )
+        }) {
+            sess.active_sign_verify = sess.active_operation.take();
         }
 
         // SAFETY: p_mechanism non-null (checked above), caller provides valid CK_MECHANISM. (Pattern 3)
@@ -2331,8 +2351,28 @@ pub extern "C" fn C_DecryptInit(
         };
         let mut sess = sess.write();
 
-        if sess.active_operation.is_some() {
+        if matches!(
+            &sess.active_operation,
+            Some(ActiveOperation::Encrypt { .. } | ActiveOperation::Decrypt { .. })
+        ) {
             return CKR_OPERATION_ACTIVE;
+        }
+        if sess
+            .active_operation
+            .as_ref()
+            .map_or(false, |op| matches!(op, ActiveOperation::Digest { .. }))
+        {
+            sess.active_digest = sess.active_operation.take();
+        } else if sess.active_operation.as_ref().map_or(false, |op| {
+            matches!(
+                op,
+                ActiveOperation::Sign { .. }
+                    | ActiveOperation::Verify { .. }
+                    | ActiveOperation::SignRecover { .. }
+                    | ActiveOperation::VerifyRecover { .. }
+            )
+        }) {
+            sess.active_sign_verify = sess.active_operation.take();
         }
 
         let mechanism = unsafe { (*p_mechanism).mechanism };
@@ -2615,7 +2655,15 @@ pub extern "C" fn C_SignInit(
         if !sess.state.is_logged_in() {
             return CKR_USER_NOT_LOGGED_IN;
         }
-        if sess.active_operation.is_some() {
+        if sess.active_sign_verify.is_some()
+            || matches!(
+                &sess.active_operation,
+                Some(ActiveOperation::Sign { .. }
+                    | ActiveOperation::Verify { .. }
+                    | ActiveOperation::SignRecover { .. }
+                    | ActiveOperation::VerifyRecover { .. })
+            )
+        {
             return CKR_OPERATION_ACTIVE;
         }
 
@@ -2672,13 +2720,18 @@ pub extern "C" fn C_SignInit(
         let hasher = sign::sign_mechanism_to_digest_mechanism(mechanism)
             .and_then(|digest_mech| hsm.crypto_backend.create_hasher(digest_mech).ok());
 
-        sess.active_operation = Some(ActiveOperation::Sign {
+        let op = ActiveOperation::Sign {
             mechanism,
             key_handle: key,
             data: Zeroizing::new(Vec::new()),
             hasher,
             cached_object: Some(obj.clone()),
-        });
+        };
+        if sess.active_operation.is_none() {
+            sess.active_operation = Some(op);
+        } else {
+            sess.active_sign_verify = Some(op);
+        }
         CKR_OK
     })
     .unwrap_or(CKR_GENERAL_ERROR)
@@ -3119,7 +3172,15 @@ pub extern "C" fn C_VerifyInit(
         };
         let mut sess = sess.write();
 
-        if sess.active_operation.is_some() {
+        if sess.active_sign_verify.is_some()
+            || matches!(
+                &sess.active_operation,
+                Some(ActiveOperation::Sign { .. }
+                    | ActiveOperation::Verify { .. }
+                    | ActiveOperation::SignRecover { .. }
+                    | ActiveOperation::VerifyRecover { .. })
+            )
+        {
             return CKR_OPERATION_ACTIVE;
         }
 
@@ -3169,13 +3230,18 @@ pub extern "C" fn C_VerifyInit(
         let hasher = sign::sign_mechanism_to_digest_mechanism(mechanism)
             .and_then(|digest_mech| hsm.crypto_backend.create_hasher(digest_mech).ok());
 
-        sess.active_operation = Some(ActiveOperation::Verify {
+        let op = ActiveOperation::Verify {
             mechanism,
             key_handle: key,
             data: Zeroizing::new(Vec::new()),
             hasher,
             cached_object: Some(obj.clone()),
-        });
+        };
+        if sess.active_operation.is_none() {
+            sess.active_operation = Some(op);
+        } else {
+            sess.active_sign_verify = Some(op);
+        }
         CKR_OK
     })
     .unwrap_or(CKR_GENERAL_ERROR)
@@ -4250,7 +4316,13 @@ pub extern "C" fn C_GenerateRandom(
 // ============================================================================
 
 fn not_supported() -> CK_RV {
-    CKR_FUNCTION_NOT_SUPPORTED
+    catch_unwind(|| {
+        if let Err(rv) = get_hsm() {
+            return rv;
+        }
+        CKR_FUNCTION_NOT_SUPPORTED
+    })
+    .unwrap_or(CKR_GENERAL_ERROR)
 }
 
 /// C_GetOperationState saves the cryptographic operation state of a session.
@@ -4287,7 +4359,10 @@ pub extern "C" fn C_GetOperationState(
         match op {
             ActiveOperation::Digest { .. } => {}
             ActiveOperation::Sign { .. } | ActiveOperation::Verify { .. } => {}
-            ActiveOperation::Encrypt { .. } | ActiveOperation::Decrypt { .. } => {
+            ActiveOperation::Encrypt { .. }
+            | ActiveOperation::Decrypt { .. }
+            | ActiveOperation::SignRecover { .. }
+            | ActiveOperation::VerifyRecover { .. } => {
                 return CKR_STATE_UNSAVEABLE;
             }
         }
@@ -4723,11 +4798,11 @@ fn estimated_signature_len(mechanism: CK_MECHANISM_TYPE, obj: &StoredObject) -> 
     } else if sign::is_ecdsa_mechanism(mechanism) {
         let ec_params = obj.ec_params.as_deref().unwrap_or(&[]);
         if is_p521_params(ec_params) {
-            Some(142) // DER-encoded P-521 ECDSA: up to ~142 bytes (raw: 132 bytes)
+            Some(132) // PKCS#11 §2.3.1 raw r || s for P-521: 132 bytes (66 + 66)
         } else if is_p384_params(ec_params) {
-            Some(104) // DER-encoded P-384 ECDSA: up to ~104 bytes
+            Some(96) // PKCS#11 §2.3.1 raw r || s for P-384: 96 bytes (48 + 48)
         } else {
-            Some(72) // DER-encoded P-256 ECDSA: up to ~72 bytes
+            Some(64) // PKCS#11 §2.3.1 raw r || s for P-256: 64 bytes (32 + 32)
         }
     } else if sign::is_eddsa_mechanism(mechanism) {
         Some(64) // Ed25519
@@ -5237,7 +5312,9 @@ pub extern "C" fn C_DigestInit(session: CK_SESSION_HANDLE, p_mechanism: CK_MECHA
         };
         let mut sess = sess.write();
 
-        if sess.active_operation.is_some() {
+        if sess.active_digest.is_some()
+            || matches!(&sess.active_operation, Some(ActiveOperation::Digest { .. }))
+        {
             return CKR_OPERATION_ACTIVE;
         }
 
@@ -5257,11 +5334,16 @@ pub extern "C" fn C_DigestInit(session: CK_SESSION_HANDLE, p_mechanism: CK_MECHA
             Err(e) => return err_to_rv(e),
         };
 
-        sess.active_operation = Some(ActiveOperation::Digest {
+        let op = ActiveOperation::Digest {
             mechanism,
             hasher: Some(hasher),
             accumulated_input: Zeroizing::new(Vec::new()),
-        });
+        };
+        if sess.active_operation.is_none() {
+            sess.active_operation = Some(op);
+        } else {
+            sess.active_digest = Some(op);
+        }
         CKR_OK
     })
     .unwrap_or(CKR_GENERAL_ERROR)
@@ -5371,7 +5453,13 @@ pub extern "C" fn C_DigestUpdate(
         };
         let mut sess = sess.write();
 
-        match &mut sess.active_operation {
+        let in_active_digest = sess.active_digest.is_some();
+        let target = if in_active_digest {
+            &mut sess.active_digest
+        } else {
+            &mut sess.active_operation
+        };
+        match target {
             Some(ActiveOperation::Digest {
                 hasher,
                 accumulated_input,
@@ -5379,7 +5467,7 @@ pub extern "C" fn C_DigestUpdate(
             }) => {
                 let data = unsafe { slice::from_raw_parts(p_part, part_len as usize) };
                 if accumulated_input.len().saturating_add(data.len()) > MAX_MULTIPART_ACCUMULATION {
-                    sess.active_operation = None;
+                    *target = None;
                     return CKR_DATA_LEN_RANGE;
                 }
                 if let Some(h) = hasher.as_mut() {
@@ -5414,9 +5502,15 @@ pub extern "C" fn C_DigestKey(session: CK_SESSION_HANDLE, key: CK_OBJECT_HANDLE)
             Ok(s) => s,
             Err(e) => return err_to_rv(e),
         };
+        let in_active_digest = sess.read().active_digest.is_some();
         {
             let sess_read = sess.read();
-            match &sess_read.active_operation {
+            let target = if in_active_digest {
+                &sess_read.active_digest
+            } else {
+                &sess_read.active_operation
+            };
+            match target {
                 Some(ActiveOperation::Digest { .. }) => { /* OK, operation is active */ }
                 _ => return CKR_OPERATION_NOT_INITIALIZED,
             }
@@ -5450,7 +5544,12 @@ pub extern "C" fn C_DigestKey(session: CK_SESSION_HANDLE, key: CK_OBJECT_HANDLE)
         // Feed key bytes into active digest operation
         let mut sess = sess.write();
 
-        match &mut sess.active_operation {
+        let target = if in_active_digest {
+            &mut sess.active_digest
+        } else {
+            &mut sess.active_operation
+        };
+        match target {
             Some(ActiveOperation::Digest {
                 hasher,
                 accumulated_input,
@@ -5492,15 +5591,23 @@ pub extern "C" fn C_DigestFinal(
         };
         let mut sess = sess.write();
 
-        // For a NULL-pointer (length) query, report the output size
-        // WITHOUT consuming the hasher so the operation remains intact.
+        let in_active_digest = sess.active_digest.is_some();
         if p_digest.is_null() {
-            let out_len = match &sess.active_operation {
+            let target = if in_active_digest {
+                &sess.active_digest
+            } else {
+                &sess.active_operation
+            };
+            let out_len = match target {
                 Some(ActiveOperation::Digest {
                     hasher: Some(h), ..
                 }) => h.output_len(),
                 Some(ActiveOperation::Digest { hasher: None, .. }) => {
-                    sess.active_operation = None;
+                    if in_active_digest {
+                        sess.active_digest = None;
+                    } else {
+                        sess.active_operation = None;
+                    }
                     return CKR_OPERATION_NOT_INITIALIZED;
                 }
                 _ => return CKR_OPERATION_NOT_INITIALIZED,
@@ -5511,8 +5618,12 @@ pub extern "C" fn C_DigestFinal(
             return CKR_OK;
         }
 
-        // Real finalization: consume the hasher and produce output.
-        let (_mechanism, hasher, _acc_input) = match &mut sess.active_operation {
+        let target = if in_active_digest {
+            &mut sess.active_digest
+        } else {
+            &mut sess.active_operation
+        };
+        let (_mechanism, hasher, _acc_input) = match target {
             Some(ActiveOperation::Digest {
                 mechanism,
                 hasher,
@@ -5524,7 +5635,11 @@ pub extern "C" fn C_DigestFinal(
         let hasher = match hasher {
             Some(h) => h,
             None => {
-                sess.active_operation = None;
+                if in_active_digest {
+                    sess.active_digest = None;
+                } else {
+                    sess.active_operation = None;
+                }
                 return CKR_OPERATION_NOT_INITIALIZED;
             }
         };
@@ -5536,8 +5651,11 @@ pub extern "C" fn C_DigestFinal(
             unsafe {
                 *pul_digest_len = output_len as CK_ULONG;
             }
-            // Operation is terminated per PKCS#11 spec on buffer too small
-            sess.active_operation = None;
+            if in_active_digest {
+                sess.active_digest = None;
+            } else {
+                sess.active_operation = None;
+            }
             return CKR_BUFFER_TOO_SMALL;
         }
 
@@ -5548,7 +5666,11 @@ pub extern "C" fn C_DigestFinal(
             *pul_digest_len = digest_out.len() as CK_ULONG;
         }
 
-        sess.active_operation = None;
+        if in_active_digest {
+            sess.active_digest = None;
+        } else {
+            sess.active_operation = None;
+        }
         CKR_OK
     })
     .unwrap_or(CKR_GENERAL_ERROR)
@@ -5576,7 +5698,14 @@ pub extern "C" fn C_SignUpdate(
         };
         let mut sess = sess.write();
 
-        match &mut sess.active_operation {
+        let in_sign_verify = sess.active_sign_verify.is_some();
+        let target = if in_sign_verify {
+            &mut sess.active_sign_verify
+        } else {
+            &mut sess.active_operation
+        };
+
+        match target {
             Some(ActiveOperation::Sign {
                 mechanism,
                 hasher,
@@ -5586,7 +5715,7 @@ pub extern "C" fn C_SignUpdate(
                 let part_data = unsafe { slice::from_raw_parts(p_part, part_len as usize) };
 
                 if data.len().saturating_add(part_data.len()) > MAX_MULTIPART_ACCUMULATION {
-                    sess.active_operation = None;
+                    *target = None;
                     return CKR_DATA_LEN_RANGE;
                 }
 
@@ -5595,7 +5724,7 @@ pub extern "C" fn C_SignUpdate(
                     h.update(part_data);
                 } else if sign::sign_mechanism_supports_multipart(*mechanism) {
                     // Mechanism supports multi-part but hasher creation failed
-                    sess.active_operation = None;
+                    *target = None;
                     return CKR_GENERAL_ERROR;
                 } else {
                     // Mechanism without built-in hash (e.g., CKM_RSA_PKCS):
@@ -5632,10 +5761,17 @@ pub extern "C" fn C_SignFinal(
         };
         let mut sess = sess.write();
 
+        let in_sign_verify = sess.active_sign_verify.is_some();
+
         // Length query: estimate signature size WITHOUT consuming
         // the hasher or accumulated data so the operation stays intact.
         if p_signature.is_null() {
-            let (mech, kh) = match &sess.active_operation {
+            let target = if in_sign_verify {
+                &sess.active_sign_verify
+            } else {
+                &sess.active_operation
+            };
+            let (mech, kh) = match target {
                 Some(ActiveOperation::Sign {
                     mechanism,
                     key_handle,
@@ -5646,7 +5782,11 @@ pub extern "C" fn C_SignFinal(
             let obj = match hsm.object_store.get_object(kh) {
                 Ok(o) => o,
                 Err(e) => {
-                    sess.active_operation = None;
+                    if in_sign_verify {
+                        sess.active_sign_verify = None;
+                    } else {
+                        sess.active_operation = None;
+                    }
                     return err_to_rv(e);
                 }
             };
@@ -5654,7 +5794,11 @@ pub extern "C" fn C_SignFinal(
             let est = match estimated_signature_len(mech, &obj) {
                 Some(n) => n,
                 None => {
-                    sess.active_operation = None;
+                    if in_sign_verify {
+                        sess.active_sign_verify = None;
+                    } else {
+                        sess.active_operation = None;
+                    }
                     return CKR_MECHANISM_INVALID;
                 }
             };
@@ -5664,8 +5808,12 @@ pub extern "C" fn C_SignFinal(
             return CKR_OK;
         }
 
-        let (mechanism, key_handle, hasher, data, cached_object) = match &mut sess.active_operation
-        {
+        let target = if in_sign_verify {
+            &mut sess.active_sign_verify
+        } else {
+            &mut sess.active_operation
+        };
+        let (mechanism, key_handle, hasher, data, cached_object) = match target {
             Some(ActiveOperation::Sign {
                 mechanism,
                 key_handle,
@@ -5688,7 +5836,11 @@ pub extern "C" fn C_SignFinal(
             match hsm.object_store.get_object(key_handle) {
                 Ok(o) => o,
                 Err(e) => {
-                    sess.active_operation = None;
+                    if in_sign_verify {
+                        sess.active_sign_verify = None;
+                    } else {
+                        sess.active_operation = None;
+                    }
                     return err_to_rv(e);
                 }
             }
@@ -5697,7 +5849,11 @@ pub extern "C" fn C_SignFinal(
         let key_bytes = match &obj.key_material {
             Some(km) => km.as_bytes(),
             None => {
-                sess.active_operation = None;
+                if in_sign_verify {
+                    sess.active_sign_verify = None;
+                } else {
+                    sess.active_operation = None;
+                }
                 return CKR_KEY_HANDLE_INVALID;
             }
         };
@@ -5735,7 +5891,11 @@ pub extern "C" fn C_SignFinal(
                     unsafe {
                         *pul_signature_len = signature.len() as CK_ULONG;
                     }
-                    sess.active_operation = None;
+                    if in_sign_verify {
+                        sess.active_sign_verify = None;
+                    } else {
+                        sess.active_operation = None;
+                    }
                     return CKR_BUFFER_TOO_SMALL;
                 }
 
@@ -5755,11 +5915,19 @@ pub extern "C" fn C_SignFinal(
                     None,
                 );
 
-                sess.active_operation = None;
+                if in_sign_verify {
+                    sess.active_sign_verify = None;
+                } else {
+                    sess.active_operation = None;
+                }
                 CKR_OK
             }
             Err(e) => {
-                sess.active_operation = None;
+                if in_sign_verify {
+                    sess.active_sign_verify = None;
+                } else {
+                    sess.active_operation = None;
+                }
                 err_to_rv(e)
             }
         }
@@ -5769,22 +5937,235 @@ pub extern "C" fn C_SignFinal(
 
 #[no_mangle]
 pub extern "C" fn C_SignRecoverInit(
-    _s: CK_SESSION_HANDLE,
-    _m: CK_MECHANISM_PTR,
-    _k: CK_OBJECT_HANDLE,
+    session: CK_SESSION_HANDLE,
+    p_mechanism: CK_MECHANISM_PTR,
+    key: CK_OBJECT_HANDLE,
 ) -> CK_RV {
-    not_supported()
+    catch_unwind(|| {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
+            Ok(h) => h,
+            Err(rv) => return rv,
+        };
+        if p_mechanism.is_null() {
+            return CKR_ARGUMENTS_BAD;
+        }
+
+        let sess = match hsm.session_manager.get_session(session) {
+            Ok(s) => s,
+            Err(e) => return err_to_rv(e),
+        };
+        let mut sess = sess.write();
+
+        if !sess.state.is_logged_in() {
+            return CKR_USER_NOT_LOGGED_IN;
+        }
+        if sess.active_sign_verify.is_some()
+            || matches!(
+                &sess.active_operation,
+                Some(
+                    ActiveOperation::Sign { .. }
+                        | ActiveOperation::Verify { .. }
+                        | ActiveOperation::SignRecover { .. }
+                        | ActiveOperation::VerifyRecover { .. },
+                )
+            )
+        {
+            return CKR_OPERATION_ACTIVE;
+        }
+
+        let mechanism = unsafe { (*p_mechanism).mechanism };
+        if mechanism != CKM_RSA_PKCS {
+            return CKR_MECHANISM_INVALID;
+        }
+
+        if let Err(rv) =
+            mechanisms::validate_mechanism_for_policy(mechanism, &hsm.algorithm_config, true)
+        {
+            return rv;
+        }
+
+        let obj = match hsm.object_store.get_object(key) {
+            Ok(o) => o,
+            Err(_) => return CKR_KEY_HANDLE_INVALID,
+        };
+        {
+            let obj_read = obj.read();
+            let can_sign_recover = obj_read
+                .extra_attributes
+                .get(&CKA_SIGN_RECOVER)
+                .map(|v| v.first() == Some(&1))
+                .unwrap_or(obj_read.can_sign);
+            if !can_sign_recover {
+                return CKR_KEY_FUNCTION_NOT_PERMITTED;
+            }
+            if obj_read.check_lifecycle("sign").is_err() {
+                return CKR_KEY_FUNCTION_NOT_PERMITTED;
+            }
+            if let Err(e) = approved_services::enforce(
+                mechanism,
+                &hsm.algorithm_config,
+                stored_key_bits(&obj_read),
+            ) {
+                return err_to_rv(e);
+            }
+        }
+
+        let op = ActiveOperation::SignRecover {
+            mechanism,
+            key_handle: key,
+            cached_object: Some(obj),
+        };
+        if sess.active_operation.is_none() {
+            sess.active_operation = Some(op);
+        } else {
+            sess.active_sign_verify = Some(op);
+        }
+        CKR_OK
+    })
+    .unwrap_or(CKR_GENERAL_ERROR)
 }
 
 #[no_mangle]
 pub extern "C" fn C_SignRecover(
-    _s: CK_SESSION_HANDLE,
-    _d: CK_BYTE_PTR,
-    _dl: CK_ULONG,
-    _sig: CK_BYTE_PTR,
-    _sl: CK_ULONG_PTR,
+    session: CK_SESSION_HANDLE,
+    p_data: CK_BYTE_PTR,
+    data_len: CK_ULONG,
+    p_signature: CK_BYTE_PTR,
+    pul_signature_len: CK_ULONG_PTR,
 ) -> CK_RV {
-    not_supported()
+    catch_unwind(|| {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
+            Ok(h) => h,
+            Err(rv) => return rv,
+        };
+        if p_data.is_null() || pul_signature_len.is_null() {
+            return CKR_ARGUMENTS_BAD;
+        }
+
+        let sess = match hsm.session_manager.get_session(session) {
+            Ok(s) => s,
+            Err(e) => return err_to_rv(e),
+        };
+        let mut sess = sess.write();
+
+        let (mechanism, key_handle, cached_object) = match &sess.active_operation {
+            Some(ActiveOperation::SignRecover {
+                mechanism,
+                key_handle,
+                cached_object,
+            }) => (*mechanism, *key_handle, cached_object.clone()),
+            _ => match &sess.active_sign_verify {
+                Some(ActiveOperation::SignRecover {
+                    mechanism,
+                    key_handle,
+                    cached_object,
+                }) => (*mechanism, *key_handle, cached_object.clone()),
+                _ => return CKR_OPERATION_NOT_INITIALIZED,
+            },
+        };
+
+        if (data_len as usize) > MAX_SINGLE_BUFFER {
+            sess.active_operation = None;
+            sess.active_sign_verify = None;
+            return CKR_DATA_LEN_RANGE;
+        }
+
+        let obj = if let Some(cached) = cached_object {
+            cached
+        } else {
+            match hsm.object_store.get_object(key_handle) {
+                Ok(o) => o,
+                Err(e) => {
+                    sess.active_operation = None;
+                    sess.active_sign_verify = None;
+                    return err_to_rv(e);
+                }
+            }
+        };
+        let obj = obj.read();
+        let key_bytes = match &obj.key_material {
+            Some(km) => km.as_bytes(),
+            None => {
+                sess.active_operation = None;
+                sess.active_sign_verify = None;
+                return CKR_KEY_HANDLE_INVALID;
+            }
+        };
+
+        let est = match estimated_signature_len(mechanism, &obj) {
+            Some(n) => n,
+            None => {
+                sess.active_operation = None;
+                sess.active_sign_verify = None;
+                return CKR_MECHANISM_INVALID;
+            }
+        };
+
+        if p_signature.is_null() {
+            unsafe {
+                *pul_signature_len = est as CK_ULONG;
+            }
+            return CKR_OK;
+        }
+
+        let buf_len = unsafe { *pul_signature_len } as usize;
+        if buf_len < est {
+            unsafe {
+                *pul_signature_len = est as CK_ULONG;
+            }
+            return CKR_BUFFER_TOO_SMALL;
+        }
+
+        let data = unsafe { slice::from_raw_parts(p_data, data_len as usize) };
+        let result = hsm.crypto_backend.rsa_pkcs1v15_sign_recover(key_bytes, data);
+
+        if matches!(&sess.active_operation, Some(ActiveOperation::SignRecover { .. })) {
+            sess.active_operation = None;
+        }
+        sess.active_sign_verify = None;
+
+        match result {
+            Ok(signature) => {
+                if signature.len() > buf_len {
+                    unsafe {
+                        *pul_signature_len = signature.len() as CK_ULONG;
+                    }
+                    return CKR_BUFFER_TOO_SMALL;
+                }
+                let out = unsafe { slice::from_raw_parts_mut(p_signature, signature.len()) };
+                out.copy_from_slice(&signature);
+                unsafe {
+                    *pul_signature_len = signature.len() as CK_ULONG;
+                }
+                let _ = hsm.audit_log.record(
+                    session as u64,
+                    AuditOperation::Sign {
+                        mechanism: mechanism as u64,
+                        fips_approved: mechanisms::is_fips_approved(mechanism),
+                    },
+                    AuditResult::Success,
+                    None,
+                );
+                CKR_OK
+            }
+            Err(e) => {
+                let rv = err_to_rv(e);
+                let _ = hsm.audit_log.record(
+                    session as u64,
+                    AuditOperation::Sign {
+                        mechanism: mechanism as u64,
+                        fips_approved: mechanisms::is_fips_approved(mechanism),
+                    },
+                    AuditResult::Failure(rv as u64),
+                    None,
+                );
+                rv
+            }
+        }
+    })
+    .unwrap_or(CKR_GENERAL_ERROR)
 }
 
 #[no_mangle]
@@ -5809,7 +6190,14 @@ pub extern "C" fn C_VerifyUpdate(
         };
         let mut sess = sess.write();
 
-        match &mut sess.active_operation {
+        let in_sign_verify = sess.active_sign_verify.is_some();
+        let target = if in_sign_verify {
+            &mut sess.active_sign_verify
+        } else {
+            &mut sess.active_operation
+        };
+
+        match target {
             Some(ActiveOperation::Verify {
                 mechanism,
                 hasher,
@@ -5819,7 +6207,7 @@ pub extern "C" fn C_VerifyUpdate(
                 let part_data = unsafe { slice::from_raw_parts(p_part, part_len as usize) };
 
                 if data.len().saturating_add(part_data.len()) > MAX_MULTIPART_ACCUMULATION {
-                    sess.active_operation = None;
+                    *target = None;
                     return CKR_DATA_LEN_RANGE;
                 }
 
@@ -5828,7 +6216,7 @@ pub extern "C" fn C_VerifyUpdate(
                     h.update(part_data);
                 } else if sign::sign_mechanism_supports_multipart(*mechanism) {
                     // Mechanism supports multi-part but hasher creation failed
-                    sess.active_operation = None;
+                    *target = None;
                     return CKR_GENERAL_ERROR;
                 } else {
                     // Mechanism without built-in hash (e.g., CKM_RSA_PKCS):
@@ -5865,18 +6253,35 @@ pub extern "C" fn C_VerifyFinal(
         };
         let mut sess = sess.write();
 
-        match &sess.active_operation {
-            Some(ActiveOperation::Verify { .. }) => {}
-            _ => return CKR_OPERATION_NOT_INITIALIZED,
+        let in_sign_verify = sess.active_sign_verify.is_some();
+
+        {
+            let target = if in_sign_verify {
+                &sess.active_sign_verify
+            } else {
+                &sess.active_operation
+            };
+            match target {
+                Some(ActiveOperation::Verify { .. }) => {}
+                _ => return CKR_OPERATION_NOT_INITIALIZED,
+            }
         }
 
         if (signature_len as usize) > MAX_SINGLE_BUFFER {
-            sess.active_operation = None;
+            if in_sign_verify {
+                sess.active_sign_verify = None;
+            } else {
+                sess.active_operation = None;
+            }
             return CKR_DATA_LEN_RANGE;
         }
 
-        let (mechanism, key_handle, hasher, data, cached_object) = match &mut sess.active_operation
-        {
+        let target = if in_sign_verify {
+            &mut sess.active_sign_verify
+        } else {
+            &mut sess.active_operation
+        };
+        let (mechanism, key_handle, hasher, data, cached_object) = match target {
             Some(ActiveOperation::Verify {
                 mechanism,
                 key_handle,
@@ -5901,7 +6306,11 @@ pub extern "C" fn C_VerifyFinal(
             match hsm.object_store.get_object(key_handle) {
                 Ok(o) => o,
                 Err(e) => {
-                    sess.active_operation = None;
+                    if in_sign_verify {
+                        sess.active_sign_verify = None;
+                    } else {
+                        sess.active_operation = None;
+                    }
                     return err_to_rv(e);
                 }
             }
@@ -5934,7 +6343,11 @@ pub extern "C" fn C_VerifyFinal(
             )
         };
 
-        sess.active_operation = None;
+        if in_sign_verify {
+            sess.active_sign_verify = None;
+        } else {
+            sess.active_operation = None;
+        }
 
         match result {
             Ok(true) => {
@@ -5981,66 +6394,723 @@ pub extern "C" fn C_VerifyFinal(
 
 #[no_mangle]
 pub extern "C" fn C_VerifyRecoverInit(
-    _s: CK_SESSION_HANDLE,
-    _m: CK_MECHANISM_PTR,
-    _k: CK_OBJECT_HANDLE,
+    session: CK_SESSION_HANDLE,
+    p_mechanism: CK_MECHANISM_PTR,
+    key: CK_OBJECT_HANDLE,
 ) -> CK_RV {
-    not_supported()
+    catch_unwind(|| {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
+            Ok(h) => h,
+            Err(rv) => return rv,
+        };
+        if p_mechanism.is_null() {
+            return CKR_ARGUMENTS_BAD;
+        }
+
+        let sess = match hsm.session_manager.get_session(session) {
+            Ok(s) => s,
+            Err(e) => return err_to_rv(e),
+        };
+        let mut sess = sess.write();
+
+        if sess.active_sign_verify.is_some()
+            || matches!(
+                &sess.active_operation,
+                Some(
+                    ActiveOperation::Sign { .. }
+                        | ActiveOperation::Verify { .. }
+                        | ActiveOperation::SignRecover { .. }
+                        | ActiveOperation::VerifyRecover { .. },
+                )
+            )
+        {
+            return CKR_OPERATION_ACTIVE;
+        }
+
+        let mechanism = unsafe { (*p_mechanism).mechanism };
+        if mechanism != CKM_RSA_PKCS {
+            return CKR_MECHANISM_INVALID;
+        }
+
+        if let Err(rv) =
+            mechanisms::validate_mechanism_for_policy(mechanism, &hsm.algorithm_config, false)
+        {
+            return rv;
+        }
+
+        let obj = match hsm.object_store.get_object(key) {
+            Ok(o) => o,
+            Err(_) => return CKR_KEY_HANDLE_INVALID,
+        };
+        {
+            let obj_read = obj.read();
+            let can_verify_recover = obj_read
+                .extra_attributes
+                .get(&CKA_VERIFY_RECOVER)
+                .map(|v| v.first() == Some(&1))
+                .unwrap_or(obj_read.can_verify);
+            if !can_verify_recover {
+                return CKR_KEY_FUNCTION_NOT_PERMITTED;
+            }
+            if obj_read.check_lifecycle("verify").is_err() {
+                return CKR_KEY_FUNCTION_NOT_PERMITTED;
+            }
+            if let Err(e) = approved_services::enforce(
+                mechanism,
+                &hsm.algorithm_config,
+                stored_key_bits(&obj_read),
+            ) {
+                return err_to_rv(e);
+            }
+        }
+
+        let op = ActiveOperation::VerifyRecover {
+            mechanism,
+            key_handle: key,
+            cached_object: Some(obj),
+        };
+        if sess.active_operation.is_none() {
+            sess.active_operation = Some(op);
+        } else {
+            sess.active_sign_verify = Some(op);
+        }
+        CKR_OK
+    })
+    .unwrap_or(CKR_GENERAL_ERROR)
 }
 
 #[no_mangle]
 pub extern "C" fn C_VerifyRecover(
-    _s: CK_SESSION_HANDLE,
-    _sig: CK_BYTE_PTR,
-    _sl: CK_ULONG,
-    _d: CK_BYTE_PTR,
-    _dl: CK_ULONG_PTR,
+    session: CK_SESSION_HANDLE,
+    p_signature: CK_BYTE_PTR,
+    signature_len: CK_ULONG,
+    p_data: CK_BYTE_PTR,
+    pul_data_len: CK_ULONG_PTR,
 ) -> CK_RV {
-    not_supported()
+    catch_unwind(|| {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
+            Ok(h) => h,
+            Err(rv) => return rv,
+        };
+        if p_signature.is_null() || pul_data_len.is_null() {
+            return CKR_ARGUMENTS_BAD;
+        }
+
+        let sess = match hsm.session_manager.get_session(session) {
+            Ok(s) => s,
+            Err(e) => return err_to_rv(e),
+        };
+        let mut sess = sess.write();
+
+        let (mechanism, key_handle, cached_object) = match &sess.active_operation {
+            Some(ActiveOperation::VerifyRecover {
+                mechanism,
+                key_handle,
+                cached_object,
+            }) => (*mechanism, *key_handle, cached_object.clone()),
+            _ => match &sess.active_sign_verify {
+                Some(ActiveOperation::VerifyRecover {
+                    mechanism,
+                    key_handle,
+                    cached_object,
+                }) => (*mechanism, *key_handle, cached_object.clone()),
+                _ => return CKR_OPERATION_NOT_INITIALIZED,
+            },
+        };
+
+        if (signature_len as usize) > MAX_SINGLE_BUFFER {
+            sess.active_operation = None;
+            sess.active_sign_verify = None;
+            return CKR_DATA_LEN_RANGE;
+        }
+
+        let obj = if let Some(cached) = cached_object {
+            cached
+        } else {
+            match hsm.object_store.get_object(key_handle) {
+                Ok(o) => o,
+                Err(e) => {
+                    sess.active_operation = None;
+                    sess.active_sign_verify = None;
+                    return err_to_rv(e);
+                }
+            }
+        };
+        let obj = obj.read();
+        let modulus = match &obj.modulus {
+            Some(m) => m.as_slice(),
+            None => {
+                sess.active_operation = None;
+                sess.active_sign_verify = None;
+                return CKR_KEY_HANDLE_INVALID;
+            }
+        };
+        let public_exponent = match &obj.public_exponent {
+            Some(e) => e.as_slice(),
+            None => {
+                sess.active_operation = None;
+                sess.active_sign_verify = None;
+                return CKR_KEY_HANDLE_INVALID;
+            }
+        };
+
+        let signature = unsafe { slice::from_raw_parts(p_signature, signature_len as usize) };
+        let recovered = match hsm
+            .crypto_backend
+            .rsa_pkcs1v15_verify_recover(modulus, public_exponent, signature)
+        {
+            Ok(d) => d,
+            Err(e) => {
+                if matches!(
+                    &sess.active_operation,
+                    Some(ActiveOperation::VerifyRecover { .. })
+                ) {
+                    sess.active_operation = None;
+                }
+                sess.active_sign_verify = None;
+                let rv = err_to_rv(e);
+                let _ = hsm.audit_log.record(
+                    session as u64,
+                    AuditOperation::Verify {
+                        mechanism: mechanism as u64,
+                        fips_approved: mechanisms::is_fips_approved(mechanism),
+                    },
+                    AuditResult::Failure(rv as u64),
+                    None,
+                );
+                return rv;
+            }
+        };
+
+        if p_data.is_null() {
+            unsafe {
+                *pul_data_len = recovered.len() as CK_ULONG;
+            }
+            return CKR_OK;
+        }
+
+        let buf_len = unsafe { *pul_data_len } as usize;
+        if buf_len < recovered.len() {
+            unsafe {
+                *pul_data_len = recovered.len() as CK_ULONG;
+            }
+            return CKR_BUFFER_TOO_SMALL;
+        }
+
+        if matches!(
+            &sess.active_operation,
+            Some(ActiveOperation::VerifyRecover { .. })
+        ) {
+            sess.active_operation = None;
+        }
+        sess.active_sign_verify = None;
+
+        let out = unsafe { slice::from_raw_parts_mut(p_data, recovered.len()) };
+        out.copy_from_slice(&recovered);
+        unsafe {
+            *pul_data_len = recovered.len() as CK_ULONG;
+        }
+
+        let _ = hsm.audit_log.record(
+            session as u64,
+            AuditOperation::Verify {
+                mechanism: mechanism as u64,
+                fips_approved: mechanisms::is_fips_approved(mechanism),
+            },
+            AuditResult::Success,
+            None,
+        );
+        CKR_OK
+    })
+    .unwrap_or(CKR_GENERAL_ERROR)
 }
 
 #[no_mangle]
 pub extern "C" fn C_DigestEncryptUpdate(
-    _s: CK_SESSION_HANDLE,
-    _p: CK_BYTE_PTR,
-    _pl: CK_ULONG,
-    _e: CK_BYTE_PTR,
-    _el: CK_ULONG_PTR,
+    session: CK_SESSION_HANDLE,
+    p_part: CK_BYTE_PTR,
+    part_len: CK_ULONG,
+    p_encrypted_part: CK_BYTE_PTR,
+    pul_encrypted_part_len: CK_ULONG_PTR,
 ) -> CK_RV {
-    not_supported()
+    catch_unwind(|| {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
+            Ok(h) => h,
+            Err(rv) => return rv,
+        };
+        if pul_encrypted_part_len.is_null() {
+            return CKR_ARGUMENTS_BAD;
+        }
+
+        let sess = match hsm.session_manager.get_session(session) {
+            Ok(s) => s,
+            Err(e) => return err_to_rv(e),
+        };
+        let mut sess = sess.write();
+
+        let has_encrypt = matches!(&sess.active_operation, Some(ActiveOperation::Encrypt { .. }));
+        let has_digest = sess.active_digest.is_some()
+            || matches!(&sess.active_operation, Some(ActiveOperation::Digest { .. }));
+        if !has_encrypt || !has_digest {
+            return CKR_OPERATION_NOT_INITIALIZED;
+        }
+
+        if p_encrypted_part.is_null() {
+            unsafe {
+                *pul_encrypted_part_len = 0;
+            }
+            return CKR_OK;
+        }
+        if p_part.is_null() {
+            return CKR_ARGUMENTS_BAD;
+        }
+
+        let part = unsafe { slice::from_raw_parts(p_part, part_len as usize) };
+
+        // 1. Digest the part
+        let digest_target = if sess.active_digest.is_some() {
+            &mut sess.active_digest
+        } else {
+            &mut sess.active_operation
+        };
+        if let Some(ActiveOperation::Digest {
+            hasher,
+            accumulated_input,
+            ..
+        }) = digest_target
+        {
+            if accumulated_input.len().saturating_add(part.len()) > MAX_MULTIPART_ACCUMULATION {
+                sess.active_digest = None;
+                sess.active_operation = None;
+                return CKR_DATA_LEN_RANGE;
+            }
+            if let Some(h) = hasher.as_mut() {
+                h.update(part);
+            }
+            accumulated_input.extend_from_slice(part);
+        }
+
+        // 2. Encrypt the part (accumulation mode, matching C_EncryptUpdate)
+        if let Some(ActiveOperation::Encrypt {
+            mechanism, data, ..
+        }) = &mut sess.active_operation
+        {
+            if !encrypt_mechanism_supports_multipart(*mechanism) {
+                sess.active_operation = None;
+                sess.active_digest = None;
+                return CKR_MECHANISM_INVALID;
+            }
+            if data.len().saturating_add(part.len()) > MAX_MULTIPART_ACCUMULATION {
+                sess.active_operation = None;
+                sess.active_digest = None;
+                return CKR_DATA_LEN_RANGE;
+            }
+            data.extend_from_slice(part);
+        }
+
+        unsafe {
+            *pul_encrypted_part_len = 0;
+        }
+        CKR_OK
+    })
+    .unwrap_or(CKR_GENERAL_ERROR)
 }
 
 #[no_mangle]
 pub extern "C" fn C_DecryptDigestUpdate(
-    _s: CK_SESSION_HANDLE,
-    _e: CK_BYTE_PTR,
-    _el: CK_ULONG,
-    _d: CK_BYTE_PTR,
-    _dl: CK_ULONG_PTR,
+    session: CK_SESSION_HANDLE,
+    p_encrypted_part: CK_BYTE_PTR,
+    encrypted_part_len: CK_ULONG,
+    p_part: CK_BYTE_PTR,
+    pul_part_len: CK_ULONG_PTR,
 ) -> CK_RV {
-    not_supported()
+    catch_unwind(|| {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
+            Ok(h) => h,
+            Err(rv) => return rv,
+        };
+        if pul_part_len.is_null() {
+            return CKR_ARGUMENTS_BAD;
+        }
+
+        let sess = match hsm.session_manager.get_session(session) {
+            Ok(s) => s,
+            Err(e) => return err_to_rv(e),
+        };
+        let mut sess = sess.write();
+
+        let has_decrypt = matches!(&sess.active_operation, Some(ActiveOperation::Decrypt { .. }));
+        let has_digest = sess.active_digest.is_some()
+            || matches!(&sess.active_operation, Some(ActiveOperation::Digest { .. }));
+        if !has_decrypt || !has_digest {
+            return CKR_OPERATION_NOT_INITIALIZED;
+        }
+
+        if p_part.is_null() {
+            unsafe {
+                *pul_part_len = encrypted_part_len;
+            }
+            return CKR_OK;
+        }
+        if p_encrypted_part.is_null() {
+            return CKR_ARGUMENTS_BAD;
+        }
+
+        let enc_part =
+            unsafe { slice::from_raw_parts(p_encrypted_part, encrypted_part_len as usize) };
+        if (encrypted_part_len as usize) > MAX_SINGLE_BUFFER {
+            sess.active_operation = None;
+            sess.active_digest = None;
+            return CKR_DATA_LEN_RANGE;
+        }
+
+        let (mechanism, key_handle, mech_param, cached_object) = match &sess.active_operation {
+            Some(ActiveOperation::Decrypt {
+                mechanism,
+                key_handle,
+                mechanism_param,
+                cached_object,
+                ..
+            }) => (*mechanism, *key_handle, mechanism_param.clone(), cached_object.clone()),
+            _ => return CKR_OPERATION_NOT_INITIALIZED,
+        };
+
+        let obj = if let Some(cached) = cached_object {
+            cached
+        } else {
+            match hsm.object_store.get_object(key_handle) {
+                Ok(o) => o,
+                Err(e) => {
+                    sess.active_operation = None;
+                    sess.active_digest = None;
+                    return err_to_rv(e);
+                }
+            }
+        };
+        let obj = obj.read();
+        let key_bytes = match &obj.key_material {
+            Some(km) => km.as_bytes(),
+            None => {
+                sess.active_operation = None;
+                sess.active_digest = None;
+                return CKR_KEY_HANDLE_INVALID;
+            }
+        };
+
+        let decrypted = match mechanism {
+            CKM_AES_CBC => {
+                hsm.crypto_backend
+                    .aes_cbc_decrypt_unpadded(key_bytes, &mech_param, enc_part)
+            }
+            CKM_AES_CBC_PAD => {
+                hsm.crypto_backend
+                    .aes_cbc_decrypt(key_bytes, &mech_param, enc_part)
+            }
+            CKM_AES_CTR => {
+                hsm.crypto_backend
+                    .aes_ctr_decrypt(key_bytes, &mech_param, enc_part)
+            }
+            _ => {
+                sess.active_operation = None;
+                sess.active_digest = None;
+                return CKR_MECHANISM_INVALID;
+            }
+        };
+
+        let pt = match decrypted {
+            Ok(d) => d,
+            Err(e) => {
+                sess.active_operation = None;
+                sess.active_digest = None;
+                return err_to_rv(e);
+            }
+        };
+
+        let buf_len = unsafe { *pul_part_len } as usize;
+        if buf_len < pt.len() {
+            unsafe {
+                *pul_part_len = pt.len() as CK_ULONG;
+            }
+            return CKR_BUFFER_TOO_SMALL;
+        }
+
+        let out = unsafe { slice::from_raw_parts_mut(p_part, pt.len()) };
+        out.copy_from_slice(&pt);
+        unsafe {
+            *pul_part_len = pt.len() as CK_ULONG;
+        }
+
+        let digest_target = if sess.active_digest.is_some() {
+            &mut sess.active_digest
+        } else {
+            &mut sess.active_operation
+        };
+        if let Some(ActiveOperation::Digest {
+            hasher,
+            accumulated_input,
+            ..
+        }) = digest_target
+        {
+            if accumulated_input.len().saturating_add(pt.len()) > MAX_MULTIPART_ACCUMULATION {
+                sess.active_digest = None;
+                sess.active_operation = None;
+                return CKR_DATA_LEN_RANGE;
+            }
+            if let Some(h) = hasher.as_mut() {
+                h.update(&pt);
+            }
+            accumulated_input.extend_from_slice(&pt);
+        }
+
+        CKR_OK
+    })
+    .unwrap_or(CKR_GENERAL_ERROR)
 }
 
 #[no_mangle]
 pub extern "C" fn C_SignEncryptUpdate(
-    _s: CK_SESSION_HANDLE,
-    _p: CK_BYTE_PTR,
-    _pl: CK_ULONG,
-    _e: CK_BYTE_PTR,
-    _el: CK_ULONG_PTR,
+    session: CK_SESSION_HANDLE,
+    p_part: CK_BYTE_PTR,
+    part_len: CK_ULONG,
+    p_encrypted_part: CK_BYTE_PTR,
+    pul_encrypted_part_len: CK_ULONG_PTR,
 ) -> CK_RV {
-    not_supported()
+    catch_unwind(|| {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
+            Ok(h) => h,
+            Err(rv) => return rv,
+        };
+        if pul_encrypted_part_len.is_null() {
+            return CKR_ARGUMENTS_BAD;
+        }
+
+        let sess = match hsm.session_manager.get_session(session) {
+            Ok(s) => s,
+            Err(e) => return err_to_rv(e),
+        };
+        let mut sess = sess.write();
+
+        let has_encrypt = matches!(&sess.active_operation, Some(ActiveOperation::Encrypt { .. }));
+        let has_sign = sess
+            .active_sign_verify
+            .as_ref()
+            .map_or(false, |op| matches!(op, ActiveOperation::Sign { .. }))
+            || matches!(&sess.active_operation, Some(ActiveOperation::Sign { .. }));
+        if !has_encrypt || !has_sign {
+            return CKR_OPERATION_NOT_INITIALIZED;
+        }
+
+        if p_encrypted_part.is_null() {
+            unsafe {
+                *pul_encrypted_part_len = 0;
+            }
+            return CKR_OK;
+        }
+        if p_part.is_null() {
+            return CKR_ARGUMENTS_BAD;
+        }
+
+        let part = unsafe { slice::from_raw_parts(p_part, part_len as usize) };
+
+        // 1. Submit part to sign
+        let sign_target = if sess.active_sign_verify.is_some() {
+            &mut sess.active_sign_verify
+        } else {
+            &mut sess.active_operation
+        };
+        if let Some(ActiveOperation::Sign { hasher, data, .. }) = sign_target {
+            if data.len().saturating_add(part.len()) > MAX_MULTIPART_ACCUMULATION {
+                sess.active_sign_verify = None;
+                sess.active_operation = None;
+                return CKR_DATA_LEN_RANGE;
+            }
+            if let Some(h) = hasher.as_mut() {
+                h.update(part);
+            } else {
+                data.extend_from_slice(part);
+            }
+        }
+
+        // 2. Encrypt part (accumulation mode)
+        if let Some(ActiveOperation::Encrypt {
+            mechanism, data, ..
+        }) = &mut sess.active_operation
+        {
+            if !encrypt_mechanism_supports_multipart(*mechanism) {
+                sess.active_operation = None;
+                sess.active_sign_verify = None;
+                return CKR_MECHANISM_INVALID;
+            }
+            if data.len().saturating_add(part.len()) > MAX_MULTIPART_ACCUMULATION {
+                sess.active_operation = None;
+                sess.active_sign_verify = None;
+                return CKR_DATA_LEN_RANGE;
+            }
+            data.extend_from_slice(part);
+        }
+
+        unsafe {
+            *pul_encrypted_part_len = 0;
+        }
+        CKR_OK
+    })
+    .unwrap_or(CKR_GENERAL_ERROR)
 }
 
 #[no_mangle]
 pub extern "C" fn C_DecryptVerifyUpdate(
-    _s: CK_SESSION_HANDLE,
-    _e: CK_BYTE_PTR,
-    _el: CK_ULONG,
-    _d: CK_BYTE_PTR,
-    _dl: CK_ULONG_PTR,
+    session: CK_SESSION_HANDLE,
+    p_encrypted_part: CK_BYTE_PTR,
+    encrypted_part_len: CK_ULONG,
+    p_part: CK_BYTE_PTR,
+    pul_part_len: CK_ULONG_PTR,
 ) -> CK_RV {
-    not_supported()
+    catch_unwind(|| {
+        let _scrub = ScrubOnDrop;
+        let hsm = match get_hsm() {
+            Ok(h) => h,
+            Err(rv) => return rv,
+        };
+        if pul_part_len.is_null() {
+            return CKR_ARGUMENTS_BAD;
+        }
+
+        let sess = match hsm.session_manager.get_session(session) {
+            Ok(s) => s,
+            Err(e) => return err_to_rv(e),
+        };
+        let mut sess = sess.write();
+
+        let has_decrypt = matches!(&sess.active_operation, Some(ActiveOperation::Decrypt { .. }));
+        let has_verify = sess
+            .active_sign_verify
+            .as_ref()
+            .map_or(false, |op| matches!(op, ActiveOperation::Verify { .. }))
+            || matches!(&sess.active_operation, Some(ActiveOperation::Verify { .. }));
+        if !has_decrypt || !has_verify {
+            return CKR_OPERATION_NOT_INITIALIZED;
+        }
+
+        if p_part.is_null() {
+            unsafe {
+                *pul_part_len = encrypted_part_len;
+            }
+            return CKR_OK;
+        }
+        if p_encrypted_part.is_null() {
+            return CKR_ARGUMENTS_BAD;
+        }
+
+        let enc_part =
+            unsafe { slice::from_raw_parts(p_encrypted_part, encrypted_part_len as usize) };
+        if (encrypted_part_len as usize) > MAX_SINGLE_BUFFER {
+            sess.active_operation = None;
+            sess.active_sign_verify = None;
+            return CKR_DATA_LEN_RANGE;
+        }
+
+        let (mechanism, key_handle, mech_param, cached_object) = match &sess.active_operation {
+            Some(ActiveOperation::Decrypt {
+                mechanism,
+                key_handle,
+                mechanism_param,
+                cached_object,
+                ..
+            }) => (*mechanism, *key_handle, mechanism_param.clone(), cached_object.clone()),
+            _ => return CKR_OPERATION_NOT_INITIALIZED,
+        };
+
+        let obj = if let Some(cached) = cached_object {
+            cached
+        } else {
+            match hsm.object_store.get_object(key_handle) {
+                Ok(o) => o,
+                Err(e) => {
+                    sess.active_operation = None;
+                    sess.active_sign_verify = None;
+                    return err_to_rv(e);
+                }
+            }
+        };
+        let obj = obj.read();
+        let key_bytes = match &obj.key_material {
+            Some(km) => km.as_bytes(),
+            None => {
+                sess.active_operation = None;
+                sess.active_sign_verify = None;
+                return CKR_KEY_HANDLE_INVALID;
+            }
+        };
+
+        let decrypted = match mechanism {
+            CKM_AES_CBC => {
+                hsm.crypto_backend
+                    .aes_cbc_decrypt_unpadded(key_bytes, &mech_param, enc_part)
+            }
+            CKM_AES_CBC_PAD => {
+                hsm.crypto_backend
+                    .aes_cbc_decrypt(key_bytes, &mech_param, enc_part)
+            }
+            CKM_AES_CTR => {
+                hsm.crypto_backend
+                    .aes_ctr_decrypt(key_bytes, &mech_param, enc_part)
+            }
+            _ => {
+                sess.active_operation = None;
+                sess.active_sign_verify = None;
+                return CKR_MECHANISM_INVALID;
+            }
+        };
+
+        let pt = match decrypted {
+            Ok(d) => d,
+            Err(e) => {
+                sess.active_operation = None;
+                sess.active_sign_verify = None;
+                return err_to_rv(e);
+            }
+        };
+
+        let buf_len = unsafe { *pul_part_len } as usize;
+        if buf_len < pt.len() {
+            unsafe {
+                *pul_part_len = pt.len() as CK_ULONG;
+            }
+            return CKR_BUFFER_TOO_SMALL;
+        }
+
+        let out = unsafe { slice::from_raw_parts_mut(p_part, pt.len()) };
+        out.copy_from_slice(&pt);
+        unsafe {
+            *pul_part_len = pt.len() as CK_ULONG;
+        }
+
+        let verify_target = if sess.active_sign_verify.is_some() {
+            &mut sess.active_sign_verify
+        } else {
+            &mut sess.active_operation
+        };
+        if let Some(ActiveOperation::Verify { hasher, data, .. }) = verify_target {
+            if data.len().saturating_add(pt.len()) > MAX_MULTIPART_ACCUMULATION {
+                sess.active_sign_verify = None;
+                sess.active_operation = None;
+                return CKR_DATA_LEN_RANGE;
+            }
+            if let Some(h) = hasher.as_mut() {
+                h.update(&pt);
+            } else {
+                data.extend_from_slice(&pt);
+            }
+        }
+
+        CKR_OK
+    })
+    .unwrap_or(CKR_GENERAL_ERROR)
 }
 
 #[no_mangle]

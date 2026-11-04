@@ -431,6 +431,91 @@ pub fn rsa_pkcs1v15_verify(
     }
 }
 
+/// RSA PKCS#1 v1.5 sign with data recovery (PKCS#11 CKM_RSA_PKCS / C_SignRecover).
+///
+/// Pads raw data using PKCS#1 v1.5 block format 01:
+/// `0x00 || 0x01 || PS (>= 8 bytes of 0xFF) || 0x00 || Data`
+/// and computes `s = m^d mod n`.
+pub fn rsa_pkcs1v15_sign_recover(
+    private_key_der: &[u8],
+    data: &[u8],
+) -> HsmResult<Vec<u8>> {
+    require_rustcrypto_rsa_private_ops()?;
+    use rsa::traits::{PrivateKeyParts, PublicKeyParts};
+
+    validate_data_size(data)?;
+    let private_key = parse_rsa_private_key(private_key_der)?;
+    validate_rsa_private_key_size(&private_key)?;
+
+    let k = private_key.size();
+    if data.len() + 11 > k {
+        return Err(HsmError::DataLenRange);
+    }
+
+    let mut em = vec![0xFF; k];
+    em[0] = 0x00;
+    em[1] = 0x01;
+    let delim_idx = k - 1 - data.len();
+    em[delim_idx] = 0x00;
+    em[delim_idx + 1..].copy_from_slice(data);
+
+    let m = rsa::BigUint::from_bytes_be(&em);
+    let s = m.modpow(private_key.d(), private_key.n());
+    let mut sig = s.to_bytes_be();
+    if sig.len() < k {
+        let mut padded = vec![0u8; k];
+        padded[k - sig.len()..].copy_from_slice(&sig);
+        sig = padded;
+    }
+    Ok(sig)
+}
+
+/// RSA PKCS#1 v1.5 verify with data recovery (PKCS#11 CKM_RSA_PKCS / C_VerifyRecover).
+///
+/// Computes `m = s^e mod n` and extracts raw data from PKCS#1 v1.5 block format 01:
+/// `0x00 || 0x01 || PS (>= 8 bytes of 0xFF) || 0x00 || Data`.
+pub fn rsa_pkcs1v15_verify_recover(
+    modulus: &[u8],
+    public_exponent: &[u8],
+    signature: &[u8],
+) -> HsmResult<Vec<u8>> {
+    validate_rsa_public_key_size(modulus)?;
+    let n = rsa::BigUint::from_bytes_be(modulus);
+    let e = rsa::BigUint::from_bytes_be(public_exponent);
+    let k = modulus.len();
+
+    if signature.len() != k {
+        return Err(HsmError::SignatureInvalid);
+    }
+    let s = rsa::BigUint::from_bytes_be(signature);
+    if s >= n {
+        return Err(HsmError::SignatureInvalid);
+    }
+
+    let m = s.modpow(&e, &n);
+    let m_bytes = m.to_bytes_be();
+    let mut em = vec![0u8; k];
+    if m_bytes.len() > k {
+        return Err(HsmError::SignatureInvalid);
+    }
+    em[k - m_bytes.len()..].copy_from_slice(&m_bytes);
+
+    if em[0] != 0x00 || em[1] != 0x01 {
+        return Err(HsmError::SignatureInvalid);
+    }
+
+    let mut idx = 2;
+    while idx < k && em[idx] == 0xFF {
+        idx += 1;
+    }
+
+    if idx < 10 || idx >= k || em[idx] != 0x00 {
+        return Err(HsmError::SignatureInvalid);
+    }
+
+    Ok(em[idx + 1..].to_vec())
+}
+
 // ============================================================================
 // RSA-PSS
 // ============================================================================
@@ -1941,5 +2026,27 @@ mod tests {
             get_cached_rsa_public_key(slot_a, handle_a).is_none(),
             "clear_all must drop the public cache"
         );
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(any(debug_assertions, feature = "insecure-rustcrypto-rsa-private-ops")),
+        ignore = "RustCrypto RSA private-key operations are refused in release builds \
+                  (RUSTSEC-2023-0071); run in debug or with \
+                  --features insecure-rustcrypto-rsa-private-ops"
+    )]
+    fn rsa_pkcs1v15_sign_recover_roundtrip() {
+        let (priv_der, modulus, pub_exp) = fresh_rsa_keypair();
+        let msg = b"recoverable message";
+        let sig = rsa_pkcs1v15_sign_recover(&priv_der, msg).expect("sign recover");
+        assert_eq!(sig.len(), modulus.len());
+
+        let recovered = rsa_pkcs1v15_verify_recover(&modulus, &pub_exp, &sig).expect("verify recover");
+        assert_eq!(recovered, msg);
+
+        // Corrupted signature fails
+        let mut bad_sig = sig.clone();
+        bad_sig[10] ^= 0x55;
+        assert!(rsa_pkcs1v15_verify_recover(&modulus, &pub_exp, &bad_sig).is_err());
     }
 }
