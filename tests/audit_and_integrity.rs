@@ -1036,3 +1036,51 @@ fn test_hsm_core_audit_chain_with_derived_key_verifies() {
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_hsm_core_restart_preserves_audit_chain_and_key() {
+    let mut config = craton_hsm::config::HsmConfig::default();
+    let temp_dir = std::env::temp_dir().join(format!("craton_audit_restart_test_{}", std::process::id()));
+    std::fs::create_dir_all(&temp_dir).expect("create temp dir");
+    config.token.storage_path = temp_dir.clone();
+    let log_file = temp_dir.join("audit.log");
+    config.audit.log_path = log_file.clone();
+
+    // First boot: record an event
+    {
+        let core = craton_hsm::core::HsmCore::try_new(&config).expect("core init 1");
+        core.audit_log()
+            .record_sync(
+                1,
+                craton_hsm::audit::log::AuditOperation::Initialize,
+                craton_hsm::audit::log::AuditResult::Success,
+                None,
+            )
+            .expect("record 1");
+        assert_eq!(core.audit_log().verify_chain(), Ok(1));
+    }
+
+    // Second boot (restart): core must load saved state HMAC key, verify existing chain, and append event 2
+    {
+        let core2 = craton_hsm::core::HsmCore::try_new(&config).expect("core restart");
+        assert!(!core2.audit_log().is_tamper_detected(), "Restarted core must not trigger false tamper alarm");
+        core2.audit_log()
+            .record_sync(
+                1,
+                craton_hsm::audit::log::AuditOperation::GenerateRandom { length: 32 },
+                craton_hsm::audit::log::AuditResult::Success,
+                None,
+            )
+            .expect("record 2");
+        let all_entries = craton_hsm::audit::log::load_entries_from_file(&log_file).expect("load entries");
+        assert_eq!(
+            craton_hsm::audit::log::verify_chain_entries_with_key(
+                &all_entries,
+                core2.audit_log().audit_chain_key()
+            ),
+            Ok(2)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}

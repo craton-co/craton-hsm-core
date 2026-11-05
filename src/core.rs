@@ -193,11 +193,33 @@ impl HsmCore {
         key
     }
 
+    /// Load or create the persistent state HMAC key for operation states and audit chain.
+    fn get_or_create_state_hmac_key(config: &HsmConfig) -> Zeroizing<[u8; 32]> {
+        let key_path = config.token.storage_path.join("state_hmac.key");
+        if key_path.is_file() {
+            if let Ok(data) = std::fs::read(&key_path) {
+                if data.len() == 32 {
+                    let mut key = [0u8; 32];
+                    key.copy_from_slice(&data);
+                    return Zeroizing::new(key);
+                }
+            }
+        }
+
+        let key = Self::generate_state_hmac_key();
+        if std::fs::create_dir_all(&config.token.storage_path).is_ok()
+            && std::fs::write(&key_path, *key).is_ok()
+        {
+            let _ = crate::platform_acl::restrict_file_to_owner(&key_path);
+        }
+        key
+    }
+
     /// Fallible constructor — returns an error if the HMAC_DRBG cannot be
     /// seeded (e.g., OS entropy source unavailable).
     pub fn try_new(config: &HsmConfig) -> Result<Self, crate::error::HsmError> {
         let drbg = HmacDrbg::new().map_err(|_| crate::error::HsmError::GeneralError)?;
-        let state_hmac_key = Self::generate_state_hmac_key();
+        let state_hmac_key = Self::get_or_create_state_hmac_key(config);
         let audit_chain_key = crate::audit::log::derive_audit_chain_key(&state_hmac_key);
         let audit_log = if config.audit.enabled {
             AuditLog::new_with_path_and_key(config.audit.log_path.clone(), audit_chain_key)?
@@ -245,7 +267,7 @@ impl HsmCore {
         backend: Arc<dyn CryptoBackend>,
     ) -> Result<Self, crate::error::HsmError> {
         let drbg = HmacDrbg::new().map_err(|_| crate::error::HsmError::GeneralError)?;
-        let state_hmac_key = Self::generate_state_hmac_key();
+        let state_hmac_key = Self::get_or_create_state_hmac_key(config);
         let audit_chain_key = crate::audit::log::derive_audit_chain_key(&state_hmac_key);
         let audit_log = if config.audit.enabled {
             AuditLog::new_with_path_and_key(config.audit.log_path.clone(), audit_chain_key)?
