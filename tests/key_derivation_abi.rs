@@ -486,6 +486,55 @@ fn test_ecdh_p521_derived_key_usable() {
     assert_eq!(rv, CKR_OK, "Derived P-521 key should be usable");
 }
 
+#[test]
+fn test_ecdh_p521_derive_generic_secret_66_bytes() {
+    let session = setup_user_session();
+    let (_pub_a, priv_a) = generate_ec_keypair(session, &P521_OID);
+    let (pub_b, _priv_b) = generate_ec_keypair(session, &P521_OID);
+
+    let ec_point_b = read_ec_point(session, pub_b);
+
+    let mut mechanism = CK_MECHANISM {
+        mechanism: CKM_ECDH1_DERIVE,
+        p_parameter: ec_point_b.as_ptr() as CK_VOID_PTR,
+        parameter_len: ec_point_b.len() as CK_ULONG,
+    };
+
+    let key_len_bytes = ck_ulong_bytes(66);
+    let class_bytes = ck_ulong_bytes(CKO_SECRET_KEY);
+    let key_type_bytes = ck_ulong_bytes(CKK_GENERIC_SECRET);
+
+    let mut derive_template = vec![
+        CK_ATTRIBUTE {
+            attr_type: CKA_CLASS,
+            p_value: class_bytes.as_ptr() as CK_VOID_PTR,
+            value_len: class_bytes.len() as CK_ULONG,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_KEY_TYPE,
+            p_value: key_type_bytes.as_ptr() as CK_VOID_PTR,
+            value_len: key_type_bytes.len() as CK_ULONG,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_VALUE_LEN,
+            p_value: key_len_bytes.as_ptr() as CK_VOID_PTR,
+            value_len: key_len_bytes.len() as CK_ULONG,
+        },
+    ];
+
+    let mut derived_key: CK_OBJECT_HANDLE = 0;
+    let rv = C_DeriveKey(
+        session,
+        &mut mechanism,
+        priv_a,
+        derive_template.as_mut_ptr(),
+        derive_template.len() as CK_ULONG,
+        &mut derived_key,
+    );
+    assert_eq!(rv, CKR_OK, "Deriving 66-byte CKK_GENERIC_SECRET from P-521 must succeed");
+    assert_ne!(derived_key, 0);
+}
+
 // ============================================================================
 // Error cases
 // ============================================================================
