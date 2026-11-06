@@ -34,14 +34,10 @@ pub struct VectorConfig {
     pub aes_ctr_enabled: bool,
     /// Accelerated AES-CBC decryption (VAES 512-bit, 4 parallel 16-byte blocks).
     pub aes_cbc_enabled: bool,
-    /// Accelerated SHA-3 / Keccak-p[1600] using AVX-512 vector permutation.
-    pub sha3_enabled: bool,
     /// Accelerated ML-KEM polynomial arithmetic mod 3329 (AVX-512BW 32x i16 lanes).
     pub pqc_mlkem_enabled: bool,
     /// Accelerated ML-DSA polynomial arithmetic mod 8380417 (AVX-512F 16x i32 lanes).
     pub pqc_mldsa_enabled: bool,
-    /// Accelerated RSA Montgomery multiplication (AVX-512 IFMA 52-bit digit multiply).
-    pub rsa_ifma_enabled: bool,
 }
 
 impl Default for VectorConfig {
@@ -52,10 +48,8 @@ impl Default for VectorConfig {
         Self {
             aes_ctr_enabled: true, // 2.30x speedup (11.58 GB/s vs 5.03 GB/s)
             aes_cbc_enabled: true, // 2.89x speedup (16.13 GB/s vs 5.57 GB/s)
-            sha3_enabled: true,
             pqc_mlkem_enabled: true, // 6.49x speedup on Montgomery mul, 1.62x on poly add
             pqc_mldsa_enabled: true, // 1.78x speedup on poly add
-            rsa_ifma_enabled: true,  // 4.47x speedup
         }
     }
 }
@@ -67,10 +61,8 @@ impl VectorConfig {
     /// - `CRATON_HSM_AVX512_DISABLE=1`: Master switch disabling all AVX-512 paths.
     /// - `CRATON_HSM_AVX512_AES_CTR=0|1`
     /// - `CRATON_HSM_AVX512_AES_CBC=0|1`
-    /// - `CRATON_HSM_AVX512_SHA3=0|1`
     /// - `CRATON_HSM_AVX512_MLKEM=0|1`
     /// - `CRATON_HSM_AVX512_MLDSA=0|1`
-    /// - `CRATON_HSM_AVX512_RSA_IFMA=0|1`
     pub fn from_env() -> Self {
         if std::env::var("CRATON_HSM_AVX512_DISABLE")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -87,17 +79,11 @@ impl VectorConfig {
         if let Ok(val) = std::env::var("CRATON_HSM_AVX512_AES_CBC") {
             config.aes_cbc_enabled = val == "1" || val.eq_ignore_ascii_case("true");
         }
-        if let Ok(val) = std::env::var("CRATON_HSM_AVX512_SHA3") {
-            config.sha3_enabled = val == "1" || val.eq_ignore_ascii_case("true");
-        }
         if let Ok(val) = std::env::var("CRATON_HSM_AVX512_MLKEM") {
             config.pqc_mlkem_enabled = val == "1" || val.eq_ignore_ascii_case("true");
         }
         if let Ok(val) = std::env::var("CRATON_HSM_AVX512_MLDSA") {
             config.pqc_mldsa_enabled = val == "1" || val.eq_ignore_ascii_case("true");
-        }
-        if let Ok(val) = std::env::var("CRATON_HSM_AVX512_RSA_IFMA") {
-            config.rsa_ifma_enabled = val == "1" || val.eq_ignore_ascii_case("true");
         }
 
         config
@@ -108,10 +94,8 @@ impl VectorConfig {
         Self {
             aes_ctr_enabled: false,
             aes_cbc_enabled: false,
-            sha3_enabled: false,
             pqc_mlkem_enabled: false,
             pqc_mldsa_enabled: false,
-            rsa_ifma_enabled: false,
         }
     }
 }
@@ -132,6 +116,7 @@ pub fn set_config(config: VectorConfig) {
 /// Hardware and confidential computing capability report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CpuVectorCapabilities {
+    pub aes: bool,
     pub avx512f: bool,
     pub avx512bw: bool,
     pub avx512dq: bool,
@@ -146,6 +131,7 @@ pub struct CpuVectorCapabilities {
 pub fn detect_vector_capabilities() -> CpuVectorCapabilities {
     #[cfg(target_arch = "x86_64")]
     {
+        let aes = is_x86_feature_detected!("aes");
         let avx512f = is_x86_feature_detected!("avx512f");
         let avx512bw = is_x86_feature_detected!("avx512bw");
         let avx512dq = is_x86_feature_detected!("avx512dq");
@@ -161,6 +147,7 @@ pub fn detect_vector_capabilities() -> CpuVectorCapabilities {
         let enclave_xcr0_valid = avx512f;
 
         CpuVectorCapabilities {
+            aes,
             avx512f,
             avx512bw,
             avx512dq,
@@ -174,6 +161,7 @@ pub fn detect_vector_capabilities() -> CpuVectorCapabilities {
     #[cfg(not(target_arch = "x86_64"))]
     {
         CpuVectorCapabilities {
+            aes: false,
             avx512f: false,
             avx512bw: false,
             avx512dq: false,
@@ -193,17 +181,12 @@ pub fn is_avx512_supported() -> bool {
 
 pub fn is_aes_ctr_avx512_enabled() -> bool {
     let caps = detect_vector_capabilities();
-    caps.avx512f && caps.vaes && active_config().aes_ctr_enabled
+    caps.aes && caps.avx512f && caps.vaes && active_config().aes_ctr_enabled
 }
 
 pub fn is_aes_cbc_avx512_enabled() -> bool {
     let caps = detect_vector_capabilities();
-    caps.avx512f && caps.vaes && active_config().aes_cbc_enabled
-}
-
-pub fn is_sha3_avx512_enabled() -> bool {
-    let caps = detect_vector_capabilities();
-    caps.avx512f && caps.avx512vl && active_config().sha3_enabled
+    caps.aes && caps.avx512f && caps.vaes && active_config().aes_cbc_enabled
 }
 
 pub fn is_pqc_mlkem_vector_enabled() -> bool {
@@ -214,11 +197,6 @@ pub fn is_pqc_mlkem_vector_enabled() -> bool {
 pub fn is_pqc_mldsa_vector_enabled() -> bool {
     let caps = detect_vector_capabilities();
     caps.avx512f && active_config().pqc_mldsa_enabled
-}
-
-pub fn is_rsa_ifma_enabled() -> bool {
-    let caps = detect_vector_capabilities();
-    caps.avx512f && caps.avx512ifma && active_config().rsa_ifma_enabled
 }
 
 // ============================================================================
@@ -766,244 +744,6 @@ pub mod pqc_mldsa {
     }
 }
 
-// ============================================================================
-// SHA-3 / Keccak-p[1600] AVX-512 Vector Permutation
-// ============================================================================
-
-pub mod sha3_keccak {
-    use super::ScrubOnDrop;
-
-    const ROUND_CONSTANTS: [u64; 24] = [
-        0x0000000000000001, 0x0000000000008082, 0x800000000000808a, 0x8000000080008000,
-        0x000000000000808b, 0x0000000080000001, 0x8000000080008081, 0x8000000000008009,
-        0x000000000000008a, 0x0000000000000088, 0x0000000080008009, 0x000000008000000a,
-        0x000000008000808b, 0x800000000000008b, 0x8000000000008089, 0x8000000000008003,
-        0x8000000000008002, 0x8000000000000080, 0x000000000000800a, 0x800000008000000a,
-        0x8000000080008081, 0x8000000000008080, 0x0000000080000001, 0x8000000080008008,
-    ];
-
-    const ROTATION_CONSTANTS: [u32; 25] = [
-        0, 1, 62, 28, 27,
-        36, 44, 6, 55, 20,
-        3, 10, 43, 25, 39,
-        41, 45, 15, 21, 8,
-        18, 2, 61, 56, 14,
-    ];
-
-    const PI: [usize; 25] = [
-        0, 10, 20, 5, 15,
-        16, 1, 11, 21, 6,
-        7, 17, 2, 12, 22,
-        23, 8, 18, 3, 13,
-        14, 24, 9, 19, 4,
-    ];
-
-    pub fn keccak_f1600(state: &mut [u64; 25]) {
-        #[cfg(target_arch = "x86_64")]
-        {
-            if super::is_sha3_avx512_enabled() {
-                unsafe { keccak_f1600_avx512(state); }
-                return;
-            }
-        }
-        keccak_f1600_scalar(state);
-    }
-
-    pub fn keccak_f1600_scalar(state: &mut [u64; 25]) {
-        let mut b = [0u64; 25];
-        let mut c = [0u64; 5];
-        let mut d = [0u64; 5];
-
-        for &rc in &ROUND_CONSTANTS {
-            // Theta
-            for x in 0..5 {
-                c[x] = state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20];
-            }
-            for x in 0..5 {
-                d[x] = c[(x + 4) % 5] ^ c[(x + 1) % 5].rotate_left(1);
-            }
-            for x in 0..5 {
-                for y in 0..5 {
-                    state[x + y * 5] ^= d[x];
-                }
-            }
-
-            // Rho and Pi
-            for i in 0..25 {
-                b[PI[i]] = state[i].rotate_left(ROTATION_CONSTANTS[i]);
-            }
-
-            // Chi
-            for y in 0..5 {
-                for x in 0..5 {
-                    state[x + y * 5] = b[x + y * 5] ^ ((!b[(x + 1) % 5 + y * 5]) & b[(x + 2) % 5 + y * 5]);
-                }
-            }
-
-            // Iota
-            state[0] ^= rc;
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx512f,avx512vl")]
-    pub unsafe fn keccak_f1600_avx512(state: &mut [u64; 25]) {
-        use std::arch::x86_64::*;
-        let _scrub = ScrubOnDrop;
-
-        let mut b = [0u64; 25];
-
-        for &rc in &ROUND_CONSTANTS {
-            // Theta: compute column parity
-            let mut c = [0u64; 5];
-            for x in 0..5 {
-                c[x] = state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20];
-            }
-
-            let mut d = [0u64; 5];
-            for x in 0..5 {
-                d[x] = c[(x + 4) % 5] ^ c[(x + 1) % 5].rotate_left(1);
-            }
-
-            for y in 0..5 {
-                let base = y * 5;
-                state[base] ^= d[0];
-                state[base + 1] ^= d[1];
-                state[base + 2] ^= d[2];
-                state[base + 3] ^= d[3];
-                state[base + 4] ^= d[4];
-            }
-
-            // Rho and Pi
-            for i in 0..25 {
-                b[PI[i]] = state[i].rotate_left(ROTATION_CONSTANTS[i]);
-            }
-
-            // Chi using AVX-512 ternary logic: chi(a, b, c) = a ^ (~b & c) with lookup byte 0xd6
-            for y in 0..5 {
-                let base = y * 5;
-                let b0 = b[base];
-                let b1 = b[base + 1];
-                let b2 = b[base + 2];
-                let b3 = b[base + 3];
-                let b4 = b[base + 4];
-
-                let va = _mm256_set_epi64x(b3 as i64, b2 as i64, b1 as i64, b0 as i64);
-                let vb = _mm256_set_epi64x(b4 as i64, b3 as i64, b2 as i64, b1 as i64);
-                let vc = _mm256_set_epi64x(b0 as i64, b4 as i64, b3 as i64, b2 as i64);
-                let vres = _mm256_ternarylogic_epi64::<0xd6>(va, vb, vc);
-
-                let mut out_chunk = [0i64; 4];
-                _mm256_storeu_si256(out_chunk.as_mut_ptr() as *mut __m256i, vres);
-                state[base] = out_chunk[0] as u64;
-                state[base + 1] = out_chunk[1] as u64;
-                state[base + 2] = out_chunk[2] as u64;
-                state[base + 3] = out_chunk[3] as u64;
-                state[base + 4] = b4 ^ ((!b0) & b1);
-            }
-
-            // Iota
-            state[0] ^= rc;
-        }
-    }
-}
-
-// ============================================================================
-// RSA BigInt Montgomery Multiplication with AVX-512 IFMA
-// ============================================================================
-
-pub mod rsa_ifma {
-    use super::ScrubOnDrop;
-
-    /// Modular multiplication for 2048-bit BigInts (32x 64-bit limbs).
-    /// Returns true if AVX-512 IFMA was executed, false if scalar fallback was used.
-    pub fn montgomery_mul_2048(
-        out: &mut [u64; 32],
-        a: &[u64; 32],
-        b: &[u64; 32],
-        n: &[u64; 32],
-        n_prime: u64,
-    ) -> bool {
-        #[cfg(target_arch = "x86_64")]
-        {
-            if super::is_rsa_ifma_enabled() {
-                unsafe {
-                    montgomery_mul_2048_ifma(out, a, b, n, n_prime);
-                }
-                return true;
-            }
-        }
-        montgomery_mul_2048_scalar(out, a, b, n, n_prime);
-        false
-    }
-
-    pub fn montgomery_mul_2048_scalar(
-        out: &mut [u64; 32],
-        a: &[u64; 32],
-        b: &[u64; 32],
-        n: &[u64; 32],
-        n_prime: u64,
-    ) {
-        let mut t = [0u64; 65];
-        for i in 0..32 {
-            let mut carry: u128 = 0;
-            for j in 0..32 {
-                let sum = (t[i + j] as u128) + (a[j] as u128) * (b[i] as u128) + carry;
-                t[i + j] = sum as u64;
-                carry = sum >> 64;
-            }
-            t[i + 32] = (t[i + 32] as u128 + carry) as u64;
-
-            let m = t[i].wrapping_mul(n_prime);
-            let mut carry_m: u128 = 0;
-            for j in 0..32 {
-                let sum = (t[i + j] as u128) + (n[j] as u128) * (m as u128) + carry_m;
-                t[i + j] = sum as u64;
-                carry_m = sum >> 64;
-            }
-            t[i + 32] = (t[i + 32] as u128 + carry_m) as u64;
-        }
-
-        out.copy_from_slice(&t[32..64]);
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx512f,avx512ifma")]
-    unsafe fn montgomery_mul_2048_ifma(
-        out: &mut [u64; 32],
-        a: &[u64; 32],
-        b: &[u64; 32],
-        n: &[u64; 32],
-        n_prime: u64,
-    ) {
-        use std::arch::x86_64::*;
-        let _scrub = ScrubOnDrop;
-
-        let mut t = [0u64; 65];
-        for i in 0..32 {
-            let bi = _mm512_set1_epi64(b[i] as i64);
-            // Process 32 elements in 4x 8-element ZMM chunks using _mm512_madd52lo_epu64
-            for j in (0..32).step_by(8) {
-                let va = _mm512_loadu_si512(a.as_ptr().add(j) as *const __m512i);
-                let vc = _mm512_loadu_si512(t.as_ptr().add(i + j) as *const __m512i);
-                let res = _mm512_madd52lo_epu64(vc, va, bi);
-                _mm512_storeu_si512(t.as_mut_ptr().add(i + j) as *mut __m512i, res);
-            }
-
-            let m = t[i].wrapping_mul(n_prime);
-            let vm = _mm512_set1_epi64(m as i64);
-            for j in (0..32).step_by(8) {
-                let vn = _mm512_loadu_si512(n.as_ptr().add(j) as *const __m512i);
-                let vc = _mm512_loadu_si512(t.as_ptr().add(i + j) as *const __m512i);
-                let res = _mm512_madd52lo_epu64(vc, vn, vm);
-                _mm512_storeu_si512(t.as_mut_ptr().add(i + j) as *mut __m512i, res);
-            }
-        }
-
-        out.copy_from_slice(&t[32..64]);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1108,38 +848,5 @@ mod tests {
         pqc_mldsa::poly_sub(&mut a, &b);
         assert_eq!(a[0], 1000);
         assert_eq!(a[255], 1000);
-    }
-
-    #[test]
-    fn test_keccak_f1600_matches() {
-        let mut s1 = [0u64; 25];
-        s1[0] = 0x123456789abcdef0;
-        s1[1] = 0xfedcba9876543210;
-        let mut s2 = s1;
-
-        sha3_keccak::keccak_f1600(&mut s1);
-        sha3_keccak::keccak_f1600_scalar(&mut s2);
-        assert_eq!(s1, s2);
-    }
-
-    #[test]
-    fn test_rsa_ifma_montgomery_mul_matches_scalar() {
-        let mut a = [0u64; 32];
-        let mut b = [0u64; 32];
-        let mut n = [0u64; 32];
-        for i in 0..32 {
-            a[i] = 0x1111222233334444 + (i as u64);
-            b[i] = 0x5555666677778888 + (i as u64);
-            n[i] = 0x9999aaaabbbbcccc + (i as u64);
-        }
-        n[0] |= 1; // ensure odd modulus
-        let n_prime = 0xd3e512fd5e1d4b67u64;
-
-        let mut out_ifma = [0u64; 32];
-        let mut out_scalar = [0u64; 32];
-
-        rsa_ifma::montgomery_mul_2048(&mut out_ifma, &a, &b, &n, n_prime);
-        rsa_ifma::montgomery_mul_2048_scalar(&mut out_scalar, &a, &b, &n, n_prime);
-        assert_eq!(out_ifma, out_scalar);
     }
 }
