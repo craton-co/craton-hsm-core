@@ -1553,13 +1553,13 @@ fn test_ec_keygen_rejects_unsupported_and_missing_curve() {
         value_len: 1,
     }];
 
-    // 1. Unsupported curve (secp521r1 OID: 06 05 2B 81 04 00 23) -> CKR_CURVE_NOT_SUPPORTED
-    let p521_oid: [u8; 7] = [0x06, 0x05, 0x2B, 0x81, 0x04, 0x00, 0x23];
-    let mut pub_p521 = vec![
+    // 1. Unsupported curve (secp224r1 OID: 06 05 2B 81 04 00 21) -> CKR_CURVE_NOT_SUPPORTED
+    let unsupported_oid: [u8; 7] = [0x06, 0x05, 0x2B, 0x81, 0x04, 0x00, 0x21];
+    let mut pub_unsupported = vec![
         CK_ATTRIBUTE {
             attr_type: CKA_EC_PARAMS,
-            p_value: p521_oid.as_ptr() as CK_VOID_PTR,
-            value_len: p521_oid.len() as CK_ULONG,
+            p_value: unsupported_oid.as_ptr() as CK_VOID_PTR,
+            value_len: unsupported_oid.len() as CK_ULONG,
         },
         CK_ATTRIBUTE {
             attr_type: CKA_VERIFY,
@@ -1572,8 +1572,8 @@ fn test_ec_keygen_rejects_unsupported_and_missing_curve() {
     let rv = C_GenerateKeyPair(
         session,
         &mut mechanism,
-        pub_p521.as_mut_ptr(),
-        pub_p521.len() as CK_ULONG,
+        pub_unsupported.as_mut_ptr(),
+        pub_unsupported.len() as CK_ULONG,
         priv_template.as_mut_ptr(),
         priv_template.len() as CK_ULONG,
         &mut pub_key,

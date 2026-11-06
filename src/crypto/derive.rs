@@ -272,7 +272,7 @@ pub fn apply_ec_kdf(
 }
 
 /// Largest `CKK_GENERIC_SECRET` a derivation may produce, in bytes.
-pub const MAX_DERIVED_GENERIC_SECRET_LEN: usize = 64;
+pub const MAX_DERIVED_GENERIC_SECRET_LEN: usize = 128;
 
 /// Type, length and protection of a derived secret key, resolved from the
 /// caller's derivation template.
