@@ -671,3 +671,331 @@ fn test_dual_operations_uninitialized_errors() {
 
     teardown_session(session);
 }
+
+#[test]
+fn test_rsa_sign_recover_buffer_too_small_preserves_op() {
+    let session = setup_session();
+    let (_rsa_pub, rsa_priv) = generate_rsa_key_pair(session);
+
+    let mut sign_mech = CK_MECHANISM {
+        mechanism: CKM_RSA_PKCS,
+        p_parameter: ptr::null_mut(),
+        parameter_len: 0,
+    };
+
+    let rv = C_SignRecoverInit(session, &mut sign_mech, rsa_priv);
+    assert_eq!(rv, CKR_OK);
+
+    let msg = b"data to sign and recover";
+    let mut sig_buf = vec![0u8; 10]; // Intentionally too small
+    let mut sig_len: CK_ULONG = sig_buf.len() as CK_ULONG;
+
+    let rv = C_SignRecover(
+        session,
+        msg.as_ptr() as CK_BYTE_PTR,
+        msg.len() as CK_ULONG,
+        sig_buf.as_mut_ptr(),
+        &mut sig_len,
+    );
+    assert_eq!(rv, CKR_BUFFER_TOO_SMALL);
+    assert!(sig_len >= 256);
+
+    // Operation must be preserved so we can allocate and retry
+    let mut full_sig_buf = vec![0u8; sig_len as usize];
+    let rv = C_SignRecover(
+        session,
+        msg.as_ptr() as CK_BYTE_PTR,
+        msg.len() as CK_ULONG,
+        full_sig_buf.as_mut_ptr(),
+        &mut sig_len,
+    );
+    assert_eq!(rv, CKR_OK);
+
+    teardown_session(session);
+}
+
+#[test]
+fn test_decrypt_digest_update_multipart_cbc() {
+    let session = setup_session();
+    let aes_key = generate_aes_key(session);
+
+    let iv = [0x42u8; 16];
+    let plaintext = b"0123456789abcdef0123456789abcdef"; // exactly 32 bytes (2 blocks)
+
+    let mut enc_mech = CK_MECHANISM {
+        mechanism: CKM_AES_CBC,
+        p_parameter: iv.as_ptr() as *mut _,
+        parameter_len: 16,
+    };
+
+    let rv = C_EncryptInit(session, &mut enc_mech, aes_key);
+    assert_eq!(rv, CKR_OK);
+
+    let mut ciphertext = vec![0u8; 32];
+    let mut ct_len: CK_ULONG = 32;
+    let rv = C_Encrypt(
+        session,
+        plaintext.as_ptr() as CK_BYTE_PTR,
+        plaintext.len() as CK_ULONG,
+        ciphertext.as_mut_ptr(),
+        &mut ct_len,
+    );
+    assert_eq!(rv, CKR_OK);
+
+    let mut dec_mech = CK_MECHANISM {
+        mechanism: CKM_AES_CBC,
+        p_parameter: iv.as_ptr() as *mut _,
+        parameter_len: 16,
+    };
+    let mut digest_mech = CK_MECHANISM {
+        mechanism: CKM_SHA256,
+        p_parameter: ptr::null_mut(),
+        parameter_len: 0,
+    };
+
+    let rv = C_DecryptInit(session, &mut dec_mech, aes_key);
+    assert_eq!(rv, CKR_OK);
+    let rv = C_DigestInit(session, &mut digest_mech);
+    assert_eq!(rv, CKR_OK);
+
+    // Multi-part update: chunk 1 (16 bytes)
+    let mut part1 = vec![0u8; 16];
+    let mut part1_len: CK_ULONG = 16;
+    let rv = C_DecryptDigestUpdate(
+        session,
+        ciphertext[..16].as_ptr() as CK_BYTE_PTR,
+        16,
+        part1.as_mut_ptr(),
+        &mut part1_len,
+    );
+    assert_eq!(rv, CKR_OK);
+    assert_eq!(&part1[..part1_len as usize], &plaintext[..16]);
+
+    // Multi-part update: chunk 2 (16 bytes) — requires IV progression from chunk 1
+    let mut part2 = vec![0u8; 16];
+    let mut part2_len: CK_ULONG = 16;
+    let rv = C_DecryptDigestUpdate(
+        session,
+        ciphertext[16..].as_ptr() as CK_BYTE_PTR,
+        16,
+        part2.as_mut_ptr(),
+        &mut part2_len,
+    );
+    assert_eq!(rv, CKR_OK);
+    assert_eq!(&part2[..part2_len as usize], &plaintext[16..]);
+
+    let mut digest = vec![0u8; 32];
+    let mut digest_len: CK_ULONG = 32;
+    let rv = C_DigestFinal(session, digest.as_mut_ptr(), &mut digest_len);
+    assert_eq!(rv, CKR_OK);
+
+    let expected_digest = Sha256::digest(plaintext);
+    assert_eq!(digest.as_slice(), expected_digest.as_slice());
+
+    teardown_session(session);
+}
+
+#[test]
+fn test_decrypt_digest_update_multipart_cbc_pad() {
+    let session = setup_session();
+    let aes_key = generate_aes_key(session);
+
+    let iv = [0x55u8; 16];
+    let plaintext = b"0123456789abcdef0123456789abcdef"; // 32 bytes
+
+    let mut enc_mech = CK_MECHANISM {
+        mechanism: CKM_AES_CBC_PAD,
+        p_parameter: iv.as_ptr() as *mut _,
+        parameter_len: 16,
+    };
+
+    let rv = C_EncryptInit(session, &mut enc_mech, aes_key);
+    assert_eq!(rv, CKR_OK);
+
+    let mut ciphertext = vec![0u8; 64];
+    let mut ct_len: CK_ULONG = 64;
+    let rv = C_Encrypt(
+        session,
+        plaintext.as_ptr() as CK_BYTE_PTR,
+        plaintext.len() as CK_ULONG,
+        ciphertext.as_mut_ptr(),
+        &mut ct_len,
+    );
+    assert_eq!(rv, CKR_OK);
+    assert_eq!(ct_len, 48); // 32 bytes data + 16 bytes padding block
+
+    let mut dec_mech = CK_MECHANISM {
+        mechanism: CKM_AES_CBC_PAD,
+        p_parameter: iv.as_ptr() as *mut _,
+        parameter_len: 16,
+    };
+    let mut digest_mech = CK_MECHANISM {
+        mechanism: CKM_SHA256,
+        p_parameter: ptr::null_mut(),
+        parameter_len: 0,
+    };
+
+    let rv = C_DecryptInit(session, &mut dec_mech, aes_key);
+    assert_eq!(rv, CKR_OK);
+    let rv = C_DigestInit(session, &mut digest_mech);
+    assert_eq!(rv, CKR_OK);
+
+    // Chunk 1 (16 bytes intermediate)
+    let mut part1 = vec![0u8; 32];
+    let mut part1_len: CK_ULONG = 32;
+    let rv = C_DecryptDigestUpdate(
+        session,
+        ciphertext[..16].as_ptr() as CK_BYTE_PTR,
+        16,
+        part1.as_mut_ptr(),
+        &mut part1_len,
+    );
+    assert_eq!(rv, CKR_OK);
+    assert_eq!(&part1[..part1_len as usize], &plaintext[..16]);
+
+    // Chunk 2 (16 bytes intermediate)
+    let mut part2 = vec![0u8; 32];
+    let mut part2_len: CK_ULONG = 32;
+    let rv = C_DecryptDigestUpdate(
+        session,
+        ciphertext[16..32].as_ptr() as CK_BYTE_PTR,
+        16,
+        part2.as_mut_ptr(),
+        &mut part2_len,
+    );
+    assert_eq!(rv, CKR_OK);
+    assert_eq!(&part2[..part2_len as usize], &plaintext[16..32]);
+
+    // Chunk 3 (16 bytes padding block)
+    let mut part3 = vec![0u8; 32];
+    let mut part3_len: CK_ULONG = 32;
+    let rv = C_DecryptDigestUpdate(
+        session,
+        ciphertext[32..48].as_ptr() as CK_BYTE_PTR,
+        16,
+        part3.as_mut_ptr(),
+        &mut part3_len,
+    );
+    assert_eq!(rv, CKR_OK);
+    assert_eq!(part3_len, 0); // padding removed
+
+    let mut digest = vec![0u8; 32];
+    let mut digest_len: CK_ULONG = 32;
+    let rv = C_DigestFinal(session, digest.as_mut_ptr(), &mut digest_len);
+    assert_eq!(rv, CKR_OK);
+
+    let expected_digest = Sha256::digest(plaintext);
+    assert_eq!(digest.as_slice(), expected_digest.as_slice());
+
+    teardown_session(session);
+}
+
+#[test]
+fn test_rsa_sign_recover_disallowed_by_template_attribute() {
+    let session = setup_session();
+
+    let mut mechanism = CK_MECHANISM {
+        mechanism: CKM_RSA_PKCS_KEY_PAIR_GEN,
+        p_parameter: ptr::null_mut(),
+        parameter_len: 0,
+    };
+    let modulus_bits = ck_ulong_bytes(2048);
+    let sign_true: CK_BBOOL = CK_TRUE;
+    let sign_recover_false: CK_BBOOL = CK_FALSE;
+    let verify_true: CK_BBOOL = CK_TRUE;
+
+    let mut pub_template = vec![
+        CK_ATTRIBUTE {
+            attr_type: CKA_MODULUS_BITS,
+            p_value: modulus_bits.as_ptr() as CK_VOID_PTR,
+            value_len: modulus_bits.len() as CK_ULONG,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_VERIFY,
+            p_value: &verify_true as *const _ as CK_VOID_PTR,
+            value_len: 1,
+        },
+    ];
+
+    let mut priv_template = vec![
+        CK_ATTRIBUTE {
+            attr_type: CKA_SIGN,
+            p_value: &sign_true as *const _ as CK_VOID_PTR,
+            value_len: 1,
+        },
+        CK_ATTRIBUTE {
+            attr_type: CKA_SIGN_RECOVER,
+            p_value: &sign_recover_false as *const _ as CK_VOID_PTR,
+            value_len: 1,
+        },
+    ];
+
+    let mut pub_key: CK_OBJECT_HANDLE = 0;
+    let mut priv_key: CK_OBJECT_HANDLE = 0;
+    let rv = C_GenerateKeyPair(
+        session,
+        &mut mechanism,
+        pub_template.as_mut_ptr(),
+        pub_template.len() as CK_ULONG,
+        priv_template.as_mut_ptr(),
+        priv_template.len() as CK_ULONG,
+        &mut pub_key,
+        &mut priv_key,
+    );
+    assert_eq!(rv, CKR_OK);
+
+    let mut sign_mech = CK_MECHANISM {
+        mechanism: CKM_SHA256_RSA_PKCS,
+        p_parameter: ptr::null_mut(),
+        parameter_len: 0,
+    };
+
+    // Standard C_SignInit should succeed because CKA_SIGN is true
+    let rv = C_SignInit(session, &mut sign_mech, priv_key);
+    assert_eq!(rv, CKR_OK);
+    let mut sig = vec![0u8; 256];
+    let mut sig_len: CK_ULONG = 256;
+    let _ = C_Sign(session, b"test".as_ptr() as *mut _, 4, sig.as_mut_ptr(), &mut sig_len);
+
+    let mut recover_mech = CK_MECHANISM {
+        mechanism: CKM_RSA_PKCS,
+        p_parameter: ptr::null_mut(),
+        parameter_len: 0,
+    };
+
+    // C_SignRecoverInit must fail because CKA_SIGN_RECOVER is explicitly false
+    let rv = C_SignRecoverInit(session, &mut recover_mech, priv_key);
+    assert_eq!(rv, CKR_KEY_FUNCTION_NOT_PERMITTED);
+
+    teardown_session(session);
+}
+
+#[test]
+fn test_get_operation_state_returns_unsaveable_on_concurrent_dual_operation() {
+    let session = setup_session();
+    let aes_key = generate_aes_key(session);
+
+    let iv = [0x55u8; 16];
+    let mut dec_mech = CK_MECHANISM {
+        mechanism: CKM_AES_CBC_PAD,
+        p_parameter: iv.as_ptr() as *mut _,
+        parameter_len: 16,
+    };
+    let mut digest_mech = CK_MECHANISM {
+        mechanism: CKM_SHA256,
+        p_parameter: ptr::null_mut(),
+        parameter_len: 0,
+    };
+
+    let rv = C_DecryptInit(session, &mut dec_mech, aes_key);
+    assert_eq!(rv, CKR_OK);
+    let rv = C_DigestInit(session, &mut digest_mech);
+    assert_eq!(rv, CKR_OK);
+
+    // Both decrypt and digest active concurrently: C_GetOperationState must return CKR_STATE_UNSAVEABLE
+    let mut state_len: CK_ULONG = 0;
+    let rv = C_GetOperationState(session, ptr::null_mut(), &mut state_len);
+    assert_eq!(rv, CKR_STATE_UNSAVEABLE);
+
+    teardown_session(session);
+}

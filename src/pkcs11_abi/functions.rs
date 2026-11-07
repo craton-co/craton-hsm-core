@@ -3537,7 +3537,12 @@ pub extern "C" fn C_GenerateKey(
                         Err(rv) => return rv,
                     }
                 }
-                CKA_WRAP_TEMPLATE | CKA_UNWRAP_TEMPLATE | CKA_WRAP_WITH_TRUSTED | CKA_TRUSTED => {
+                CKA_WRAP_TEMPLATE
+                | CKA_UNWRAP_TEMPLATE
+                | CKA_WRAP_WITH_TRUSTED
+                | CKA_TRUSTED
+                | CKA_SIGN_RECOVER
+                | CKA_VERIFY_RECOVER => {
                     obj.extra_attributes.insert(*attr_type, value.clone());
                 }
                 _ => {}
@@ -4159,7 +4164,7 @@ fn apply_pub_template(obj: &mut StoredObject, template: &[(CK_ATTRIBUTE_TYPE, Ve
                     obj.end_date = None;
                 }
             }
-            CKA_WRAP_TEMPLATE | CKA_TRUSTED => {
+            CKA_WRAP_TEMPLATE | CKA_TRUSTED | CKA_VERIFY_RECOVER => {
                 obj.extra_attributes.insert(*attr_type, value.clone());
             }
             _ => {}
@@ -4233,7 +4238,7 @@ fn apply_priv_template(obj: &mut StoredObject, template: &[(CK_ATTRIBUTE_TYPE, V
                     obj.end_date = None;
                 }
             }
-            CKA_UNWRAP_TEMPLATE | CKA_WRAP_WITH_TRUSTED => {
+            CKA_UNWRAP_TEMPLATE | CKA_WRAP_WITH_TRUSTED | CKA_SIGN_RECOVER => {
                 obj.extra_attributes.insert(*attr_type, value.clone());
             }
             _ => {}
@@ -4348,6 +4353,11 @@ pub extern "C" fn C_GetOperationState(
             Err(e) => return err_to_rv(e),
         };
         let sess = sess.read();
+
+        // If concurrent dual-function operations are in progress, state cannot be saved
+        if sess.active_digest.is_some() || sess.active_sign_verify.is_some() {
+            return CKR_STATE_UNSAVEABLE;
+        }
 
         let op = match &sess.active_operation {
             Some(op) => op,
@@ -4524,6 +4534,8 @@ pub extern "C" fn C_SetOperationState(
         };
 
         let mut sess = sess.write();
+        sess.active_digest = None;
+        sess.active_sign_verify = None;
         sess.active_operation = Some(active_op);
         CKR_OK
     })
@@ -5212,6 +5224,14 @@ pub extern "C" fn C_DecryptFinal(
                 ),
                 _ => return CKR_OPERATION_NOT_INITIALIZED,
             };
+
+        if data.is_empty() {
+            sess.active_operation = None;
+            unsafe {
+                *pul_last_part_len = 0;
+            }
+            return CKR_OK;
+        }
 
         let obj = if let Some(cached) = cached_object {
             cached
@@ -6121,11 +6141,6 @@ pub extern "C" fn C_SignRecover(
         let data = unsafe { slice::from_raw_parts(p_data, data_len as usize) };
         let result = hsm.crypto_backend.rsa_pkcs1v15_sign_recover(key_bytes, data);
 
-        if matches!(&sess.active_operation, Some(ActiveOperation::SignRecover { .. })) {
-            sess.active_operation = None;
-        }
-        sess.active_sign_verify = None;
-
         match result {
             Ok(signature) => {
                 if signature.len() > buf_len {
@@ -6134,6 +6149,11 @@ pub extern "C" fn C_SignRecover(
                     }
                     return CKR_BUFFER_TOO_SMALL;
                 }
+                if matches!(&sess.active_operation, Some(ActiveOperation::SignRecover { .. })) {
+                    sess.active_operation = None;
+                }
+                sess.active_sign_verify = None;
+
                 let out = unsafe { slice::from_raw_parts_mut(p_signature, signature.len()) };
                 out.copy_from_slice(&signature);
                 unsafe {
@@ -6151,6 +6171,11 @@ pub extern "C" fn C_SignRecover(
                 CKR_OK
             }
             Err(e) => {
+                if matches!(&sess.active_operation, Some(ActiveOperation::SignRecover { .. })) {
+                    sess.active_operation = None;
+                }
+                sess.active_sign_verify = None;
+
                 let rv = err_to_rv(e);
                 let _ = hsm.audit_log.record(
                     session as u64,
@@ -6807,8 +6832,13 @@ pub extern "C" fn C_DecryptDigestUpdate(
                     .aes_cbc_decrypt_unpadded(key_bytes, &mech_param, enc_part)
             }
             CKM_AES_CBC_PAD => {
-                hsm.crypto_backend
-                    .aes_cbc_decrypt(key_bytes, &mech_param, enc_part)
+                match hsm.crypto_backend.aes_cbc_decrypt(key_bytes, &mech_param, enc_part) {
+                    Ok(pt) => Ok(pt),
+                    Err(crate::error::HsmError::EncryptedDataInvalid) if enc_part.len() % 16 == 0 => {
+                        hsm.crypto_backend.aes_cbc_decrypt_unpadded(key_bytes, &mech_param, enc_part)
+                    }
+                    Err(e) => Err(e),
+                }
             }
             CKM_AES_CTR => {
                 hsm.crypto_backend
@@ -6842,6 +6872,28 @@ pub extern "C" fn C_DecryptDigestUpdate(
         out.copy_from_slice(&pt);
         unsafe {
             *pul_part_len = pt.len() as CK_ULONG;
+        }
+
+        if let Some(ActiveOperation::Decrypt { mechanism_param, .. }) = &mut sess.active_operation {
+            match mechanism {
+                CKM_AES_CBC | CKM_AES_CBC_PAD => {
+                    if enc_part.len() >= 16 {
+                        mechanism_param.clear();
+                        mechanism_param.extend_from_slice(&enc_part[enc_part.len() - 16..]);
+                    }
+                }
+                CKM_AES_CTR => {
+                    if mechanism_param.len() == 16 {
+                        let blocks = ((enc_part.len() + 15) / 16) as u128;
+                        let mut ctr_bytes = [0u8; 16];
+                        ctr_bytes.copy_from_slice(mechanism_param);
+                        let val = u128::from_be_bytes(ctr_bytes).wrapping_add(blocks);
+                        mechanism_param.clear();
+                        mechanism_param.extend_from_slice(&val.to_be_bytes());
+                    }
+                }
+                _ => {}
+            }
         }
 
         let digest_target = if sess.active_digest.is_some() {
@@ -7053,8 +7105,13 @@ pub extern "C" fn C_DecryptVerifyUpdate(
                     .aes_cbc_decrypt_unpadded(key_bytes, &mech_param, enc_part)
             }
             CKM_AES_CBC_PAD => {
-                hsm.crypto_backend
-                    .aes_cbc_decrypt(key_bytes, &mech_param, enc_part)
+                match hsm.crypto_backend.aes_cbc_decrypt(key_bytes, &mech_param, enc_part) {
+                    Ok(pt) => Ok(pt),
+                    Err(crate::error::HsmError::EncryptedDataInvalid) if enc_part.len() % 16 == 0 => {
+                        hsm.crypto_backend.aes_cbc_decrypt_unpadded(key_bytes, &mech_param, enc_part)
+                    }
+                    Err(e) => Err(e),
+                }
             }
             CKM_AES_CTR => {
                 hsm.crypto_backend
@@ -7088,6 +7145,28 @@ pub extern "C" fn C_DecryptVerifyUpdate(
         out.copy_from_slice(&pt);
         unsafe {
             *pul_part_len = pt.len() as CK_ULONG;
+        }
+
+        if let Some(ActiveOperation::Decrypt { mechanism_param, .. }) = &mut sess.active_operation {
+            match mechanism {
+                CKM_AES_CBC | CKM_AES_CBC_PAD => {
+                    if enc_part.len() >= 16 {
+                        mechanism_param.clear();
+                        mechanism_param.extend_from_slice(&enc_part[enc_part.len() - 16..]);
+                    }
+                }
+                CKM_AES_CTR => {
+                    if mechanism_param.len() == 16 {
+                        let blocks = ((enc_part.len() + 15) / 16) as u128;
+                        let mut ctr_bytes = [0u8; 16];
+                        ctr_bytes.copy_from_slice(mechanism_param);
+                        let val = u128::from_be_bytes(ctr_bytes).wrapping_add(blocks);
+                        mechanism_param.clear();
+                        mechanism_param.extend_from_slice(&val.to_be_bytes());
+                    }
+                }
+                _ => {}
+            }
         }
 
         let verify_target = if sess.active_sign_verify.is_some() {
@@ -7505,7 +7584,12 @@ pub extern "C" fn C_UnwrapKey(
                         Err(rv) => return rv,
                     }
                 }
-                CKA_WRAP_TEMPLATE | CKA_UNWRAP_TEMPLATE | CKA_WRAP_WITH_TRUSTED | CKA_TRUSTED => {
+                CKA_WRAP_TEMPLATE
+                | CKA_UNWRAP_TEMPLATE
+                | CKA_WRAP_WITH_TRUSTED
+                | CKA_TRUSTED
+                | CKA_SIGN_RECOVER
+                | CKA_VERIFY_RECOVER => {
                     obj.extra_attributes.insert(*attr_type, value.clone());
                 }
                 _ => {}
