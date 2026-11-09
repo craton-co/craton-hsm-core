@@ -24,8 +24,8 @@
 //!    maintain full boost clocks across mixed scalar and 512-bit vector execution.
 //!    Per-algorithm toggles allow granular activation based on empirical profiling.
 
-use parking_lot::RwLock;
 use crate::crypto::vector_scrub::ScrubOnDrop;
+use parking_lot::RwLock;
 
 /// Configuration toggles for per-algorithm AVX-512 vector acceleration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,8 +46,8 @@ impl Default for VectorConfig {
     /// Algorithms with measured speedups default to `true`.
     fn default() -> Self {
         Self {
-            aes_ctr_enabled: true, // 2.30x speedup (11.58 GB/s vs 5.03 GB/s)
-            aes_cbc_enabled: true, // 2.89x speedup (16.13 GB/s vs 5.57 GB/s)
+            aes_ctr_enabled: true,   // 2.30x speedup (11.58 GB/s vs 5.03 GB/s)
+            aes_cbc_enabled: true,   // 2.89x speedup (16.13 GB/s vs 5.57 GB/s)
             pqc_mlkem_enabled: true, // 6.49x speedup on Montgomery mul, 1.62x on poly add
             pqc_mldsa_enabled: true, // 1.78x speedup on poly add
         }
@@ -205,8 +205,8 @@ pub fn is_pqc_mldsa_vector_enabled() -> bool {
 
 #[cfg(target_arch = "x86_64")]
 mod x86_vaes {
-    use std::arch::x86_64::*;
     use super::ScrubOnDrop;
+    use std::arch::x86_64::*;
     use zeroize::Zeroize;
 
     /// AES round keys representation for VAES.
@@ -379,11 +379,7 @@ mod x86_vaes {
 
     /// 512-bit parallel AES-CTR crypt: 4 blocks (64 bytes) per iteration.
     #[target_feature(enable = "aes,avx512f,vaes")]
-    pub(super) unsafe fn crypt_aes_ctr_512(
-        key: &[u8],
-        iv: &[u8],
-        data: &[u8],
-    ) -> Option<Vec<u8>> {
+    pub(super) unsafe fn crypt_aes_ctr_512(key: &[u8], iv: &[u8], data: &[u8]) -> Option<Vec<u8>> {
         let _scrub = ScrubOnDrop;
         if iv.len() != 16 {
             return None;
@@ -530,10 +526,16 @@ mod x86_vaes {
             for r in 1..expanded.rounds {
                 state = _mm_aesdec_si128(state, _mm512_castsi512_si128(expanded.rkeys_dec[r]));
             }
-            state = _mm_aesdeclast_si128(state, _mm512_castsi512_si128(expanded.rkeys_dec[expanded.rounds]));
+            state = _mm_aesdeclast_si128(
+                state,
+                _mm512_castsi512_si128(expanded.rkeys_dec[expanded.rounds]),
+            );
 
             let pt_blk = _mm_xor_si128(state, prev_iv);
-            _mm_storeu_si128(output.as_mut_ptr().add(block_offset) as *mut __m128i, pt_blk);
+            _mm_storeu_si128(
+                output.as_mut_ptr().add(block_offset) as *mut __m128i,
+                pt_blk,
+            );
             prev_iv = ct_blk;
         }
 
@@ -563,7 +565,11 @@ pub fn avx512_aes_ctr_crypt(key: &[u8], iv: &[u8], data: &[u8]) -> Option<Vec<u8
 pub fn avx512_aes_cbc_decrypt(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Option<Vec<u8>> {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_aes_cbc_avx512_enabled() && iv.len() == 16 && ciphertext.len() >= 64 && ciphertext.len() % 16 == 0 {
+        if is_aes_cbc_avx512_enabled()
+            && iv.len() == 16
+            && ciphertext.len() >= 64
+            && ciphertext.len() % 16 == 0
+        {
             unsafe { x86_vaes::decrypt_aes_cbc_512(key, iv, ciphertext) }
         } else {
             None
@@ -590,7 +596,9 @@ pub mod pqc_mlkem {
         #[cfg(target_arch = "x86_64")]
         {
             if super::is_pqc_mlkem_vector_enabled() {
-                unsafe { poly_add_avx512(a, b); }
+                unsafe {
+                    poly_add_avx512(a, b);
+                }
                 return;
             }
         }
@@ -602,7 +610,9 @@ pub mod pqc_mlkem {
         #[cfg(target_arch = "x86_64")]
         {
             if super::is_pqc_mlkem_vector_enabled() {
-                unsafe { poly_sub_avx512(a, b); }
+                unsafe {
+                    poly_sub_avx512(a, b);
+                }
                 return;
             }
         }
@@ -672,7 +682,9 @@ pub mod pqc_mldsa {
         #[cfg(target_arch = "x86_64")]
         {
             if super::is_pqc_mldsa_vector_enabled() {
-                unsafe { poly_add_avx512(a, b); }
+                unsafe {
+                    poly_add_avx512(a, b);
+                }
                 return;
             }
         }
@@ -684,7 +696,9 @@ pub mod pqc_mldsa {
         #[cfg(target_arch = "x86_64")]
         {
             if super::is_pqc_mldsa_vector_enabled() {
-                unsafe { poly_sub_avx512(a, b); }
+                unsafe {
+                    poly_sub_avx512(a, b);
+                }
                 return;
             }
         }
@@ -772,7 +786,10 @@ mod tests {
             let mut expected = data.clone();
             cipher.apply_keystream(&mut expected);
 
-            assert_eq!(avx_out, expected, "AVX-512 AES-CTR output must match standard Ctr128BE");
+            assert_eq!(
+                avx_out, expected,
+                "AVX-512 AES-CTR output must match standard Ctr128BE"
+            );
         }
     }
 
@@ -785,10 +802,14 @@ mod tests {
         use cbc::cipher::{BlockEncryptMut, KeyIvInit};
         type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
         let enc = Aes256CbcEnc::new_from_slices(&key, &iv).unwrap();
-        let ciphertext = enc.encrypt_padded_vec_mut::<cbc::cipher::block_padding::NoPadding>(&plaintext);
+        let ciphertext =
+            enc.encrypt_padded_vec_mut::<cbc::cipher::block_padding::NoPadding>(&plaintext);
 
         if let Some(avx_pt) = avx512_aes_cbc_decrypt(&key, &iv, &ciphertext) {
-            assert_eq!(avx_pt, plaintext, "AVX-512 AES-CBC decrypt must recover original plaintext");
+            assert_eq!(
+                avx_pt, plaintext,
+                "AVX-512 AES-CBC decrypt must recover original plaintext"
+            );
         }
     }
 

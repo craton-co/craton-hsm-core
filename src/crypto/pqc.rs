@@ -806,7 +806,10 @@ mod tests {
         let mut a_vector = a;
         mlkem_poly_add(&mut a_vector, &b);
 
-        assert_eq!(a_scalar, a_vector, "mlkem_poly_add must match scalar reference");
+        assert_eq!(
+            a_scalar, a_vector,
+            "mlkem_poly_add must match scalar reference"
+        );
 
         let mut sub_scalar = a_scalar;
         crate::crypto::vector_accel::pqc_mlkem::poly_sub_scalar(&mut sub_scalar, &b);
@@ -814,8 +817,14 @@ mod tests {
         let mut sub_vector = a_vector;
         mlkem_poly_sub(&mut sub_vector, &b);
 
-        assert_eq!(sub_scalar, sub_vector, "mlkem_poly_sub must match scalar reference");
-        assert_eq!(sub_vector, a, "poly_add followed by poly_sub must recover original");
+        assert_eq!(
+            sub_scalar, sub_vector,
+            "mlkem_poly_sub must match scalar reference"
+        );
+        assert_eq!(
+            sub_vector, a,
+            "poly_add followed by poly_sub must recover original"
+        );
     }
 
     #[test]
@@ -833,7 +842,10 @@ mod tests {
         let mut a_vector = a;
         mldsa_poly_add(&mut a_vector, &b);
 
-        assert_eq!(a_scalar, a_vector, "mldsa_poly_add must match scalar reference");
+        assert_eq!(
+            a_scalar, a_vector,
+            "mldsa_poly_add must match scalar reference"
+        );
 
         let mut sub_scalar = a_scalar;
         crate::crypto::vector_accel::pqc_mldsa::poly_sub_scalar(&mut sub_scalar, &b);
@@ -841,7 +853,13 @@ mod tests {
         let mut sub_vector = a_vector;
         mldsa_poly_sub(&mut sub_vector, &b);
 
-        assert_eq!(sub_scalar, sub_vector, "mldsa_poly_sub must match scalar reference");
-        assert_eq!(sub_vector, a, "poly_add followed by poly_sub must recover original");
+        assert_eq!(
+            sub_scalar, sub_vector,
+            "mldsa_poly_sub must match scalar reference"
+        );
+        assert_eq!(
+            sub_vector, a,
+            "poly_add followed by poly_sub must recover original"
+        );
     }
 }

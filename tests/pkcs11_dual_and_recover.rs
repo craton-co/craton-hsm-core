@@ -955,7 +955,13 @@ fn test_rsa_sign_recover_disallowed_by_template_attribute() {
     assert_eq!(rv, CKR_OK);
     let mut sig = vec![0u8; 256];
     let mut sig_len: CK_ULONG = 256;
-    let _ = C_Sign(session, b"test".as_ptr() as *mut _, 4, sig.as_mut_ptr(), &mut sig_len);
+    let _ = C_Sign(
+        session,
+        b"test".as_ptr() as *mut _,
+        4,
+        sig.as_mut_ptr(),
+        &mut sig_len,
+    );
 
     let mut recover_mech = CK_MECHANISM {
         mechanism: CKM_RSA_PKCS,

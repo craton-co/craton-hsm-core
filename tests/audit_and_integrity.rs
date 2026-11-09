@@ -971,12 +971,16 @@ fn test_audit_group_commit_preserves_order_and_chain() {
 #[test]
 fn test_hsm_core_wires_derived_audit_chain_key() {
     let mut config = craton_hsm::config::HsmConfig::default();
-    config.token.storage_path = std::env::temp_dir().join(format!("craton_audit_key_test_{}", std::process::id()));
+    config.token.storage_path =
+        std::env::temp_dir().join(format!("craton_audit_key_test_{}", std::process::id()));
     let core = craton_hsm::core::HsmCore::try_new(&config).expect("core init");
 
     // Verify the audit chain key in AuditLog is non-zero (derived from state_hmac_key)
     let audit_key = core.audit_log().audit_chain_key();
-    assert_ne!(***audit_key, [0u8; 32], "Audit chain key must not be a zero placeholder in HsmCore");
+    assert_ne!(
+        ***audit_key, [0u8; 32],
+        "Audit chain key must not be a zero placeholder in HsmCore"
+    );
 
     // Verify derive_audit_chain_key produces a deterministic distinct key from state_hmac_key
     let dummy_state_key = [0x42u8; 32];
@@ -992,7 +996,8 @@ fn test_hsm_core_wires_derived_audit_chain_key() {
 #[test]
 fn test_hsm_core_audit_chain_with_derived_key_verifies() {
     let mut config = craton_hsm::config::HsmConfig::default();
-    let temp_dir = std::env::temp_dir().join(format!("craton_audit_chain_test_{}", std::process::id()));
+    let temp_dir =
+        std::env::temp_dir().join(format!("craton_audit_chain_test_{}", std::process::id()));
     std::fs::create_dir_all(&temp_dir).expect("create temp dir");
     config.token.storage_path = temp_dir.clone();
     let log_file = temp_dir.join("audit.log");
@@ -1040,7 +1045,8 @@ fn test_hsm_core_audit_chain_with_derived_key_verifies() {
 #[test]
 fn test_hsm_core_restart_preserves_audit_chain_and_key() {
     let mut config = craton_hsm::config::HsmConfig::default();
-    let temp_dir = std::env::temp_dir().join(format!("craton_audit_restart_test_{}", std::process::id()));
+    let temp_dir =
+        std::env::temp_dir().join(format!("craton_audit_restart_test_{}", std::process::id()));
     std::fs::create_dir_all(&temp_dir).expect("create temp dir");
     config.token.storage_path = temp_dir.clone();
     let log_file = temp_dir.join("audit.log");
@@ -1063,8 +1069,12 @@ fn test_hsm_core_restart_preserves_audit_chain_and_key() {
     // Second boot (restart): core must load saved state HMAC key, verify existing chain, and append event 2
     {
         let core2 = craton_hsm::core::HsmCore::try_new(&config).expect("core restart");
-        assert!(!core2.audit_log().is_tamper_detected(), "Restarted core must not trigger false tamper alarm");
-        core2.audit_log()
+        assert!(
+            !core2.audit_log().is_tamper_detected(),
+            "Restarted core must not trigger false tamper alarm"
+        );
+        core2
+            .audit_log()
             .record_sync(
                 1,
                 craton_hsm::audit::log::AuditOperation::GenerateRandom { length: 32 },
@@ -1072,7 +1082,8 @@ fn test_hsm_core_restart_preserves_audit_chain_and_key() {
                 None,
             )
             .expect("record 2");
-        let all_entries = craton_hsm::audit::log::load_entries_from_file(&log_file).expect("load entries");
+        let all_entries =
+            craton_hsm::audit::log::load_entries_from_file(&log_file).expect("load entries");
         assert_eq!(
             craton_hsm::audit::log::verify_chain_entries_with_key(
                 &all_entries,

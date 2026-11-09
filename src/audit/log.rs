@@ -878,8 +878,12 @@ impl AuditWorker {
             previous_hash,
         };
 
-        let new_head =
-            compute_chain_hash_with(&previous_hash, &event, &self.audit_chain_key, &mut self.hash_buf)?;
+        let new_head = compute_chain_hash_with(
+            &previous_hash,
+            &event,
+            &self.audit_chain_key,
+            &mut self.hash_buf,
+        )?;
 
         // Serialize into the reusable buffer. A serialization failure must not
         // leave a partial line behind, so truncate back to the mark.
@@ -2098,7 +2102,8 @@ mod codec_tests {
 
         let mut scratch = Vec::new();
         let _ = compute_chain_hash_with(&prev, &long, &key, &mut scratch).expect("long hashes");
-        let reused = compute_chain_hash_with(&prev, &short, &key, &mut scratch).expect("short hashes");
+        let reused =
+            compute_chain_hash_with(&prev, &short, &key, &mut scratch).expect("short hashes");
         let fresh = compute_chain_hash(&prev, &short, &key).expect("short hashes standalone");
 
         assert_eq!(

@@ -24,6 +24,8 @@ service HsmService {
   rpc WrapKey(WrapKeyRequest) returns (WrapKeyResponse);
   rpc UnwrapKey(UnwrapKeyRequest) returns (UnwrapKeyResponse);
   rpc DeriveKey(DeriveKeyRequest) returns (DeriveKeyResponse);
+  rpc EncapsulateKey(EncapsulateKeyRequest) returns (EncapsulateKeyResponse);
+  rpc DecapsulateKey(DecapsulateKeyRequest) returns (DecapsulateKeyResponse);
   rpc CopyObject(CopyObjectRequest) returns (CopyObjectResponse);
 
   // PIN management
@@ -212,6 +214,30 @@ message EcdhDeriveParams {
 }
 
 message DeriveKeyResponse {
+  uint64 key_handle = 1;
+}
+
+message EncapsulateKeyRequest {
+  uint64 session_handle = 1;
+  Mechanism mechanism = 2;
+  uint64 public_key_handle = 3;
+  repeated Attribute template = 4;
+}
+
+message EncapsulateKeyResponse {
+  bytes ciphertext = 1;
+  uint64 key_handle = 2;
+}
+
+message DecapsulateKeyRequest {
+  uint64 session_handle = 1;
+  Mechanism mechanism = 2;
+  uint64 private_key_handle = 3;
+  bytes ciphertext = 4;
+  repeated Attribute template = 5;
+}
+
+message DecapsulateKeyResponse {
   uint64 key_handle = 1;
 }
 

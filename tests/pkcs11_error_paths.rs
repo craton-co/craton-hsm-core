@@ -1382,7 +1382,10 @@ fn test_ecdsa_signature_length_query_exact_raw_size() {
     );
     assert_eq!(rv, CKR_OK);
     // Must return exact raw r || s size (64 bytes for P-256), not oversized DER estimate (72)
-    assert_eq!(query_len, 64, "P-256 ECDSA length query must return exact raw size (64 bytes)");
+    assert_eq!(
+        query_len, 64,
+        "P-256 ECDSA length query must return exact raw size (64 bytes)"
+    );
 
     let _ = C_DestroyObject(session, pub_key);
     let _ = C_DestroyObject(session, priv_key);
@@ -1400,14 +1403,74 @@ fn test_unsupported_function_stubs_return_ckr_function_not_supported() {
     let mut buf = [0u8; 32];
     let mut out_len = buf.len() as CK_ULONG;
 
-    assert_eq!(C_SignRecoverInit(session, &mut mech, 1), CKR_FUNCTION_NOT_SUPPORTED);
-    assert_eq!(C_SignRecover(session, buf.as_mut_ptr(), 32, buf.as_mut_ptr(), &mut out_len), CKR_FUNCTION_NOT_SUPPORTED);
-    assert_eq!(C_VerifyRecoverInit(session, &mut mech, 1), CKR_FUNCTION_NOT_SUPPORTED);
-    assert_eq!(C_VerifyRecover(session, buf.as_mut_ptr(), 32, buf.as_mut_ptr(), &mut out_len), CKR_FUNCTION_NOT_SUPPORTED);
-    assert_eq!(C_DigestEncryptUpdate(session, buf.as_mut_ptr(), 32, buf.as_mut_ptr(), &mut out_len), CKR_FUNCTION_NOT_SUPPORTED);
-    assert_eq!(C_DecryptDigestUpdate(session, buf.as_mut_ptr(), 32, buf.as_mut_ptr(), &mut out_len), CKR_FUNCTION_NOT_SUPPORTED);
-    assert_eq!(C_SignEncryptUpdate(session, buf.as_mut_ptr(), 32, buf.as_mut_ptr(), &mut out_len), CKR_FUNCTION_NOT_SUPPORTED);
-    assert_eq!(C_DecryptVerifyUpdate(session, buf.as_mut_ptr(), 32, buf.as_mut_ptr(), &mut out_len), CKR_FUNCTION_NOT_SUPPORTED);
+    assert_eq!(
+        C_SignRecoverInit(session, &mut mech, 1),
+        CKR_FUNCTION_NOT_SUPPORTED
+    );
+    assert_eq!(
+        C_SignRecover(
+            session,
+            buf.as_mut_ptr(),
+            32,
+            buf.as_mut_ptr(),
+            &mut out_len
+        ),
+        CKR_FUNCTION_NOT_SUPPORTED
+    );
+    assert_eq!(
+        C_VerifyRecoverInit(session, &mut mech, 1),
+        CKR_FUNCTION_NOT_SUPPORTED
+    );
+    assert_eq!(
+        C_VerifyRecover(
+            session,
+            buf.as_mut_ptr(),
+            32,
+            buf.as_mut_ptr(),
+            &mut out_len
+        ),
+        CKR_FUNCTION_NOT_SUPPORTED
+    );
+    assert_eq!(
+        C_DigestEncryptUpdate(
+            session,
+            buf.as_mut_ptr(),
+            32,
+            buf.as_mut_ptr(),
+            &mut out_len
+        ),
+        CKR_FUNCTION_NOT_SUPPORTED
+    );
+    assert_eq!(
+        C_DecryptDigestUpdate(
+            session,
+            buf.as_mut_ptr(),
+            32,
+            buf.as_mut_ptr(),
+            &mut out_len
+        ),
+        CKR_FUNCTION_NOT_SUPPORTED
+    );
+    assert_eq!(
+        C_SignEncryptUpdate(
+            session,
+            buf.as_mut_ptr(),
+            32,
+            buf.as_mut_ptr(),
+            &mut out_len
+        ),
+        CKR_FUNCTION_NOT_SUPPORTED
+    );
+    assert_eq!(
+        C_DecryptVerifyUpdate(
+            session,
+            buf.as_mut_ptr(),
+            32,
+            buf.as_mut_ptr(),
+            &mut out_len
+        ),
+        CKR_FUNCTION_NOT_SUPPORTED
+    );
 
     let _ = C_CloseSession(session);
 }

@@ -709,7 +709,9 @@ pub fn aes_cbc_decrypt(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> HsmResult<Ve
 
     let result: HsmResult<Vec<u8>> = if iv.len() != 16 {
         Err(HsmError::MechanismParamInvalid)
-    } else if let Some(mut avx_out) = crate::crypto::vector_accel::avx512_aes_cbc_decrypt(key, iv, ciphertext) {
+    } else if let Some(mut avx_out) =
+        crate::crypto::vector_accel::avx512_aes_cbc_decrypt(key, iv, ciphertext)
+    {
         // Constant-time PKCS#7 unpadding to avoid padding oracle leakage
         if pkcs7_unpad_ct(&mut avx_out) {
             Ok(avx_out)
@@ -871,7 +873,8 @@ pub fn aes_cbc_decrypt_unpadded(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Hsm
         return Err(HsmError::EncryptedDataLenRange);
     }
 
-    if let Some(avx_out) = crate::crypto::vector_accel::avx512_aes_cbc_decrypt(key, iv, ciphertext) {
+    if let Some(avx_out) = crate::crypto::vector_accel::avx512_aes_cbc_decrypt(key, iv, ciphertext)
+    {
         return Ok(avx_out);
     }
     use cbc::cipher::{BlockDecryptMut, KeyIvInit};
