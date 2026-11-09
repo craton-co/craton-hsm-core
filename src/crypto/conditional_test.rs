@@ -680,17 +680,23 @@ pub fn mechanism_to_families(
         CKM_SHA512_RSA_PKCS_PSS => vec![AlgorithmFamily::Sha512, AlgorithmFamily::RsaPss],
         CKM_ECDSA_SHA256 => {
             let mut f = vec![AlgorithmFamily::Sha256];
-            if let Some(ef) = ecdsa_family { f.push(ef); }
+            if let Some(ef) = ecdsa_family {
+                f.push(ef);
+            }
             f
         }
         CKM_ECDSA_SHA384 => {
             let mut f = vec![AlgorithmFamily::Sha384];
-            if let Some(ef) = ecdsa_family { f.push(ef); }
+            if let Some(ef) = ecdsa_family {
+                f.push(ef);
+            }
             f
         }
         CKM_ECDSA_SHA512 => {
             let mut f = vec![AlgorithmFamily::Sha512];
-            if let Some(ef) = ecdsa_family { f.push(ef); }
+            if let Some(ef) = ecdsa_family {
+                f.push(ef);
+            }
             f
         }
         CKM_SHA_1 => vec![AlgorithmFamily::Sha1],
@@ -863,13 +869,22 @@ mod tests {
 
         // Full families check: returns both digest and ECDSA
         let f256 = mechanism_to_families(CKM_ECDSA_SHA256, None);
-        assert_eq!(f256, vec![AlgorithmFamily::Sha256, AlgorithmFamily::EcdsaP256]);
+        assert_eq!(
+            f256,
+            vec![AlgorithmFamily::Sha256, AlgorithmFamily::EcdsaP256]
+        );
 
         let f384 = mechanism_to_families(CKM_ECDSA_SHA384, Some(p384_oid));
-        assert_eq!(f384, vec![AlgorithmFamily::Sha384, AlgorithmFamily::EcdsaP384]);
+        assert_eq!(
+            f384,
+            vec![AlgorithmFamily::Sha384, AlgorithmFamily::EcdsaP384]
+        );
 
         let f521 = mechanism_to_families(CKM_ECDSA_SHA512, Some(p521_oid));
-        assert_eq!(f521, vec![AlgorithmFamily::Sha512, AlgorithmFamily::EcdsaP521]);
+        assert_eq!(
+            f521,
+            vec![AlgorithmFamily::Sha512, AlgorithmFamily::EcdsaP521]
+        );
     }
 
     #[cfg(feature = "rustcrypto-backend")]

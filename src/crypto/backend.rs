@@ -78,11 +78,7 @@ pub trait CryptoBackend: Send + Sync {
         self.rsa_pkcs1v15_verify(modulus, public_exponent, data, signature, hash_alg)
     }
 
-    fn rsa_pkcs1v15_sign_recover(
-        &self,
-        private_key_der: &[u8],
-        data: &[u8],
-    ) -> HsmResult<Vec<u8>> {
+    fn rsa_pkcs1v15_sign_recover(&self, private_key_der: &[u8], data: &[u8]) -> HsmResult<Vec<u8>> {
         super::sign::rsa_pkcs1v15_sign_recover(private_key_der, data)
     }
 

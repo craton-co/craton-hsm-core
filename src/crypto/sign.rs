@@ -436,10 +436,7 @@ pub fn rsa_pkcs1v15_verify(
 /// Pads raw data using PKCS#1 v1.5 block format 01:
 /// `0x00 || 0x01 || PS (>= 8 bytes of 0xFF) || 0x00 || Data`
 /// and computes `s = m^d mod n`.
-pub fn rsa_pkcs1v15_sign_recover(
-    private_key_der: &[u8],
-    data: &[u8],
-) -> HsmResult<Vec<u8>> {
+pub fn rsa_pkcs1v15_sign_recover(private_key_der: &[u8], data: &[u8]) -> HsmResult<Vec<u8>> {
     require_rustcrypto_rsa_private_ops()?;
     use rsa::traits::{PrivateKeyParts, PublicKeyParts};
 
@@ -2041,7 +2038,8 @@ mod tests {
         let sig = rsa_pkcs1v15_sign_recover(&priv_der, msg).expect("sign recover");
         assert_eq!(sig.len(), modulus.len());
 
-        let recovered = rsa_pkcs1v15_verify_recover(&modulus, &pub_exp, &sig).expect("verify recover");
+        let recovered =
+            rsa_pkcs1v15_verify_recover(&modulus, &pub_exp, &sig).expect("verify recover");
         assert_eq!(recovered, msg);
 
         // Corrupted signature fails

@@ -531,7 +531,10 @@ fn test_ecdh_p521_derive_generic_secret_66_bytes() {
         derive_template.len() as CK_ULONG,
         &mut derived_key,
     );
-    assert_eq!(rv, CKR_OK, "Deriving 66-byte CKK_GENERIC_SECRET from P-521 must succeed");
+    assert_eq!(
+        rv, CKR_OK,
+        "Deriving 66-byte CKK_GENERIC_SECRET from P-521 must succeed"
+    );
     assert_ne!(derived_key, 0);
 }
 

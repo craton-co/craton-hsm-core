@@ -632,13 +632,11 @@ fn ecdsa_p521_keygen_with_pairwise_test() {
         },
     ];
 
-    let mut priv_template = [
-        CK_ATTRIBUTE {
-            attr_type: CKA_SIGN,
-            p_value: &true_val as *const _ as *mut _,
-            value_len: 1,
-        },
-    ];
+    let mut priv_template = [CK_ATTRIBUTE {
+        attr_type: CKA_SIGN,
+        p_value: &true_val as *const _ as *mut _,
+        value_len: 1,
+    }];
 
     let mut mechanism = CK_MECHANISM {
         mechanism: CKM_EC_KEY_PAIR_GEN,

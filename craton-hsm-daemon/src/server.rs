@@ -499,6 +499,50 @@ const FORBIDDEN_TEMPLATE_ATTRS: &[u64] = &[
     CKA_TRUSTED as u64,
 ];
 
+fn store_derived_key(
+    hsm: &HsmCore,
+    slot_id: CK_ULONG,
+    derived_tpl: &craton_hsm::crypto::derive::DerivedKeyTemplate,
+    derived_material: craton_hsm::store::key_material::RawKeyMaterial,
+    template: &[(craton_hsm::pkcs11_abi::types::CK_ATTRIBUTE_TYPE, Vec<u8>)],
+) -> Result<u64, Status> {
+    derived_tpl
+        .check_len(derived_material.as_bytes().len())
+        .map_err(hsm_err_to_status)?;
+
+    let handle = hsm
+        .object_store()
+        .next_handle()
+        .map_err(hsm_err_to_status)?;
+
+    let derived_len_actual = derived_material.as_bytes().len();
+    let mut obj = craton_hsm::store::object::StoredObject::new(handle, CKO_SECRET_KEY);
+    obj.slot_id = slot_id;
+    obj.key_type = Some(derived_tpl.key_type);
+    obj.value_len = Some(derived_len_actual as CK_ULONG);
+    obj.key_material = Some(derived_material);
+    obj.sensitive = derived_tpl.sensitive;
+    obj.extractable = derived_tpl.extractable;
+
+    for (attr_type, value) in template {
+        if matches!(
+            *attr_type,
+            CKA_VALUE_LEN | CKA_KEY_TYPE | CKA_SENSITIVE | CKA_EXTRACTABLE
+        ) {
+            continue;
+        }
+        craton_hsm::store::attributes::apply_attribute(&mut obj, *attr_type, value)
+            .map_err(hsm_err_to_status)?;
+    }
+
+    let new_handle = hsm
+        .object_store()
+        .insert_object(obj)
+        .map_err(hsm_err_to_status)?;
+
+    Ok(new_handle as u64)
+}
+
 #[tonic::async_trait]
 impl HsmService for HsmServiceImpl {
     async fn open_session(
@@ -1114,6 +1158,140 @@ impl HsmService for HsmServiceImpl {
                     priv_obj.extractable = false;
                     priv_obj.private = true;
                 }
+                m if craton_hsm::crypto::pqc::is_ml_dsa_mechanism(m)
+                    || m == CKM_ML_DSA_KEY_PAIR_GEN =>
+                {
+                    let variant = if m == CKM_ML_DSA_KEY_PAIR_GEN {
+                        let param_set = pub_template
+                            .iter()
+                            .find(|(t, _)| *t == CKA_PARAMETER_SET)
+                            .or_else(|| priv_template.iter().find(|(t, _)| *t == CKA_PARAMETER_SET))
+                            .and_then(|(_, v)| craton_hsm::store::attributes::read_ck_ulong(v))
+                            .ok_or_else(|| {
+                                Status::invalid_argument(
+                                    "CKA_PARAMETER_SET required for CKM_ML_DSA_KEY_PAIR_GEN",
+                                )
+                            })?;
+                        craton_hsm::crypto::pqc::mechanism_for_parameter_set(m, param_set)
+                            .and_then(craton_hsm::crypto::pqc::mechanism_to_ml_dsa_variant)
+                            .ok_or_else(|| {
+                                Status::invalid_argument("Invalid CKA_PARAMETER_SET for ML-DSA")
+                            })?
+                    } else {
+                        craton_hsm::crypto::pqc::mechanism_to_ml_dsa_variant(m)
+                            .ok_or_else(|| Status::invalid_argument("Invalid ML-DSA mechanism"))?
+                    };
+
+                    let (sk_seed, vk_bytes) = self
+                        .hsm
+                        .crypto_backend()
+                        .ml_dsa_keygen(variant)
+                        .map_err(hsm_err_to_status)?;
+
+                    let variant_name = match variant {
+                        craton_hsm::crypto::pqc::MlDsaVariant::MlDsa44 => "ML-DSA-44",
+                        craton_hsm::crypto::pqc::MlDsaVariant::MlDsa65 => "ML-DSA-65",
+                        craton_hsm::crypto::pqc::MlDsaVariant::MlDsa87 => "ML-DSA-87",
+                    };
+                    craton_hsm::crypto::pairwise_test::ml_dsa_pairwise_test(
+                        self.hsm.crypto_backend().as_ref(),
+                        &sk_seed,
+                        &vk_bytes,
+                        variant_name,
+                    )
+                    .map_err(hsm_err_to_status)?;
+
+                    key_length = match variant {
+                        craton_hsm::crypto::pqc::MlDsaVariant::MlDsa44 => 44,
+                        craton_hsm::crypto::pqc::MlDsaVariant::MlDsa65 => 65,
+                        craton_hsm::crypto::pqc::MlDsaVariant::MlDsa87 => 87,
+                    };
+
+                    pub_obj =
+                        craton_hsm::store::object::StoredObject::new(pub_handle, CKO_PUBLIC_KEY);
+                    pub_obj.slot_id = slot_id;
+                    pub_obj.key_type = Some(CKK_ML_DSA);
+                    pub_obj.public_key_data = Some(vk_bytes.clone());
+                    pub_obj.can_verify = true;
+
+                    priv_obj =
+                        craton_hsm::store::object::StoredObject::new(priv_handle, CKO_PRIVATE_KEY);
+                    priv_obj.slot_id = slot_id;
+                    priv_obj.key_type = Some(CKK_ML_DSA);
+                    priv_obj.key_material = Some(sk_seed);
+                    priv_obj.public_key_data = Some(vk_bytes);
+                    priv_obj.can_sign = true;
+                    priv_obj.sensitive = true;
+                    priv_obj.extractable = false;
+                    priv_obj.private = true;
+                }
+                m if craton_hsm::crypto::pqc::is_ml_kem_mechanism(m)
+                    || m == CKM_ML_KEM_KEY_PAIR_GEN =>
+                {
+                    let variant = if m == CKM_ML_KEM_KEY_PAIR_GEN {
+                        let param_set = pub_template
+                            .iter()
+                            .find(|(t, _)| *t == CKA_PARAMETER_SET)
+                            .or_else(|| priv_template.iter().find(|(t, _)| *t == CKA_PARAMETER_SET))
+                            .and_then(|(_, v)| craton_hsm::store::attributes::read_ck_ulong(v))
+                            .ok_or_else(|| {
+                                Status::invalid_argument(
+                                    "CKA_PARAMETER_SET required for CKM_ML_KEM_KEY_PAIR_GEN",
+                                )
+                            })?;
+                        craton_hsm::crypto::pqc::mechanism_for_parameter_set(m, param_set)
+                            .and_then(craton_hsm::crypto::pqc::mechanism_to_ml_kem_variant)
+                            .ok_or_else(|| {
+                                Status::invalid_argument("Invalid CKA_PARAMETER_SET for ML-KEM")
+                            })?
+                    } else {
+                        craton_hsm::crypto::pqc::mechanism_to_ml_kem_variant(m)
+                            .ok_or_else(|| Status::invalid_argument("Invalid ML-KEM mechanism"))?
+                    };
+
+                    let (dk_seed, ek_bytes) = self
+                        .hsm
+                        .crypto_backend()
+                        .ml_kem_keygen(variant)
+                        .map_err(hsm_err_to_status)?;
+
+                    let variant_name = match variant {
+                        craton_hsm::crypto::pqc::MlKemVariant::MlKem512 => "ML-KEM-512",
+                        craton_hsm::crypto::pqc::MlKemVariant::MlKem768 => "ML-KEM-768",
+                        craton_hsm::crypto::pqc::MlKemVariant::MlKem1024 => "ML-KEM-1024",
+                    };
+                    craton_hsm::crypto::pairwise_test::ml_kem_pairwise_test(
+                        self.hsm.crypto_backend().as_ref(),
+                        &dk_seed,
+                        &ek_bytes,
+                        variant_name,
+                    )
+                    .map_err(hsm_err_to_status)?;
+
+                    key_length = match variant {
+                        craton_hsm::crypto::pqc::MlKemVariant::MlKem512 => 512,
+                        craton_hsm::crypto::pqc::MlKemVariant::MlKem768 => 768,
+                        craton_hsm::crypto::pqc::MlKemVariant::MlKem1024 => 1024,
+                    };
+
+                    pub_obj =
+                        craton_hsm::store::object::StoredObject::new(pub_handle, CKO_PUBLIC_KEY);
+                    pub_obj.slot_id = slot_id;
+                    pub_obj.key_type = Some(CKK_ML_KEM);
+                    pub_obj.public_key_data = Some(ek_bytes.clone());
+                    pub_obj.can_derive = true;
+
+                    priv_obj =
+                        craton_hsm::store::object::StoredObject::new(priv_handle, CKO_PRIVATE_KEY);
+                    priv_obj.slot_id = slot_id;
+                    priv_obj.key_type = Some(CKK_ML_KEM);
+                    priv_obj.key_material = Some(dk_seed);
+                    priv_obj.public_key_data = Some(ek_bytes);
+                    priv_obj.can_derive = true;
+                    priv_obj.sensitive = true;
+                    priv_obj.extractable = false;
+                    priv_obj.private = true;
+                }
                 _ => {
                     return Err(Status::invalid_argument(
                         "Unsupported key pair generation mechanism",
@@ -1123,7 +1301,10 @@ impl HsmService for HsmServiceImpl {
 
             // Apply template attributes to public key
             for (attr_type, value) in &pub_template {
-                if *attr_type == CKA_MODULUS_BITS || *attr_type == CKA_EC_PARAMS {
+                if *attr_type == CKA_MODULUS_BITS
+                    || *attr_type == CKA_EC_PARAMS
+                    || *attr_type == CKA_PARAMETER_SET
+                {
                     continue; // already handled
                 }
                 craton_hsm::store::attributes::apply_attribute(&mut pub_obj, *attr_type, value)
@@ -1132,6 +1313,9 @@ impl HsmService for HsmServiceImpl {
 
             // Apply template attributes to private key
             for (attr_type, value) in &priv_template {
+                if *attr_type == CKA_PARAMETER_SET {
+                    continue; // already handled
+                }
                 craton_hsm::store::attributes::apply_attribute(&mut priv_obj, *attr_type, value)
                     .map_err(hsm_err_to_status)?;
             }
@@ -1419,6 +1603,30 @@ impl HsmService for HsmServiceImpl {
                     craton_hsm::crypto::sign::ed25519_sign(key_bytes, &req.data)
                         .map_err(hsm_err_to_status)?
                 }
+                Some(CKK_ML_DSA) => {
+                    let variant = if let Some(v) =
+                        craton_hsm::crypto::pqc::mechanism_to_ml_dsa_variant(mech_type)
+                    {
+                        v
+                    } else if mech_type == CKM_ML_DSA {
+                        key.parameter_set()
+                            .and_then(|ps| {
+                                craton_hsm::crypto::pqc::mechanism_for_parameter_set(mech_type, ps)
+                            })
+                            .and_then(craton_hsm::crypto::pqc::mechanism_to_ml_dsa_variant)
+                            .ok_or_else(|| {
+                                Status::invalid_argument("Cannot determine ML-DSA variant from key")
+                            })?
+                    } else {
+                        return Err(Status::invalid_argument(
+                            "Mechanism incompatible with ML-DSA key",
+                        ));
+                    };
+                    self.hsm
+                        .crypto_backend()
+                        .ml_dsa_sign(key_bytes, &req.data, variant)
+                        .map_err(hsm_err_to_status)?
+                }
                 _ => {
                     return Err(Status::invalid_argument(
                         "Key type does not support signing",
@@ -1552,6 +1760,35 @@ impl HsmService for HsmServiceImpl {
                         .as_ref()
                         .ok_or_else(|| Status::internal("Ed25519 key missing public key"))?;
                     craton_hsm::crypto::sign::ed25519_verify(pub_key, &req.data, &req.signature)
+                        .map_err(hsm_err_to_status)?
+                }
+                Some(CKK_ML_DSA) => {
+                    let variant = if let Some(v) =
+                        craton_hsm::crypto::pqc::mechanism_to_ml_dsa_variant(mech_type)
+                    {
+                        v
+                    } else if mech_type == CKM_ML_DSA {
+                        key.parameter_set()
+                            .and_then(|ps| {
+                                craton_hsm::crypto::pqc::mechanism_for_parameter_set(mech_type, ps)
+                            })
+                            .and_then(craton_hsm::crypto::pqc::mechanism_to_ml_dsa_variant)
+                            .ok_or_else(|| {
+                                Status::invalid_argument("Cannot determine ML-DSA variant from key")
+                            })?
+                    } else {
+                        return Err(Status::invalid_argument(
+                            "Mechanism incompatible with ML-DSA key",
+                        ));
+                    };
+                    let pub_key_bytes = key
+                        .public_key_data
+                        .as_deref()
+                        .or_else(|| key.key_material.as_ref().map(|k| k.as_bytes()))
+                        .ok_or_else(|| Status::internal("ML-DSA key missing public key data"))?;
+                    self.hsm
+                        .crypto_backend()
+                        .ml_dsa_verify(pub_key_bytes, &req.data, &req.signature, variant)
                         .map_err(hsm_err_to_status)?
                 }
                 _ => {
@@ -2156,7 +2393,10 @@ impl HsmService for HsmServiceImpl {
                 .ok_or_else(|| Status::invalid_argument("mechanism required"))?;
             let mech_type = to_ck_ulong(mech.mechanism_type, "mechanism_type")?;
 
-            if !craton_hsm::crypto::mechanisms::is_derive_mechanism(mech_type) {
+            let is_kem = craton_hsm::crypto::mechanisms::is_kem_mechanism(mech_type)
+                || mech_type == CKM_ML_KEM_KEY_PAIR_GEN;
+
+            if !craton_hsm::crypto::mechanisms::is_derive_mechanism(mech_type) && !is_kem {
                 return Err(Status::invalid_argument("Unsupported derivation mechanism"));
             }
 
@@ -2204,114 +2444,129 @@ impl HsmService for HsmServiceImpl {
             .map_err(hsm_err_to_status)?;
             let is_aes = derived_tpl.key_type == CKK_AES;
 
-            let ec_params = base_key.ec_params.as_deref().unwrap_or(&[]);
-            let is_p384 = is_p384_ec_params(ec_params);
-            if !is_p384 && !is_p256_ec_params(ec_params) {
-                return Err(Status::invalid_argument(
-                    "Unsupported EC parameters — only P-256 and P-384 are supported",
-                ));
-            }
-            if !matches!(mech_type, CKM_ECDH1_DERIVE | CKM_ECDH1_COFACTOR_DERIVE) {
-                return Err(Status::invalid_argument("Unsupported derivation mechanism"));
-            }
-
-            let derived_material = if let Some(params) = &req.ecdh_params {
-                // Standard CK_ECDH1_DERIVE_PARAMS: raw shared secret from the
-                // configured backend, then the requested PKCS#11 KDF.
-                let kdf = to_ck_ulong(params.kdf, "ecdh_params.kdf")?;
-                let peer = craton_hsm::store::ec_point::decode(&params.public_data);
-                if peer.is_empty() {
+            let derived_material = if is_kem {
+                if base_key.key_type != Some(CKK_ML_KEM) {
                     return Err(Status::invalid_argument(
-                        "ecdh_params.public_data must contain the peer public key",
+                        "Key type does not match KEM mechanism",
+                    ));
+                }
+                let variant = craton_hsm::crypto::pqc::mechanism_to_ml_kem_variant(mech_type)
+                    .or_else(|| {
+                        base_key
+                            .parameter_set()
+                            .and_then(|ps| {
+                                craton_hsm::crypto::pqc::mechanism_for_parameter_set(
+                                    CKM_ML_KEM_KEY_PAIR_GEN,
+                                    ps,
+                                )
+                            })
+                            .and_then(craton_hsm::crypto::pqc::mechanism_to_ml_kem_variant)
+                    })
+                    .ok_or_else(|| {
+                        Status::invalid_argument("Unsupported or invalid ML-KEM mechanism")
+                    })?;
+
+                if mech.parameter.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "Mechanism parameter must contain the ML-KEM ciphertext",
                     ));
                 }
                 let backend = self.hsm.crypto_backend();
-                let z = if is_p384 {
-                    backend.ecdh_p384_shared_secret(base_material, peer)
-                } else {
-                    backend.ecdh_p256_shared_secret(base_material, peer)
-                }
-                .map_err(|e| match e {
-                    craton_hsm::error::HsmError::ArgumentsBad => {
-                        Status::invalid_argument("Invalid peer public key")
-                    }
-                    e => hsm_err_to_status(e),
-                })?;
-                // AES defaults to 256 bits; a generic secret defaults to the
-                // full shared secret.
-                let key_len = derived_tpl
-                    .value_len
-                    .unwrap_or(if is_aes { 32 } else { z.len() });
-                craton_hsm::crypto::derive::apply_ec_kdf(
-                    backend.as_ref(),
-                    kdf,
-                    &z,
-                    &params.shared_data,
-                    key_len,
-                    self.hsm.algorithm_config().fips_approved_only,
-                )
-                .map_err(hsm_err_to_status)?
-            } else {
-                // Legacy form: the mechanism parameter is the peer public key.
-                let peer = craton_hsm::store::ec_point::decode(&mech.parameter);
-                if peer.is_empty() {
+                let shared_secret = backend
+                    .ml_kem_decapsulate(base_material, &mech.parameter, variant)
+                    .map_err(hsm_err_to_status)?;
+                let key_len =
+                    derived_tpl
+                        .value_len
+                        .unwrap_or(if is_aes { 32 } else { shared_secret.len() });
+                if shared_secret.len() < key_len {
                     return Err(Status::invalid_argument(
-                        "Mechanism parameter must contain the peer public key",
+                        "Derived key length exceeds shared secret length",
                     ));
                 }
-                let okm_len = if is_aes {
-                    Some(derived_tpl.value_len.unwrap_or(32))
-                } else {
-                    derived_tpl.value_len
-                };
-                if is_p384 {
-                    craton_hsm::crypto::derive::ecdh_p384(base_material, peer, okm_len)
-                } else {
-                    craton_hsm::crypto::derive::ecdh_p256(base_material, peer, okm_len)
+                craton_hsm::store::key_material::RawKeyMaterial::new(
+                    shared_secret[..key_len].to_vec(),
+                )
+            } else {
+                let ec_params = base_key.ec_params.as_deref().unwrap_or(&[]);
+                let is_p384 = is_p384_ec_params(ec_params);
+                if !is_p384 && !is_p256_ec_params(ec_params) {
+                    return Err(Status::invalid_argument(
+                        "Unsupported EC parameters — only P-256 and P-384 are supported",
+                    ));
                 }
-                .map_err(hsm_err_to_status)?
+                if !matches!(mech_type, CKM_ECDH1_DERIVE | CKM_ECDH1_COFACTOR_DERIVE) {
+                    return Err(Status::invalid_argument("Unsupported derivation mechanism"));
+                }
+
+                if let Some(params) = &req.ecdh_params {
+                    // Standard CK_ECDH1_DERIVE_PARAMS: raw shared secret from the
+                    // configured backend, then the requested PKCS#11 KDF.
+                    let kdf = to_ck_ulong(params.kdf, "ecdh_params.kdf")?;
+                    let peer = craton_hsm::store::ec_point::decode(&params.public_data);
+                    if peer.is_empty() {
+                        return Err(Status::invalid_argument(
+                            "ecdh_params.public_data must contain the peer public key",
+                        ));
+                    }
+                    let backend = self.hsm.crypto_backend();
+                    let z = if is_p384 {
+                        backend.ecdh_p384_shared_secret(base_material, peer)
+                    } else {
+                        backend.ecdh_p256_shared_secret(base_material, peer)
+                    }
+                    .map_err(|e| match e {
+                        craton_hsm::error::HsmError::ArgumentsBad => {
+                            Status::invalid_argument("Invalid peer public key")
+                        }
+                        e => hsm_err_to_status(e),
+                    })?;
+                    // AES defaults to 256 bits; a generic secret defaults to the
+                    // full shared secret.
+                    let key_len =
+                        derived_tpl
+                            .value_len
+                            .unwrap_or(if is_aes { 32 } else { z.len() });
+                    craton_hsm::crypto::derive::apply_ec_kdf(
+                        backend.as_ref(),
+                        kdf,
+                        &z,
+                        &params.shared_data,
+                        key_len,
+                        self.hsm.algorithm_config().fips_approved_only,
+                    )
+                    .map_err(hsm_err_to_status)?
+                } else {
+                    // Legacy form: the mechanism parameter is the peer public key.
+                    let peer = craton_hsm::store::ec_point::decode(&mech.parameter);
+                    if peer.is_empty() {
+                        return Err(Status::invalid_argument(
+                            "Mechanism parameter must contain the peer public key",
+                        ));
+                    }
+                    let okm_len = if is_aes {
+                        Some(derived_tpl.value_len.unwrap_or(32))
+                    } else {
+                        derived_tpl.value_len
+                    };
+                    if is_p384 {
+                        craton_hsm::crypto::derive::ecdh_p384(base_material, peer, okm_len)
+                    } else {
+                        craton_hsm::crypto::derive::ecdh_p256(base_material, peer, okm_len)
+                    }
+                    .map_err(hsm_err_to_status)?
+                }
             };
-            derived_tpl
-                .check_len(derived_material.as_bytes().len())
-                .map_err(hsm_err_to_status)?;
 
             drop(base_key);
 
-            // Build new derived key object
-            let handle = self
-                .hsm
-                .object_store()
-                .next_handle()
-                .map_err(hsm_err_to_status)?;
-
-            let derived_len_actual = derived_material.as_bytes().len();
-            let mut obj = craton_hsm::store::object::StoredObject::new(handle, CKO_SECRET_KEY);
-            obj.slot_id = slot_id;
-            obj.key_type = Some(derived_tpl.key_type);
-            obj.value_len = Some(derived_len_actual as CK_ULONG);
-            obj.key_material = Some(derived_material);
-            // PKCS#11 lets the template choose the derived key's protection;
-            // `DerivedKeyTemplate` has already applied it (and the defaults).
-            obj.sensitive = derived_tpl.sensitive;
-            obj.extractable = derived_tpl.extractable;
-
-            // Apply the remaining template attributes (label, CKA_ENCRYPT, etc.)
-            for (attr_type, value) in &template {
-                if matches!(
-                    *attr_type,
-                    CKA_VALUE_LEN | CKA_KEY_TYPE | CKA_SENSITIVE | CKA_EXTRACTABLE
-                ) {
-                    continue; // already handled
-                }
-                craton_hsm::store::attributes::apply_attribute(&mut obj, *attr_type, value)
-                    .map_err(hsm_err_to_status)?;
-            }
-
-            let new_handle = self
-                .hsm
-                .object_store()
-                .insert_object(obj)
-                .map_err(hsm_err_to_status)?;
+            let new_handle = store_derived_key(
+                &self.hsm,
+                slot_id,
+                &derived_tpl,
+                derived_material,
+                &template,
+            )?;
 
             self.audit(
                 req.session_handle,
@@ -2328,7 +2583,274 @@ impl HsmService for HsmServiceImpl {
             )?;
 
             Ok(Response::new(DeriveKeyResponse {
-                key_handle: new_handle as u64,
+                key_handle: new_handle,
+            }))
+        })
+    }
+
+    async fn encapsulate_key(
+        &self,
+        request: Request<EncapsulateKeyRequest>,
+    ) -> Result<Response<EncapsulateKeyResponse>, Status> {
+        blocking(|| {
+            let client_id = client_id_from_request(&request);
+            let req = request.into_inner();
+            let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
+
+            let mech = req
+                .mechanism
+                .ok_or_else(|| Status::invalid_argument("mechanism required"))?;
+            let mech_type = to_ck_ulong(mech.mechanism_type, "mechanism_type")?;
+
+            if !craton_hsm::crypto::mechanisms::is_kem_mechanism(mech_type)
+                && mech_type != CKM_ML_KEM_KEY_PAIR_GEN
+            {
+                return Err(Status::invalid_argument("Unsupported KEM mechanism"));
+            }
+
+            craton_hsm::crypto::mechanisms::validate_mechanism_for_policy(
+                mech_type,
+                self.hsm.algorithm_config(),
+                false,
+            )
+            .map_err(|_| Status::permission_denied("Mechanism blocked by algorithm policy"))?;
+
+            let fips_approved = craton_hsm::crypto::mechanisms::is_fips_approved(mech_type);
+
+            let pub_handle = to_ck_ulong(req.public_key_handle, "public_key_handle")?;
+            let pub_obj = self
+                .hsm
+                .object_store()
+                .get_object(pub_handle)
+                .map_err(hsm_err_to_status)?;
+            let pub_key = pub_obj.read();
+
+            if pub_key.slot_id != slot_id {
+                return Err(Status::not_found("Public key not found"));
+            }
+            if !pub_key.can_derive {
+                return Err(Status::permission_denied(
+                    "Key cannot be used for encapsulation (derivation)",
+                ));
+            }
+            if pub_key.key_type != Some(CKK_ML_KEM) {
+                return Err(Status::invalid_argument("Key is not an ML-KEM key"));
+            }
+
+            let variant = craton_hsm::crypto::pqc::mechanism_to_ml_kem_variant(mech_type)
+                .or_else(|| {
+                    pub_key
+                        .parameter_set()
+                        .and_then(|ps| {
+                            craton_hsm::crypto::pqc::mechanism_for_parameter_set(
+                                CKM_ML_KEM_KEY_PAIR_GEN,
+                                ps,
+                            )
+                        })
+                        .and_then(craton_hsm::crypto::pqc::mechanism_to_ml_kem_variant)
+                })
+                .ok_or_else(|| {
+                    Status::invalid_argument(
+                        "Cannot determine ML-KEM variant from mechanism and key",
+                    )
+                })?;
+
+            let ek_bytes = pub_key
+                .public_key_data
+                .as_deref()
+                .or_else(|| pub_key.key_material.as_ref().map(|k| k.as_bytes()))
+                .ok_or_else(|| Status::internal("ML-KEM key missing encapsulation key material"))?;
+
+            let (ciphertext, shared_secret) = self
+                .hsm
+                .crypto_backend()
+                .ml_kem_encapsulate(ek_bytes, variant)
+                .map_err(hsm_err_to_status)?;
+
+            drop(pub_key);
+
+            let template = proto_attrs_to_template(&req.template)?;
+            let derived_tpl = craton_hsm::crypto::derive::DerivedKeyTemplate::resolve(
+                &template,
+                CKK_GENERIC_SECRET,
+                self.hsm.algorithm_config(),
+            )
+            .map_err(hsm_err_to_status)?;
+            let is_aes = derived_tpl.key_type == CKK_AES;
+            let key_len =
+                derived_tpl
+                    .value_len
+                    .unwrap_or(if is_aes { 32 } else { shared_secret.len() });
+            if shared_secret.len() < key_len {
+                return Err(Status::invalid_argument(
+                    "Derived key length exceeds shared secret length",
+                ));
+            }
+            let derived_material = craton_hsm::store::key_material::RawKeyMaterial::new(
+                shared_secret[..key_len].to_vec(),
+            );
+
+            let new_handle = store_derived_key(
+                &self.hsm,
+                slot_id,
+                &derived_tpl,
+                derived_material,
+                &template,
+            )?;
+
+            self.audit(
+                req.session_handle,
+                AuditOperation::DeriveKey {
+                    mechanism: mech_type as u64,
+                    fips_approved,
+                },
+                AuditResult::Success,
+                Some(format!(
+                    "public_key={}, derived_key={}",
+                    req.public_key_handle, new_handle
+                )),
+                &client_id,
+            )?;
+
+            Ok(Response::new(EncapsulateKeyResponse {
+                ciphertext,
+                key_handle: new_handle,
+            }))
+        })
+    }
+
+    async fn decapsulate_key(
+        &self,
+        request: Request<DecapsulateKeyRequest>,
+    ) -> Result<Response<DecapsulateKeyResponse>, Status> {
+        blocking(|| {
+            let client_id = client_id_from_request(&request);
+            let req = request.into_inner();
+            let slot_id = require_authenticated_session(&self.hsm, req.session_handle)?;
+
+            let mech = req
+                .mechanism
+                .ok_or_else(|| Status::invalid_argument("mechanism required"))?;
+            let mech_type = to_ck_ulong(mech.mechanism_type, "mechanism_type")?;
+
+            if !craton_hsm::crypto::mechanisms::is_kem_mechanism(mech_type)
+                && mech_type != CKM_ML_KEM_KEY_PAIR_GEN
+            {
+                return Err(Status::invalid_argument("Unsupported KEM mechanism"));
+            }
+
+            craton_hsm::crypto::mechanisms::validate_mechanism_for_policy(
+                mech_type,
+                self.hsm.algorithm_config(),
+                false,
+            )
+            .map_err(|_| Status::permission_denied("Mechanism blocked by algorithm policy"))?;
+
+            let fips_approved = craton_hsm::crypto::mechanisms::is_fips_approved(mech_type);
+
+            let priv_handle = to_ck_ulong(req.private_key_handle, "private_key_handle")?;
+            let priv_obj = self
+                .hsm
+                .object_store()
+                .get_object(priv_handle)
+                .map_err(hsm_err_to_status)?;
+            let priv_key = priv_obj.read();
+
+            if priv_key.slot_id != slot_id {
+                return Err(Status::not_found("Private key not found"));
+            }
+            if !priv_key.can_derive {
+                return Err(Status::permission_denied(
+                    "Key cannot be used for decapsulation (derivation)",
+                ));
+            }
+            if priv_key.key_type != Some(CKK_ML_KEM) {
+                return Err(Status::invalid_argument("Key is not an ML-KEM key"));
+            }
+
+            let variant = craton_hsm::crypto::pqc::mechanism_to_ml_kem_variant(mech_type)
+                .or_else(|| {
+                    priv_key
+                        .parameter_set()
+                        .and_then(|ps| {
+                            craton_hsm::crypto::pqc::mechanism_for_parameter_set(
+                                CKM_ML_KEM_KEY_PAIR_GEN,
+                                ps,
+                            )
+                        })
+                        .and_then(craton_hsm::crypto::pqc::mechanism_to_ml_kem_variant)
+                })
+                .ok_or_else(|| {
+                    Status::invalid_argument(
+                        "Cannot determine ML-KEM variant from mechanism and key",
+                    )
+                })?;
+
+            if req.ciphertext.is_empty() {
+                return Err(Status::invalid_argument(
+                    "Ciphertext is required for decapsulation",
+                ));
+            }
+
+            let dk_material = priv_key
+                .key_material
+                .as_ref()
+                .ok_or_else(|| Status::internal("Private key has no material"))?
+                .as_bytes();
+
+            let shared_secret = self
+                .hsm
+                .crypto_backend()
+                .ml_kem_decapsulate(dk_material, &req.ciphertext, variant)
+                .map_err(hsm_err_to_status)?;
+
+            drop(priv_key);
+
+            let template = proto_attrs_to_template(&req.template)?;
+            let derived_tpl = craton_hsm::crypto::derive::DerivedKeyTemplate::resolve(
+                &template,
+                CKK_GENERIC_SECRET,
+                self.hsm.algorithm_config(),
+            )
+            .map_err(hsm_err_to_status)?;
+            let is_aes = derived_tpl.key_type == CKK_AES;
+            let key_len =
+                derived_tpl
+                    .value_len
+                    .unwrap_or(if is_aes { 32 } else { shared_secret.len() });
+            if shared_secret.len() < key_len {
+                return Err(Status::invalid_argument(
+                    "Derived key length exceeds shared secret length",
+                ));
+            }
+            let derived_material = craton_hsm::store::key_material::RawKeyMaterial::new(
+                shared_secret[..key_len].to_vec(),
+            );
+
+            let new_handle = store_derived_key(
+                &self.hsm,
+                slot_id,
+                &derived_tpl,
+                derived_material,
+                &template,
+            )?;
+
+            self.audit(
+                req.session_handle,
+                AuditOperation::DeriveKey {
+                    mechanism: mech_type as u64,
+                    fips_approved,
+                },
+                AuditResult::Success,
+                Some(format!(
+                    "private_key={}, derived_key={}",
+                    req.private_key_handle, new_handle
+                )),
+                &client_id,
+            )?;
+
+            Ok(Response::new(DecapsulateKeyResponse {
+                key_handle: new_handle,
             }))
         })
     }
@@ -2730,6 +3252,7 @@ fn hsm_err_to_status(e: craton_hsm::error::HsmError) -> Status {
         | HsmError::AuditChainBroken(_) => Status::internal("Internal error"),
 
         HsmError::SessionClosed => Status::aborted("Session closed"),
+        HsmError::StateUnsaveable => Status::failed_precondition("Operation state cannot be saved"),
     }
 }
 
@@ -3182,5 +3705,186 @@ mod tests {
             .await
             .expect_err("CKD_NULL with shared data must fail");
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn ml_dsa_keygen_sign_verify_roundtrip() {
+        let service = make_derive_service(false);
+        let session = user_session(&service).await;
+
+        // 1. Generate ML-DSA keypair using PKCS#11 v3.2 CKM_ML_DSA_KEY_PAIR_GEN + CKP_ML_DSA_44
+        let keypair_resp = service
+            .generate_key_pair(Request::new(GenerateKeyPairRequest {
+                session_handle: session,
+                mechanism: Some(Mechanism {
+                    mechanism_type: CKM_ML_DSA_KEY_PAIR_GEN as u64,
+                    parameter: Vec::new(),
+                }),
+                public_template: vec![attr(CKA_PARAMETER_SET, ulong(CKP_ML_DSA_44))],
+                private_template: vec![],
+            }))
+            .await
+            .expect("generate ML-DSA keypair")
+            .into_inner();
+
+        let pub_key = keypair_resp.public_key_handle;
+        let priv_key = keypair_resp.private_key_handle;
+        assert_ne!(pub_key, 0);
+        assert_ne!(priv_key, 0);
+
+        // 2. Sign with CKM_ML_DSA
+        let msg = b"Post-quantum message to sign with ML-DSA";
+        let sign_resp = service
+            .sign(Request::new(SignRequest {
+                session_handle: session,
+                mechanism: Some(Mechanism {
+                    mechanism_type: CKM_ML_DSA as u64,
+                    parameter: Vec::new(),
+                }),
+                key_handle: priv_key,
+                data: msg.to_vec(),
+            }))
+            .await
+            .expect("sign ML-DSA")
+            .into_inner();
+
+        assert_eq!(sign_resp.signature.len(), 2420); // ML-DSA-44 sig length
+
+        // 3. Verify signature
+        let verify_resp = service
+            .verify(Request::new(VerifyRequest {
+                session_handle: session,
+                mechanism: Some(Mechanism {
+                    mechanism_type: CKM_ML_DSA as u64,
+                    parameter: Vec::new(),
+                }),
+                key_handle: pub_key,
+                data: msg.to_vec(),
+                signature: sign_resp.signature.clone(),
+            }))
+            .await
+            .expect("verify ML-DSA")
+            .into_inner();
+
+        assert!(
+            verify_resp.valid,
+            "ML-DSA signature must verify successfully"
+        );
+
+        // 4. Verify with tampered message fails
+        let tampered_msg = b"Tampered message";
+        let verify_bad = service
+            .verify(Request::new(VerifyRequest {
+                session_handle: session,
+                mechanism: Some(Mechanism {
+                    mechanism_type: CKM_ML_DSA as u64,
+                    parameter: Vec::new(),
+                }),
+                key_handle: pub_key,
+                data: tampered_msg.to_vec(),
+                signature: sign_resp.signature,
+            }))
+            .await
+            .expect("verify tampered ML-DSA")
+            .into_inner();
+
+        assert!(
+            !verify_bad.valid,
+            "Tampered ML-DSA message must fail verification"
+        );
+    }
+
+    #[tokio::test]
+    async fn ml_kem_encapsulate_decapsulate_and_derive_roundtrip() {
+        let service = make_derive_service(false);
+        let session = user_session(&service).await;
+
+        // 1. Generate ML-KEM-768 keypair
+        let keypair_resp = service
+            .generate_key_pair(Request::new(GenerateKeyPairRequest {
+                session_handle: session,
+                mechanism: Some(Mechanism {
+                    mechanism_type: CKM_ML_KEM_KEY_PAIR_GEN as u64,
+                    parameter: Vec::new(),
+                }),
+                public_template: vec![attr(CKA_PARAMETER_SET, ulong(CKP_ML_KEM_768))],
+                private_template: vec![],
+            }))
+            .await
+            .expect("generate ML-KEM keypair")
+            .into_inner();
+
+        let pub_key = keypair_resp.public_key_handle;
+        let priv_key = keypair_resp.private_key_handle;
+
+        // 2. EncapsulateKey with public key handle
+        let encap_resp = service
+            .encapsulate_key(Request::new(EncapsulateKeyRequest {
+                session_handle: session,
+                mechanism: Some(Mechanism {
+                    mechanism_type: CKM_ML_KEM_768 as u64,
+                    parameter: Vec::new(),
+                }),
+                public_key_handle: pub_key,
+                template: vec![attr(CKA_SENSITIVE, vec![0]), attr(CKA_EXTRACTABLE, vec![1])],
+            }))
+            .await
+            .expect("encapsulate_key")
+            .into_inner();
+
+        assert_eq!(encap_resp.ciphertext.len(), 1088); // ML-KEM-768 ciphertext size
+        assert_ne!(encap_resp.key_handle, 0);
+
+        let encap_secret = read_attr(&service, session, encap_resp.key_handle, CKA_VALUE).await;
+        assert_eq!(encap_secret.len(), 32);
+
+        // 3. DecapsulateKey with private key handle and ciphertext
+        let decap_resp = service
+            .decapsulate_key(Request::new(DecapsulateKeyRequest {
+                session_handle: session,
+                mechanism: Some(Mechanism {
+                    mechanism_type: CKM_ML_KEM_768 as u64,
+                    parameter: Vec::new(),
+                }),
+                private_key_handle: priv_key,
+                ciphertext: encap_resp.ciphertext.clone(),
+                template: vec![attr(CKA_SENSITIVE, vec![0]), attr(CKA_EXTRACTABLE, vec![1])],
+            }))
+            .await
+            .expect("decapsulate_key")
+            .into_inner();
+
+        assert_ne!(decap_resp.key_handle, 0);
+        let decap_secret = read_attr(&service, session, decap_resp.key_handle, CKA_VALUE).await;
+        assert_eq!(decap_secret.len(), 32);
+
+        // Shared secrets must match
+        assert_eq!(
+            encap_secret, decap_secret,
+            "Decapsulated secret must match encapsulated secret"
+        );
+
+        // 4. Decapsulate via DeriveKey (standard PKCS#11 C_DeriveKey translation)
+        let derive_resp = service
+            .derive_key(Request::new(DeriveKeyRequest {
+                session_handle: session,
+                mechanism: Some(Mechanism {
+                    mechanism_type: CKM_ML_KEM_768 as u64,
+                    parameter: encap_resp.ciphertext,
+                }),
+                base_key_handle: priv_key,
+                template: vec![attr(CKA_SENSITIVE, vec![0]), attr(CKA_EXTRACTABLE, vec![1])],
+                ecdh_params: None,
+            }))
+            .await
+            .expect("derive_key via ML-KEM")
+            .into_inner();
+
+        assert_ne!(derive_resp.key_handle, 0);
+        let derive_secret = read_attr(&service, session, derive_resp.key_handle, CKA_VALUE).await;
+        assert_eq!(
+            decap_secret, derive_secret,
+            "DeriveKey secret must match DecapsulateKey secret"
+        );
     }
 }

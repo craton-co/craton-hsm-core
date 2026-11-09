@@ -1493,7 +1493,11 @@ pub extern "C" fn C_CreateObject(
                             .unwrap_or([0; std::mem::size_of::<CK_ULONG>()]),
                     ) == CKK_EC
             });
-            if is_ec && !is_p256_params(params) && !is_p384_params(params) && !is_p521_params(params) {
+            if is_ec
+                && !is_p256_params(params)
+                && !is_p384_params(params)
+                && !is_p521_params(params)
+            {
                 return CKR_CURVE_NOT_SUPPORTED;
             }
         }
@@ -2658,10 +2662,12 @@ pub extern "C" fn C_SignInit(
         if sess.active_sign_verify.is_some()
             || matches!(
                 &sess.active_operation,
-                Some(ActiveOperation::Sign { .. }
-                    | ActiveOperation::Verify { .. }
-                    | ActiveOperation::SignRecover { .. }
-                    | ActiveOperation::VerifyRecover { .. })
+                Some(
+                    ActiveOperation::Sign { .. }
+                        | ActiveOperation::Verify { .. }
+                        | ActiveOperation::SignRecover { .. }
+                        | ActiveOperation::VerifyRecover { .. }
+                )
             )
         {
             return CKR_OPERATION_ACTIVE;
@@ -3175,10 +3181,12 @@ pub extern "C" fn C_VerifyInit(
         if sess.active_sign_verify.is_some()
             || matches!(
                 &sess.active_operation,
-                Some(ActiveOperation::Sign { .. }
-                    | ActiveOperation::Verify { .. }
-                    | ActiveOperation::SignRecover { .. }
-                    | ActiveOperation::VerifyRecover { .. })
+                Some(
+                    ActiveOperation::Sign { .. }
+                        | ActiveOperation::Verify { .. }
+                        | ActiveOperation::SignRecover { .. }
+                        | ActiveOperation::VerifyRecover { .. }
+                )
             )
         {
             return CKR_OPERATION_ACTIVE;
@@ -6139,7 +6147,9 @@ pub extern "C" fn C_SignRecover(
         }
 
         let data = unsafe { slice::from_raw_parts(p_data, data_len as usize) };
-        let result = hsm.crypto_backend.rsa_pkcs1v15_sign_recover(key_bytes, data);
+        let result = hsm
+            .crypto_backend
+            .rsa_pkcs1v15_sign_recover(key_bytes, data);
 
         match result {
             Ok(signature) => {
@@ -6149,7 +6159,10 @@ pub extern "C" fn C_SignRecover(
                     }
                     return CKR_BUFFER_TOO_SMALL;
                 }
-                if matches!(&sess.active_operation, Some(ActiveOperation::SignRecover { .. })) {
+                if matches!(
+                    &sess.active_operation,
+                    Some(ActiveOperation::SignRecover { .. })
+                ) {
                     sess.active_operation = None;
                 }
                 sess.active_sign_verify = None;
@@ -6171,7 +6184,10 @@ pub extern "C" fn C_SignRecover(
                 CKR_OK
             }
             Err(e) => {
-                if matches!(&sess.active_operation, Some(ActiveOperation::SignRecover { .. })) {
+                if matches!(
+                    &sess.active_operation,
+                    Some(ActiveOperation::SignRecover { .. })
+                ) {
                     sess.active_operation = None;
                 }
                 sess.active_sign_verify = None;
@@ -6582,10 +6598,11 @@ pub extern "C" fn C_VerifyRecover(
         };
 
         let signature = unsafe { slice::from_raw_parts(p_signature, signature_len as usize) };
-        let recovered = match hsm
-            .crypto_backend
-            .rsa_pkcs1v15_verify_recover(modulus, public_exponent, signature)
-        {
+        let recovered = match hsm.crypto_backend.rsa_pkcs1v15_verify_recover(
+            modulus,
+            public_exponent,
+            signature,
+        ) {
             Ok(d) => d,
             Err(e) => {
                 if matches!(
@@ -6676,7 +6693,10 @@ pub extern "C" fn C_DigestEncryptUpdate(
         };
         let mut sess = sess.write();
 
-        let has_encrypt = matches!(&sess.active_operation, Some(ActiveOperation::Encrypt { .. }));
+        let has_encrypt = matches!(
+            &sess.active_operation,
+            Some(ActiveOperation::Encrypt { .. })
+        );
         let has_digest = sess.active_digest.is_some()
             || matches!(&sess.active_operation, Some(ActiveOperation::Digest { .. }));
         if !has_encrypt || !has_digest {
@@ -6768,7 +6788,10 @@ pub extern "C" fn C_DecryptDigestUpdate(
         };
         let mut sess = sess.write();
 
-        let has_decrypt = matches!(&sess.active_operation, Some(ActiveOperation::Decrypt { .. }));
+        let has_decrypt = matches!(
+            &sess.active_operation,
+            Some(ActiveOperation::Decrypt { .. })
+        );
         let has_digest = sess.active_digest.is_some()
             || matches!(&sess.active_operation, Some(ActiveOperation::Digest { .. }));
         if !has_decrypt || !has_digest {
@@ -6800,7 +6823,12 @@ pub extern "C" fn C_DecryptDigestUpdate(
                 mechanism_param,
                 cached_object,
                 ..
-            }) => (*mechanism, *key_handle, mechanism_param.clone(), cached_object.clone()),
+            }) => (
+                *mechanism,
+                *key_handle,
+                mechanism_param.clone(),
+                cached_object.clone(),
+            ),
             _ => return CKR_OPERATION_NOT_INITIALIZED,
         };
 
@@ -6832,18 +6860,26 @@ pub extern "C" fn C_DecryptDigestUpdate(
                     .aes_cbc_decrypt_unpadded(key_bytes, &mech_param, enc_part)
             }
             CKM_AES_CBC_PAD => {
-                match hsm.crypto_backend.aes_cbc_decrypt(key_bytes, &mech_param, enc_part) {
+                match hsm
+                    .crypto_backend
+                    .aes_cbc_decrypt(key_bytes, &mech_param, enc_part)
+                {
                     Ok(pt) => Ok(pt),
-                    Err(crate::error::HsmError::EncryptedDataInvalid) if enc_part.len() % 16 == 0 => {
-                        hsm.crypto_backend.aes_cbc_decrypt_unpadded(key_bytes, &mech_param, enc_part)
+                    Err(crate::error::HsmError::EncryptedDataInvalid)
+                        if enc_part.len() % 16 == 0 =>
+                    {
+                        hsm.crypto_backend.aes_cbc_decrypt_unpadded(
+                            key_bytes,
+                            &mech_param,
+                            enc_part,
+                        )
                     }
                     Err(e) => Err(e),
                 }
             }
-            CKM_AES_CTR => {
-                hsm.crypto_backend
-                    .aes_ctr_decrypt(key_bytes, &mech_param, enc_part)
-            }
+            CKM_AES_CTR => hsm
+                .crypto_backend
+                .aes_ctr_decrypt(key_bytes, &mech_param, enc_part),
             _ => {
                 sess.active_operation = None;
                 sess.active_digest = None;
@@ -6874,7 +6910,10 @@ pub extern "C" fn C_DecryptDigestUpdate(
             *pul_part_len = pt.len() as CK_ULONG;
         }
 
-        if let Some(ActiveOperation::Decrypt { mechanism_param, .. }) = &mut sess.active_operation {
+        if let Some(ActiveOperation::Decrypt {
+            mechanism_param, ..
+        }) = &mut sess.active_operation
+        {
             match mechanism {
                 CKM_AES_CBC | CKM_AES_CBC_PAD => {
                     if enc_part.len() >= 16 {
@@ -6947,7 +6986,10 @@ pub extern "C" fn C_SignEncryptUpdate(
         };
         let mut sess = sess.write();
 
-        let has_encrypt = matches!(&sess.active_operation, Some(ActiveOperation::Encrypt { .. }));
+        let has_encrypt = matches!(
+            &sess.active_operation,
+            Some(ActiveOperation::Encrypt { .. })
+        );
         let has_sign = sess
             .active_sign_verify
             .as_ref()
@@ -7038,7 +7080,10 @@ pub extern "C" fn C_DecryptVerifyUpdate(
         };
         let mut sess = sess.write();
 
-        let has_decrypt = matches!(&sess.active_operation, Some(ActiveOperation::Decrypt { .. }));
+        let has_decrypt = matches!(
+            &sess.active_operation,
+            Some(ActiveOperation::Decrypt { .. })
+        );
         let has_verify = sess
             .active_sign_verify
             .as_ref()
@@ -7073,7 +7118,12 @@ pub extern "C" fn C_DecryptVerifyUpdate(
                 mechanism_param,
                 cached_object,
                 ..
-            }) => (*mechanism, *key_handle, mechanism_param.clone(), cached_object.clone()),
+            }) => (
+                *mechanism,
+                *key_handle,
+                mechanism_param.clone(),
+                cached_object.clone(),
+            ),
             _ => return CKR_OPERATION_NOT_INITIALIZED,
         };
 
@@ -7105,18 +7155,26 @@ pub extern "C" fn C_DecryptVerifyUpdate(
                     .aes_cbc_decrypt_unpadded(key_bytes, &mech_param, enc_part)
             }
             CKM_AES_CBC_PAD => {
-                match hsm.crypto_backend.aes_cbc_decrypt(key_bytes, &mech_param, enc_part) {
+                match hsm
+                    .crypto_backend
+                    .aes_cbc_decrypt(key_bytes, &mech_param, enc_part)
+                {
                     Ok(pt) => Ok(pt),
-                    Err(crate::error::HsmError::EncryptedDataInvalid) if enc_part.len() % 16 == 0 => {
-                        hsm.crypto_backend.aes_cbc_decrypt_unpadded(key_bytes, &mech_param, enc_part)
+                    Err(crate::error::HsmError::EncryptedDataInvalid)
+                        if enc_part.len() % 16 == 0 =>
+                    {
+                        hsm.crypto_backend.aes_cbc_decrypt_unpadded(
+                            key_bytes,
+                            &mech_param,
+                            enc_part,
+                        )
                     }
                     Err(e) => Err(e),
                 }
             }
-            CKM_AES_CTR => {
-                hsm.crypto_backend
-                    .aes_ctr_decrypt(key_bytes, &mech_param, enc_part)
-            }
+            CKM_AES_CTR => hsm
+                .crypto_backend
+                .aes_ctr_decrypt(key_bytes, &mech_param, enc_part),
             _ => {
                 sess.active_operation = None;
                 sess.active_sign_verify = None;
@@ -7147,7 +7205,10 @@ pub extern "C" fn C_DecryptVerifyUpdate(
             *pul_part_len = pt.len() as CK_ULONG;
         }
 
-        if let Some(ActiveOperation::Decrypt { mechanism_param, .. }) = &mut sess.active_operation {
+        if let Some(ActiveOperation::Decrypt {
+            mechanism_param, ..
+        }) = &mut sess.active_operation
+        {
             match mechanism {
                 CKM_AES_CBC | CKM_AES_CBC_PAD => {
                     if enc_part.len() >= 16 {

@@ -748,14 +748,19 @@ fn bench_vector_aes_ctr(c: &mut Criterion) {
     let data_64k = vec![0x5au8; 64 * 1024];
 
     // AVX-512 Vector
-    craton_hsm::crypto::vector_accel::set_config(craton_hsm::crypto::vector_accel::VectorConfig::default());
+    craton_hsm::crypto::vector_accel::set_config(
+        craton_hsm::crypto::vector_accel::VectorConfig::default(),
+    );
     group.bench_function("avx512_64k", |b| {
         b.iter(|| {
-            black_box(craton_hsm::crypto::encrypt::aes_ctr_decrypt(
-                black_box(&key),
-                black_box(&iv),
-                black_box(&data_64k),
-            ).unwrap())
+            black_box(
+                craton_hsm::crypto::encrypt::aes_ctr_decrypt(
+                    black_box(&key),
+                    black_box(&iv),
+                    black_box(&data_64k),
+                )
+                .unwrap(),
+            )
         })
     });
 
@@ -765,11 +770,14 @@ fn bench_vector_aes_ctr(c: &mut Criterion) {
     craton_hsm::crypto::vector_accel::set_config(cfg);
     group.bench_function("scalar_64k", |b| {
         b.iter(|| {
-            black_box(craton_hsm::crypto::encrypt::aes_ctr_decrypt(
-                black_box(&key),
-                black_box(&iv),
-                black_box(&data_64k),
-            ).unwrap())
+            black_box(
+                craton_hsm::crypto::encrypt::aes_ctr_decrypt(
+                    black_box(&key),
+                    black_box(&iv),
+                    black_box(&data_64k),
+                )
+                .unwrap(),
+            )
         })
     });
     group.finish();
@@ -779,7 +787,12 @@ mod pqc_bench {
     pub const MLKEM_Q: i16 = 3329;
     pub const MLKEM_N: usize = 256;
 
-    pub fn poly_mul_montgomery(out: &mut [i16; MLKEM_N], a: &[i16; MLKEM_N], b: &[i16; MLKEM_N], vector: bool) {
+    pub fn poly_mul_montgomery(
+        out: &mut [i16; MLKEM_N],
+        a: &[i16; MLKEM_N],
+        b: &[i16; MLKEM_N],
+        vector: bool,
+    ) {
         #[cfg(target_arch = "x86_64")]
         if vector && is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
             unsafe { poly_mul_montgomery_avx512(out, a, b) };
@@ -795,7 +808,11 @@ mod pqc_bench {
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx512f,avx512bw")]
-    unsafe fn poly_mul_montgomery_avx512(out: &mut [i16; MLKEM_N], a: &[i16; MLKEM_N], b: &[i16; MLKEM_N]) {
+    unsafe fn poly_mul_montgomery_avx512(
+        out: &mut [i16; MLKEM_N],
+        a: &[i16; MLKEM_N],
+        b: &[i16; MLKEM_N],
+    ) {
         use std::arch::x86_64::*;
         let v_q = _mm512_set1_epi16(MLKEM_Q);
         let v_qinv = _mm512_set1_epi16(-3327);
@@ -822,24 +839,14 @@ fn bench_vector_pqc_mlkem(c: &mut Criterion) {
     // Vector
     group.bench_function("avx512_montgomery_mul", |bench| {
         bench.iter(|| {
-            pqc_bench::poly_mul_montgomery(
-                black_box(&mut out),
-                black_box(&a),
-                black_box(&b),
-                true,
-            )
+            pqc_bench::poly_mul_montgomery(black_box(&mut out), black_box(&a), black_box(&b), true)
         })
     });
 
     // Scalar
     group.bench_function("scalar_montgomery_mul", |bench| {
         bench.iter(|| {
-            pqc_bench::poly_mul_montgomery(
-                black_box(&mut out),
-                black_box(&a),
-                black_box(&b),
-                false,
-            )
+            pqc_bench::poly_mul_montgomery(black_box(&mut out), black_box(&a), black_box(&b), false)
         })
     });
     group.finish();
