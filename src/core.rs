@@ -210,7 +210,15 @@ impl HsmCore {
         if std::fs::create_dir_all(&config.token.storage_path).is_ok()
             && std::fs::write(&key_path, *key).is_ok()
         {
-            let _ = crate::platform_acl::restrict_file_to_owner(&key_path);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+            }
+            #[cfg(windows)]
+            {
+                let _ = crate::platform_acl::restrict_file_to_owner(&key_path);
+            }
         }
         key
     }

@@ -490,6 +490,7 @@ pub fn check_gcm_caller_iv(key: &[u8], iv: &[u8]) -> HsmResult<()> {
     let counter = GCM_ENCRYPT_COUNTERS
         .entry(gcm_key_id(key))
         .or_insert_with(|| AtomicU64::new(0));
+    #[allow(deprecated)]
     counter
         .value()
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
