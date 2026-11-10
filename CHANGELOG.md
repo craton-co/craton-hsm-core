@@ -6,7 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-09
+
 ### Added
+
+- **Post-Quantum Cryptography in gRPC Daemon**: Added ML-DSA and ML-KEM key pair generation,
+  ML-DSA sign/verify, dedicated EncapsulateKey and DecapsulateKey RPCs, and DeriveKey
+  decapsulation support in craton-hsm-daemon.
+- **Cross-Platform State HMAC Key Security**: Enforced restrictive file permissions (0o600 on Unix,
+  restrict_file_to_owner on Windows) on persisted state HMAC keys.
 
 - **AVX-512 Vector Acceleration for Cryptographic Algorithms**: Implemented 512-bit vector acceleration
   across AES-CTR (2.30x speedup, >11.5 GB/s), AES-CBC decrypt (2.89x speedup, >16.1 GB/s),
