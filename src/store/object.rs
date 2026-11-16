@@ -213,6 +213,16 @@ impl StoredObject {
         }
     }
 
+    /// PKCS#11 §4.10 CKA_ALWAYS_AUTHENTICATE: each use of this private key
+    /// needs a C_Login(CKU_CONTEXT_SPECIFIC) after the operation's *Init.
+    pub fn always_authenticate(&self) -> bool {
+        self.class == CKO_PRIVATE_KEY
+            && self
+                .extra_attributes
+                .get(&CKA_ALWAYS_AUTHENTICATE)
+                .is_some_and(|v| v.first().is_some_and(|b| *b != 0))
+    }
+
     /// Whether this is a post-quantum (ML-KEM / ML-DSA / SLH-DSA) key.
     pub fn is_pqc_key(&self) -> bool {
         matches!(self.key_type, Some(CKK_ML_KEM | CKK_ML_DSA | CKK_SLH_DSA))

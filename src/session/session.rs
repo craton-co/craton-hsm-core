@@ -515,6 +515,9 @@ pub struct Session {
     /// that still holds an `Arc<RwLock<Session>>` after the DashMap removal
     /// can check this flag to detect a use-after-close condition.
     pub closed: bool,
+    /// Set by C_Login(CKU_CONTEXT_SPECIFIC); reset by every *Init on a
+    /// CKA_ALWAYS_AUTHENTICATE key, so one login authorizes one operation.
+    pub context_authenticated: bool,
 }
 
 impl Drop for Session {
@@ -549,6 +552,7 @@ impl Session {
             last_operation_fips_approved: None,
             last_activity: Instant::now(),
             closed: false,
+            context_authenticated: false,
         }
     }
 

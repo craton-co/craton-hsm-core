@@ -60,7 +60,7 @@ use crate::crypto::{approved_services, derive, mechanisms, pairwise_test, pqc, s
 use crate::error::{HsmError, HsmResult};
 use crate::pkcs11_abi::constants::*;
 use crate::pkcs11_abi::types::*;
-use crate::session::session::{ActiveOperation, FindContext};
+use crate::session::session::{ActiveOperation, FindContext, Session};
 use crate::store::key_material::RawKeyMaterial;
 use crate::store::object::StoredObject;
 use zeroize::Zeroizing;
@@ -212,6 +212,64 @@ fn err_to_rv(e: HsmError) -> CK_RV {
 /// Best-effort recovery of a stored key's size in bits, used by the FIPS
 /// approved-services key-size enforcement.  Returns None when the object's
 /// size is not encoded in a directly usable form (e.g. raw EC private keys).
+/// PKCS#11 §4.10: an operation on a CKA_ALWAYS_AUTHENTICATE key needs a
+/// C_Login(CKU_CONTEXT_SPECIFIC) after its *Init. Without it, end the matching
+/// operation(s) and return CKR_USER_NOT_LOGGED_IN.
+fn enforce_context_login(
+    hsm: &HsmCore,
+    sess: &mut Session,
+    is_kind: fn(&ActiveOperation) -> bool,
+) -> Result<(), CK_RV> {
+    if sess.context_authenticated {
+        return Ok(());
+    }
+    let mut denied = false;
+    for slot in [&mut sess.active_operation, &mut sess.active_sign_verify] {
+        if slot
+            .as_ref()
+            .is_some_and(|op| is_kind(op) && op_needs_context_login(hsm, op))
+        {
+            *slot = None;
+            denied = true;
+        }
+    }
+    if denied {
+        Err(CKR_USER_NOT_LOGGED_IN)
+    } else {
+        Ok(())
+    }
+}
+
+/// Whether `op` uses a key with CKA_ALWAYS_AUTHENTICATE set.
+fn op_needs_context_login(hsm: &HsmCore, op: &ActiveOperation) -> bool {
+    let (key, cached) = match op {
+        ActiveOperation::Sign {
+            key_handle,
+            cached_object,
+            ..
+        }
+        | ActiveOperation::SignRecover {
+            key_handle,
+            cached_object,
+            ..
+        }
+        | ActiveOperation::Decrypt {
+            key_handle,
+            cached_object,
+            ..
+        } => (*key_handle, cached_object),
+        _ => return false,
+    };
+    match cached {
+        Some(obj) => obj.read().always_authenticate(),
+        // Restored by C_SetOperationState: look the key up.
+        None => hsm
+            .object_store
+            .get_object(key)
+            .is_ok_and(|obj| obj.read().always_authenticate()),
+    }
+}
+
 fn stored_key_bits(obj: &StoredObject) -> Option<u32> {
     if let Some(bits) = obj.modulus_bits {
         return Some(bits as u32);
@@ -1333,6 +1391,40 @@ pub extern "C" fn C_Login(
             unsafe { slice::from_raw_parts(p_pin, pin_len as usize) }
         };
 
+        // PKCS#11 §5.6.8: re-authenticate for the operation just initialized
+        // on a CKA_ALWAYS_AUTHENTICATE key; session login state is unchanged.
+        if user_type == CKU_CONTEXT_SPECIFIC {
+            let mut s = sess.write();
+            let pending = [&s.active_operation, &s.active_sign_verify]
+                .into_iter()
+                .flatten()
+                .any(|op| op_needs_context_login(&hsm, op));
+            if !pending {
+                return CKR_OPERATION_NOT_INITIALIZED;
+            }
+            let rv = match token.context_login(pin) {
+                Ok(()) => {
+                    s.context_authenticated = true;
+                    CKR_OK
+                }
+                Err(e) => err_to_rv(e),
+            };
+            let result = if rv == CKR_OK {
+                AuditResult::Success
+            } else {
+                AuditResult::Failure(u64::from(rv))
+            };
+            let _ = hsm.audit_log.record(
+                u64::from(session),
+                AuditOperation::Login {
+                    user_type: u64::from(user_type),
+                },
+                result,
+                None,
+            );
+            return rv;
+        }
+
         match token.login(user_type, pin) {
             Ok(()) => {
                 // Update all sessions for this slot
@@ -2430,6 +2522,9 @@ pub extern "C" fn C_DecryptInit(
         } else {
             extract_mechanism_param(p_mechanism)
         };
+        if obj.read().always_authenticate() {
+            sess.context_authenticated = false;
+        }
         sess.active_operation = Some(ActiveOperation::Decrypt {
             mechanism,
             key_handle: key,
@@ -2465,6 +2560,11 @@ pub extern "C" fn C_Decrypt(
             Err(e) => return err_to_rv(e),
         };
         let mut sess = sess.write();
+        if let Err(rv) = enforce_context_login(&hsm, &mut sess, |op| {
+            matches!(op, ActiveOperation::Decrypt { .. })
+        }) {
+            return rv;
+        }
 
         let (mechanism, key_handle, mech_param) = match &sess.active_operation {
             Some(ActiveOperation::Decrypt {
@@ -2726,6 +2826,9 @@ pub extern "C" fn C_SignInit(
         let hasher = sign::sign_mechanism_to_digest_mechanism(mechanism)
             .and_then(|digest_mech| hsm.crypto_backend.create_hasher(digest_mech).ok());
 
+        if obj.read().always_authenticate() {
+            sess.context_authenticated = false;
+        }
         let op = ActiveOperation::Sign {
             mechanism,
             key_handle: key,
@@ -2766,6 +2869,11 @@ pub extern "C" fn C_Sign(
             Err(e) => return err_to_rv(e),
         };
         let mut sess = sess.write();
+        if let Err(rv) = enforce_context_login(&hsm, &mut sess, |op| {
+            matches!(op, ActiveOperation::Sign { .. })
+        }) {
+            return rv;
+        }
 
         let (mechanism, key_handle) = match &sess.active_operation {
             Some(ActiveOperation::Sign {
@@ -4249,6 +4357,12 @@ fn apply_priv_template(obj: &mut StoredObject, template: &[(CK_ATTRIBUTE_TYPE, V
             CKA_UNWRAP_TEMPLATE | CKA_WRAP_WITH_TRUSTED | CKA_SIGN_RECOVER => {
                 obj.extra_attributes.insert(*attr_type, value.clone());
             }
+            CKA_ALWAYS_AUTHENTICATE => match parse_ck_bbool(value) {
+                Ok(v) => {
+                    obj.extra_attributes.insert(*attr_type, vec![v as u8]);
+                }
+                Err(rv) => return rv,
+            },
             _ => {}
         }
     }
@@ -4545,6 +4659,8 @@ pub extern "C" fn C_SetOperationState(
         sess.active_digest = None;
         sess.active_sign_verify = None;
         sess.active_operation = Some(active_op);
+        // A restored operation has had no context-specific login.
+        sess.context_authenticated = false;
         CKR_OK
     })
     .unwrap_or(CKR_GENERAL_ERROR)
@@ -5115,6 +5231,11 @@ pub extern "C" fn C_DecryptUpdate(
             Err(e) => return err_to_rv(e),
         };
         let mut sess = sess.write();
+        if let Err(rv) = enforce_context_login(&hsm, &mut sess, |op| {
+            matches!(op, ActiveOperation::Decrypt { .. })
+        }) {
+            return rv;
+        }
 
         match &mut sess.active_operation {
             Some(ActiveOperation::Decrypt {
@@ -5166,6 +5287,11 @@ pub extern "C" fn C_DecryptFinal(
             Err(e) => return err_to_rv(e),
         };
         let mut sess = sess.write();
+        if let Err(rv) = enforce_context_login(&hsm, &mut sess, |op| {
+            matches!(op, ActiveOperation::Decrypt { .. })
+        }) {
+            return rv;
+        }
 
         // Length query: report a conservative upper-bound WITHOUT
         // consuming the operation state so subsequent Final call works.
@@ -5725,6 +5851,11 @@ pub extern "C" fn C_SignUpdate(
             Err(e) => return err_to_rv(e),
         };
         let mut sess = sess.write();
+        if let Err(rv) = enforce_context_login(&hsm, &mut sess, |op| {
+            matches!(op, ActiveOperation::Sign { .. })
+        }) {
+            return rv;
+        }
 
         let in_sign_verify = sess.active_sign_verify.is_some();
         let target = if in_sign_verify {
@@ -5788,6 +5919,11 @@ pub extern "C" fn C_SignFinal(
             Err(e) => return err_to_rv(e),
         };
         let mut sess = sess.write();
+        if let Err(rv) = enforce_context_login(&hsm, &mut sess, |op| {
+            matches!(op, ActiveOperation::Sign { .. })
+        }) {
+            return rv;
+        }
 
         let in_sign_verify = sess.active_sign_verify.is_some();
 
@@ -6039,6 +6175,9 @@ pub extern "C" fn C_SignRecoverInit(
             }
         }
 
+        if obj.read().always_authenticate() {
+            sess.context_authenticated = false;
+        }
         let op = ActiveOperation::SignRecover {
             mechanism,
             key_handle: key,
@@ -6077,6 +6216,11 @@ pub extern "C" fn C_SignRecover(
             Err(e) => return err_to_rv(e),
         };
         let mut sess = sess.write();
+        if let Err(rv) = enforce_context_login(&hsm, &mut sess, |op| {
+            matches!(op, ActiveOperation::SignRecover { .. })
+        }) {
+            return rv;
+        }
 
         let (mechanism, key_handle, cached_object) = match &sess.active_operation {
             Some(ActiveOperation::SignRecover {
@@ -6787,6 +6931,11 @@ pub extern "C" fn C_DecryptDigestUpdate(
             Err(e) => return err_to_rv(e),
         };
         let mut sess = sess.write();
+        if let Err(rv) = enforce_context_login(&hsm, &mut sess, |op| {
+            matches!(op, ActiveOperation::Decrypt { .. })
+        }) {
+            return rv;
+        }
 
         let has_decrypt = matches!(
             &sess.active_operation,
@@ -6985,6 +7134,11 @@ pub extern "C" fn C_SignEncryptUpdate(
             Err(e) => return err_to_rv(e),
         };
         let mut sess = sess.write();
+        if let Err(rv) = enforce_context_login(&hsm, &mut sess, |op| {
+            matches!(op, ActiveOperation::Sign { .. })
+        }) {
+            return rv;
+        }
 
         let has_encrypt = matches!(
             &sess.active_operation,
@@ -7079,6 +7233,11 @@ pub extern "C" fn C_DecryptVerifyUpdate(
             Err(e) => return err_to_rv(e),
         };
         let mut sess = sess.write();
+        if let Err(rv) = enforce_context_login(&hsm, &mut sess, |op| {
+            matches!(op, ActiveOperation::Decrypt { .. })
+        }) {
+            return rv;
+        }
 
         let has_decrypt = matches!(
             &sess.active_operation,
@@ -7448,6 +7607,10 @@ pub extern "C" fn C_UnwrapKey(
         if !uk_obj.can_unwrap {
             return CKR_KEY_FUNCTION_NOT_PERMITTED;
         }
+        // Single-call function: no *Init to follow with a context-specific login.
+        if uk_obj.always_authenticate() {
+            return CKR_USER_NOT_LOGGED_IN;
+        }
         // FIPS approved-services key-size enforcement (unwrapping key size)
         if let Err(e) =
             approved_services::enforce(mechanism, &hsm.algorithm_config, stored_key_bits(&uk_obj))
@@ -7714,6 +7877,10 @@ pub extern "C" fn C_DeriveKey(
         let bk_obj = bk_obj.read();
         if !bk_obj.can_derive {
             return CKR_KEY_FUNCTION_NOT_PERMITTED;
+        }
+        // Single-call function: no *Init to follow with a context-specific login.
+        if bk_obj.always_authenticate() {
+            return CKR_USER_NOT_LOGGED_IN;
         }
         // FIPS approved-services key-size enforcement (base key size)
         if let Err(e) =

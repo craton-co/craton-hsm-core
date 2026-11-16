@@ -839,6 +839,64 @@ impl Token {
         Ok(())
     }
 
+    /// Verify the user PIN with rate limiting and lockout accounting.
+    ///
+    /// Always performs the full PBKDF2 verification before checking lockout
+    /// state to keep timing constant.
+    fn check_user_pin(&self, auth: &mut AuthState, pin: &[u8]) -> HsmResult<()> {
+        if !auth.user_pin_initialized {
+            return Err(HsmError::UserPinNotInitialized);
+        }
+
+        // Per-account rate limit: reject if within backoff window
+        Self::check_rate_limit(&auth.user_next_allowed)?;
+
+        // Always perform the full PBKDF2 verification to prevent
+        // timing side-channels that leak lockout state.
+        let hash_guard = self.user_pin_hash.read();
+        let stored = hash_guard.as_ref().ok_or(HsmError::UserPinNotInitialized)?;
+        let stored_bytes: &[u8] = stored.as_ref();
+        let pin_correct = self.verify_pin(stored_bytes, pin);
+        drop(hash_guard);
+
+        // Check lockout AFTER verification to keep timing constant
+        if auth.user_pin_locked {
+            return Err(HsmError::PinLocked);
+        }
+
+        if !pin_correct {
+            auth.failed_user_logins += 1;
+            let failures = auth.failed_user_logins;
+            auth.user_next_allowed = Some(Instant::now() + Self::backoff_duration(failures));
+            if failures >= self.max_failed_logins {
+                auth.user_pin_locked = true;
+            }
+            self.persist_lockout(auth);
+            if auth.user_pin_locked {
+                tracing::warn!("user PIN locked after {} failed attempts", failures);
+                return Err(HsmError::PinLocked);
+            }
+            tracing::warn!("user login failed (attempt {})", failures);
+            return Err(HsmError::PinIncorrect);
+        }
+
+        auth.failed_user_logins = 0;
+        auth.user_next_allowed = None;
+        self.persist_lockout(auth);
+        Ok(())
+    }
+
+    /// Re-authenticate the logged-in user for one operation
+    /// (C_Login with CKU_CONTEXT_SPECIFIC, PKCS#11 §5.6.8). Does not change
+    /// the login state.
+    pub fn context_login(&self, pin: &[u8]) -> HsmResult<()> {
+        let mut auth = self.auth.lock();
+        if auth.login != LoginState::UserLoggedIn {
+            return Err(HsmError::UserNotLoggedIn);
+        }
+        self.check_user_pin(&mut auth, pin)
+    }
+
     /// Login as user type (CKU_USER or CKU_SO).
     ///
     /// Always performs the full PBKDF2 verification before checking lockout state,
@@ -863,46 +921,7 @@ impl Token {
                 if auth.login == LoginState::SoLoggedIn {
                     return Err(HsmError::UserAnotherAlreadyLoggedIn);
                 }
-                if !auth.user_pin_initialized {
-                    return Err(HsmError::UserPinNotInitialized);
-                }
-
-                // Per-account rate limit: reject if within backoff window
-                Self::check_rate_limit(&auth.user_next_allowed)?;
-
-                // Always perform the full PBKDF2 verification to prevent
-                // timing side-channels that leak lockout state.
-                let hash_guard = self.user_pin_hash.read();
-                let stored = hash_guard.as_ref().ok_or(HsmError::UserPinNotInitialized)?;
-                let stored_bytes: &[u8] = stored.as_ref();
-                let pin_correct = self.verify_pin(stored_bytes, pin);
-                drop(hash_guard);
-
-                // Check lockout AFTER verification to keep timing constant
-                if auth.user_pin_locked {
-                    return Err(HsmError::PinLocked);
-                }
-
-                if !pin_correct {
-                    auth.failed_user_logins += 1;
-                    let failures = auth.failed_user_logins;
-                    auth.user_next_allowed =
-                        Some(Instant::now() + Self::backoff_duration(failures));
-                    if failures >= self.max_failed_logins {
-                        auth.user_pin_locked = true;
-                    }
-                    self.persist_lockout(&auth);
-                    if auth.user_pin_locked {
-                        tracing::warn!("user PIN locked after {} failed attempts", failures);
-                        return Err(HsmError::PinLocked);
-                    }
-                    tracing::warn!("user login failed (attempt {})", failures);
-                    return Err(HsmError::PinIncorrect);
-                }
-
-                auth.failed_user_logins = 0;
-                auth.user_next_allowed = None;
-                self.persist_lockout(&auth);
+                self.check_user_pin(&mut auth, pin)?;
                 auth.login = LoginState::UserLoggedIn;
                 tracing::info!("user login succeeded");
             }
