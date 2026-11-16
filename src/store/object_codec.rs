@@ -209,6 +209,7 @@ pub(crate) fn decode(data: &[u8]) -> HsmResult<StoredObject> {
         end_date,
         lifecycle_state,
         creation_time,
+        session_handle: None,
     })
 }
 

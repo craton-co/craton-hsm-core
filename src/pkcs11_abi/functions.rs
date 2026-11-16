@@ -212,6 +212,20 @@ fn err_to_rv(e: HsmError) -> CK_RV {
 /// Best-effort recovery of a stored key's size in bits, used by the FIPS
 /// approved-services key-size enforcement.  Returns None when the object's
 /// size is not encoded in a directly usable form (e.g. raw EC private keys).
+/// Record the creating session on an object inserted by `C_*` so that a
+/// session object dies with its session (PKCS#11 §5.6.2).
+fn set_creator_session(hsm: &HsmCore, handle: CK_OBJECT_HANDLE, session: CK_SESSION_HANDLE) {
+    if let Ok(obj) = hsm.object_store.get_object(handle) {
+        obj.write().session_handle = Some(session);
+    }
+}
+
+/// PKCS#11 §5.6.2 / §5.6.3: destroy the session objects of every closed session.
+fn destroy_closed_session_objects(hsm: &HsmCore) {
+    hsm.object_store
+        .destroy_session_objects(|h| !hsm.session_manager.is_open(h));
+}
+
 /// PKCS#11 §4.10: an operation on a CKA_ALWAYS_AUTHENTICATE key needs a
 /// C_Login(CKU_CONTEXT_SPECIFIC) after its *Init. Without it, end the matching
 /// operation(s) and return CKR_USER_NOT_LOGGED_IN.
@@ -1299,7 +1313,10 @@ pub extern "C" fn C_CloseSession(session: CK_SESSION_HANDLE) -> CK_RV {
         };
 
         match hsm.session_manager.close_session(session, &token) {
-            Ok(()) => CKR_OK,
+            Ok(()) => {
+                destroy_closed_session_objects(&hsm);
+                CKR_OK
+            }
             Err(e) => err_to_rv(e),
         }
     })
@@ -1320,6 +1337,7 @@ pub extern "C" fn C_CloseAllSessions(slot_id: CK_SLOT_ID) -> CK_RV {
         };
 
         hsm.session_manager.close_all_sessions(slot_id, &token);
+        destroy_closed_session_objects(&hsm);
         CKR_OK
     })
     .unwrap_or(CKR_GENERAL_ERROR)
@@ -1612,6 +1630,7 @@ pub extern "C" fn C_CreateObject(
 
         match hsm.object_store.create_object(&template) {
             Ok(handle) => {
+                set_creator_session(&hsm, handle, session);
                 let _ = hsm.audit_log.record(
                     session as u64,
                     AuditOperation::CreateObject,
@@ -3665,6 +3684,7 @@ pub extern "C" fn C_GenerateKey(
             }
         }
 
+        obj.session_handle = Some(session);
         if let Err(e) = hsm.object_store.insert_object(obj) {
             return err_to_rv(e);
         }
@@ -3782,6 +3802,8 @@ pub extern "C" fn C_GenerateKeyPair(
             Ok(r) => r,
             Err(rv) => return rv,
         };
+        set_creator_session(&hsm, pub_handle, session);
+        set_creator_session(&hsm, priv_handle, session);
 
         let _ = hsm.audit_log.record(
             session as u64,
@@ -4896,6 +4918,7 @@ pub extern "C" fn C_CopyObject(
             }
         }
 
+        new_obj.session_handle = Some(session);
         // Insert the new object
         let result_handle = match hsm.object_store.insert_object(new_obj) {
             Ok(h) => h,
@@ -7820,6 +7843,7 @@ pub extern "C" fn C_UnwrapKey(
             }
         }
 
+        obj.session_handle = Some(session);
         if let Err(e) = hsm.object_store.insert_object(obj) {
             return err_to_rv(e);
         }
@@ -8036,6 +8060,7 @@ pub extern "C" fn C_DeriveKey(
             }
         }
 
+        obj.session_handle = Some(session);
         if let Err(e) = hsm.object_store.insert_object(obj) {
             return err_to_rv(e);
         }

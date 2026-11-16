@@ -472,6 +472,15 @@ impl ObjectStore {
         }
     }
 
+    /// Destroy the session objects whose creating session `is_closed`
+    /// (PKCS#11 §5.6.2). Dropping the object zeroizes its key material.
+    pub fn destroy_session_objects(&self, is_closed: impl Fn(CK_SESSION_HANDLE) -> bool) {
+        self.objects.retain(|_, obj| {
+            let o = obj.read();
+            o.token_object || !o.session_handle.is_some_and(&is_closed)
+        });
+    }
+
     /// Get an object by handle
     pub fn get_object(&self, handle: CK_OBJECT_HANDLE) -> HsmResult<Arc<RwLock<StoredObject>>> {
         self.objects
