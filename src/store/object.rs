@@ -98,6 +98,10 @@ pub struct StoredObject {
 
     /// Creation time (Unix epoch seconds)
     pub creation_time: u64,
+
+    /// Session that created this object. A session object (CKA_TOKEN=false)
+    /// is destroyed when that session closes (PKCS#11 §5.6.2). Not persisted.
+    pub session_handle: Option<CK_SESSION_HANDLE>,
 }
 
 impl Drop for StoredObject {
@@ -181,6 +185,7 @@ impl StoredObject {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
+            session_handle: None,
         }
     }
 

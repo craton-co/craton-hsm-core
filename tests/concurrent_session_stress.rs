@@ -324,7 +324,7 @@ fn test_concurrent_encrypt_different_sessions() {
         &mut key,
     );
     assert_eq!(rv, CKR_OK);
-    let _ = C_CloseSession(setup_session);
+    // `key` is a session object: keep its session open while the threads use it.
 
     let num_threads = 5;
     let barrier = Arc::new(Barrier::new(num_threads));
@@ -393,6 +393,7 @@ fn test_concurrent_encrypt_different_sessions() {
         .into_iter()
         .map(|h| if h.join().unwrap() { 1 } else { 0 })
         .sum();
+    let _ = C_CloseSession(setup_session);
 
     // At least some threads should succeed
     assert!(

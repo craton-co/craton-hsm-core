@@ -444,6 +444,10 @@ impl SessionManager {
         Ok(())
     }
 
+    pub fn is_open(&self, handle: CK_SESSION_HANDLE) -> bool {
+        self.sessions.contains_key(&handle)
+    }
+
     pub fn has_ro_sessions(&self, slot_id: CK_SLOT_ID) -> bool {
         self.sessions.iter().any(|entry| {
             let s = entry.value().read();

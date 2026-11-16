@@ -384,6 +384,7 @@ job_test_shard2() {
         --test pkcs11_error_paths \
         --test pkcs11_info_functions \
         --test random_and_session \
+        --test session_objects_abi \
         --test session_state_machine \
         --test supplementary_functions \
         --test token_state_persistence \
