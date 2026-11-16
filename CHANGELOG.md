@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-11-16
+
+### Fixed
+
+- **CKA_ALWAYS_AUTHENTICATE**: The attribute is now stored on private keys and enforced.
+  Sign, sign-recover and decrypt operations on such a key need `C_Login(CKU_CONTEXT_SPECIFIC)`
+  after the `*Init`, else they fail with `CKR_USER_NOT_LOGGED_IN`. `CKU_CONTEXT_SPECIFIC` with
+  no such operation returns `CKR_OPERATION_NOT_INITIALIZED`. Unwrap and derive with such a key
+  return `CKR_USER_NOT_LOGGED_IN`, since they have no `*Init` to re-authenticate after.
+- **Session objects**: Objects with `CKA_TOKEN = CK_FALSE` are now destroyed, and their key
+  material zeroized, when the session that created them is closed by `C_CloseSession` or
+  `C_CloseAllSessions` (PKCS#11 §5.6.2).
+
 ## [0.11.0] - 2026-11-09
 
 ### Added
