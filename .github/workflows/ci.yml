@@ -132,6 +132,7 @@ jobs:
       - name: Run PKCS#11 compliance & conformance tests
         run: >-
           cargo test
+          --test always_authenticate_abi
           --test attribute_management
           --test attribute_validation
           --test digest_abi

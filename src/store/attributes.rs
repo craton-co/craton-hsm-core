@@ -911,6 +911,9 @@ pub fn read_attribute(
         CKA_VALUE_LEN => Ok(obj.value_len.map(ck_ulong_to_bytes)),
         CKA_START_DATE => Ok(obj.start_date.map(|d| d.to_vec())),
         CKA_END_DATE => Ok(obj.end_date.map(|d| d.to_vec())),
+        CKA_ALWAYS_AUTHENTICATE if obj.class == CKO_PRIVATE_KEY => {
+            Ok(Some(vec![obj.always_authenticate() as u8]))
+        }
         t if crate::store::object::SENSITIVE_COMPONENT_ATTRIBUTES.contains(&t) => {
             if obj.class == CKO_PRIVATE_KEY {
                 if obj.sensitive || !obj.extractable {

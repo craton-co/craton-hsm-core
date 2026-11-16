@@ -371,6 +371,7 @@ job_test_shard2() {
 
     echo -e "\n${BOLD}  Shard 2: PKCS#11 ABI — compliance${NC}"
     if cargo test \
+        --test always_authenticate_abi \
         --test attribute_management \
         --test attribute_validation \
         --test digest_abi \
