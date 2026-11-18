@@ -503,7 +503,7 @@ impl CryptoBackend for AwsLcBackend {
         let signing_key =
             SigningKey::from_slice(private_key_bytes).map_err(|_| HsmError::KeyHandleInvalid)?;
         let signature: p521::ecdsa::Signature = signing_key
-            .sign_prehash(digest)
+            .sign_prehash(&crate::crypto::sign::p521_field_digest(digest))
             .map_err(|_| HsmError::DataLenRange)?;
         // PKCS#11 §2.3.1: ECDSA signature format is raw r || s (fixed-size, no ASN.1 DER).
         // P-521: 132 bytes (66-byte r + 66-byte s).
@@ -528,7 +528,9 @@ impl CryptoBackend for AwsLcBackend {
             .map_err(|_| HsmError::KeyHandleInvalid)?;
         let sig = p521::ecdsa::Signature::from_slice(signature)
             .map_err(|_| HsmError::SignatureInvalid)?;
-        Ok(verifying_key.verify_prehash(digest, &sig).is_ok())
+        Ok(verifying_key
+            .verify_prehash(&crate::crypto::sign::p521_field_digest(digest), &sig)
+            .is_ok())
     }
 
     // ========================================================================
