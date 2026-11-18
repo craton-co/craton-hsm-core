@@ -1569,6 +1569,20 @@ pub(crate) fn ecdsa_p384_verify_prehashed(
     Ok(verifying_key.verify_prehash(digest, &sig).is_ok())
 }
 
+/// Left-pads a digest shorter than P-521's 66-byte field with zeros.
+/// ecdsa's bits2field rejects inputs under half the field size (so SHA-256 on
+/// P-521); for a hash shorter than the order, the padded value is the same
+/// integer as the FIPS 186-5 §6.4.1 conversion, so signatures interoperate.
+pub(crate) fn p521_field_digest(digest: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    const FIELD_LEN: usize = 66;
+    if digest.len() >= FIELD_LEN {
+        return std::borrow::Cow::Borrowed(digest);
+    }
+    let mut padded = vec![0u8; FIELD_LEN];
+    padded[FIELD_LEN - digest.len()..].copy_from_slice(digest);
+    std::borrow::Cow::Owned(padded)
+}
+
 /// ECDSA P-521 sign with a pre-computed digest (hedged).
 pub(crate) fn ecdsa_p521_sign_prehashed(
     private_key_bytes: &[u8],
@@ -1583,7 +1597,7 @@ pub(crate) fn ecdsa_p521_sign_prehashed(
         SigningKey::from_slice(private_key_bytes).map_err(|_| HsmError::KeyHandleInvalid)?;
     let mut rng = DrbgRng::new()?;
     let signature: p521::ecdsa::Signature = signing_key
-        .sign_prehash_with_rng(&mut rng, digest)
+        .sign_prehash_with_rng(&mut rng, &p521_field_digest(digest))
         .map_err(|_| HsmError::DataLenRange)?;
     // PKCS#11 §2.3.1: ECDSA signature format is raw r || s (fixed-size, no ASN.1 DER).
     // P-521: 132 bytes (66-byte r + 66-byte s).
@@ -1600,9 +1614,6 @@ pub(crate) fn ecdsa_p521_verify_prehashed(
     use p521::ecdsa::signature::hazmat::PrehashVerifier;
     use p521::ecdsa::VerifyingKey;
 
-    if digest.len() < 24 {
-        return Err(HsmError::DataLenRange);
-    }
     // PKCS#11 §2.3.1: ECDSA signature format is raw r || s (fixed-size, no ASN.1 DER).
     // P-521: exactly 132 bytes (66-byte r + 66-byte s).
     if signature.len() != 132 {
@@ -1612,7 +1623,9 @@ pub(crate) fn ecdsa_p521_verify_prehashed(
         VerifyingKey::from_sec1_bytes(public_key_sec1).map_err(|_| HsmError::KeyHandleInvalid)?;
     let sig =
         p521::ecdsa::Signature::from_slice(signature).map_err(|_| HsmError::SignatureInvalid)?;
-    Ok(verifying_key.verify_prehash(digest, &sig).is_ok())
+    Ok(verifying_key
+        .verify_prehash(&p521_field_digest(digest), &sig)
+        .is_ok())
 }
 
 // ============================================================================
@@ -2046,5 +2059,27 @@ mod tests {
         let mut bad_sig = sig.clone();
         bad_sig[10] ^= 0x55;
         assert!(rsa_pkcs1v15_verify_recover(&modulus, &pub_exp, &bad_sig).is_err());
+    }
+
+    #[test]
+    fn ecdsa_p521_prehashed_accepts_digests_shorter_than_half_the_field() {
+        use sha2::Digest;
+        let sk = p521::ecdsa::SigningKey::from_slice(&[0x01; 66]).unwrap();
+        let pk = p521::ecdsa::VerifyingKey::from(&sk).to_encoded_point(false);
+        for digest in [
+            sha2::Sha256::digest(b"msg").to_vec(),
+            sha2::Sha384::digest(b"msg").to_vec(),
+            sha2::Sha512::digest(b"msg").to_vec(),
+        ] {
+            let sig = ecdsa_p521_sign_prehashed(&[0x01; 66], &digest).expect("sign");
+            assert_eq!(sig.len(), 132);
+            assert!(ecdsa_p521_verify_prehashed(pk.as_bytes(), &digest, &sig).unwrap());
+            let mut other = digest.clone();
+            other[0] ^= 1;
+            assert!(!ecdsa_p521_verify_prehashed(pk.as_bytes(), &other, &sig).unwrap());
+        }
+        // Long digests are passed through unchanged.
+        assert_eq!(p521_field_digest(&[7; 66]).len(), 66);
+        assert_eq!(p521_field_digest(&[7; 32])[..34], [0; 34]);
     }
 }
