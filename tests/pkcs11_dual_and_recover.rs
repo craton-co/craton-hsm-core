@@ -449,7 +449,17 @@ fn test_decrypt_digest_update_dual() {
         &mut dec_len,
     );
     assert_eq!(rv, CKR_OK);
-    assert_eq!(&decrypted[..dec_len as usize], plaintext);
+    // CBC-PAD holds back the last (padding) block until C_DecryptFinal.
+    assert_eq!(&decrypted[..dec_len as usize], &plaintext[..64]);
+
+    // Per PKCS#11, the part returned by C_DecryptFinal is digested by the caller.
+    let mut last = vec![0u8; 32];
+    let mut last_len: CK_ULONG = 32;
+    let rv = C_DecryptFinal(session, last.as_mut_ptr(), &mut last_len);
+    assert_eq!(rv, CKR_OK);
+    assert_eq!(&last[..last_len as usize], &plaintext[64..]);
+    let rv = C_DigestUpdate(session, last.as_mut_ptr(), last_len);
+    assert_eq!(rv, CKR_OK);
 
     // Finalize digest
     let mut digest = vec![0u8; 32];
@@ -627,7 +637,17 @@ fn test_decrypt_verify_update_dual() {
         &mut dec_len,
     );
     assert_eq!(rv, CKR_OK);
-    assert_eq!(&decrypted[..dec_len as usize], msg);
+    // CBC-PAD holds back the last (padding) block until C_DecryptFinal.
+    assert_eq!(&decrypted[..dec_len as usize], &msg[..32]);
+
+    // Per PKCS#11, the part returned by C_DecryptFinal is verified by the caller.
+    let mut last = vec![0u8; 32];
+    let mut last_len: CK_ULONG = 32;
+    let rv = C_DecryptFinal(session, last.as_mut_ptr(), &mut last_len);
+    assert_eq!(rv, CKR_OK);
+    assert_eq!(&last[..last_len as usize], &msg[32..]);
+    let rv = C_VerifyUpdate(session, last.as_mut_ptr(), last_len);
+    assert_eq!(rv, CKR_OK);
 
     // Verify Final
     let rv = C_VerifyFinal(session, signature.as_mut_ptr(), sig_len);
@@ -840,7 +860,7 @@ fn test_decrypt_digest_update_multipart_cbc_pad() {
     let rv = C_DigestInit(session, &mut digest_mech);
     assert_eq!(rv, CKR_OK);
 
-    // Chunk 1 (16 bytes intermediate)
+    // Chunk 1: held back, it might be the final (padding) block
     let mut part1 = vec![0u8; 32];
     let mut part1_len: CK_ULONG = 32;
     let rv = C_DecryptDigestUpdate(
@@ -851,9 +871,9 @@ fn test_decrypt_digest_update_multipart_cbc_pad() {
         &mut part1_len,
     );
     assert_eq!(rv, CKR_OK);
-    assert_eq!(&part1[..part1_len as usize], &plaintext[..16]);
+    assert_eq!(part1_len, 0);
 
-    // Chunk 2 (16 bytes intermediate)
+    // Chunk 2 releases block 1
     let mut part2 = vec![0u8; 32];
     let mut part2_len: CK_ULONG = 32;
     let rv = C_DecryptDigestUpdate(
@@ -864,9 +884,9 @@ fn test_decrypt_digest_update_multipart_cbc_pad() {
         &mut part2_len,
     );
     assert_eq!(rv, CKR_OK);
-    assert_eq!(&part2[..part2_len as usize], &plaintext[16..32]);
+    assert_eq!(&part2[..part2_len as usize], &plaintext[..16]);
 
-    // Chunk 3 (16 bytes padding block)
+    // Chunk 3 (padding block) releases block 2
     let mut part3 = vec![0u8; 32];
     let mut part3_len: CK_ULONG = 32;
     let rv = C_DecryptDigestUpdate(
@@ -877,7 +897,14 @@ fn test_decrypt_digest_update_multipart_cbc_pad() {
         &mut part3_len,
     );
     assert_eq!(rv, CKR_OK);
-    assert_eq!(part3_len, 0); // padding removed
+    assert_eq!(&part3[..part3_len as usize], &plaintext[16..32]);
+
+    // Final unpads the held-back padding block: nothing left
+    let mut last = vec![0u8; 32];
+    let mut last_len: CK_ULONG = 32;
+    let rv = C_DecryptFinal(session, last.as_mut_ptr(), &mut last_len);
+    assert_eq!(rv, CKR_OK);
+    assert_eq!(last_len, 0);
 
     let mut digest = vec![0u8; 32];
     let mut digest_len: CK_ULONG = 32;
@@ -886,6 +913,114 @@ fn test_decrypt_digest_update_multipart_cbc_pad() {
 
     let expected_digest = Sha256::digest(plaintext);
     assert_eq!(digest.as_slice(), expected_digest.as_slice());
+
+    teardown_session(session);
+}
+
+/// Decrypts `ct` with CKM_AES_CBC_PAD + SHA-256 through C_DecryptDigestUpdate,
+/// split at `splits`, following the PKCS#11 flow (the C_DecryptFinal part is
+/// digested by the caller). Returns (plaintext, digest) or the first error.
+fn cbc_pad_decrypt_digest(
+    session: CK_SESSION_HANDLE,
+    key: CK_OBJECT_HANDLE,
+    iv: &[u8; 16],
+    ct: &[u8],
+    splits: &[usize],
+) -> Result<(Vec<u8>, Vec<u8>), CK_RV> {
+    let mut dec_mech = CK_MECHANISM {
+        mechanism: CKM_AES_CBC_PAD,
+        p_parameter: iv.as_ptr() as *mut _,
+        parameter_len: 16,
+    };
+    let mut digest_mech = CK_MECHANISM {
+        mechanism: CKM_SHA256,
+        p_parameter: ptr::null_mut(),
+        parameter_len: 0,
+    };
+    assert_eq!(C_DecryptInit(session, &mut dec_mech, key), CKR_OK);
+    assert_eq!(C_DigestInit(session, &mut digest_mech), CKR_OK);
+
+    let mut pt = Vec::new();
+    let mut start = 0;
+    for &end in splits.iter().chain(std::iter::once(&ct.len())) {
+        let mut out = vec![0u8; 64];
+        let mut n: CK_ULONG = 64;
+        let rv = C_DecryptDigestUpdate(
+            session,
+            ct[start..end].as_ptr() as CK_BYTE_PTR,
+            (end - start) as CK_ULONG,
+            out.as_mut_ptr(),
+            &mut n,
+        );
+        if rv != CKR_OK {
+            return Err(rv);
+        }
+        pt.extend_from_slice(&out[..n as usize]);
+        start = end;
+    }
+    let mut last = vec![0u8; 32];
+    let mut last_len: CK_ULONG = 32;
+    let rv = C_DecryptFinal(session, last.as_mut_ptr(), &mut last_len);
+    if rv != CKR_OK {
+        return Err(rv);
+    }
+    assert_eq!(C_DigestUpdate(session, last.as_mut_ptr(), last_len), CKR_OK);
+    pt.extend_from_slice(&last[..last_len as usize]);
+    let mut digest = vec![0u8; 32];
+    let mut digest_len: CK_ULONG = 32;
+    assert_eq!(
+        C_DigestFinal(session, digest.as_mut_ptr(), &mut digest_len),
+        CKR_OK
+    );
+    Ok((pt, digest))
+}
+
+#[test]
+fn test_decrypt_digest_update_cbc_pad_keeps_padding_like_middle_bytes() {
+    let session = setup_session();
+    let aes_key = generate_aes_key(session);
+
+    let iv: [u8; 16] = core::array::from_fn(|i| i as u8);
+    // A middle block ending in 0x01 looks like valid padding.
+    let mut plaintext = vec![0xAAu8; 15];
+    plaintext.push(0x01);
+    plaintext.extend_from_slice(&[0xBB; 20]);
+
+    let mut enc_mech = CK_MECHANISM {
+        mechanism: CKM_AES_CBC_PAD,
+        p_parameter: iv.as_ptr() as *mut _,
+        parameter_len: 16,
+    };
+    assert_eq!(C_EncryptInit(session, &mut enc_mech, aes_key), CKR_OK);
+    let mut ct = vec![0u8; 64];
+    let mut ct_len: CK_ULONG = 64;
+    let rv = C_Encrypt(
+        session,
+        plaintext.as_mut_ptr(),
+        plaintext.len() as CK_ULONG,
+        ct.as_mut_ptr(),
+        &mut ct_len,
+    );
+    assert_eq!(rv, CKR_OK);
+    ct.truncate(ct_len as usize);
+    assert_eq!(ct.len(), 48);
+
+    let expected = Sha256::digest(&plaintext);
+    // Whole-block parts, and parts split off block boundaries.
+    for splits in [&[16usize, 32][..], &[5, 25], &[1, 17, 47]] {
+        let (pt, digest) = cbc_pad_decrypt_digest(session, aes_key, &iv, &ct, splits)
+            .unwrap_or_else(|rv| panic!("splits {splits:?}: rv {rv:#x}"));
+        assert_eq!(pt, plaintext, "splits {splits:?}");
+        assert_eq!(digest.as_slice(), expected.as_slice(), "splits {splits:?}");
+    }
+
+    // Bad padding on the real last block must be rejected at C_DecryptFinal.
+    let mut tampered = ct.clone();
+    tampered[31] ^= 0x20; // last plaintext byte 0x0C -> 0x2C
+    assert_eq!(
+        cbc_pad_decrypt_digest(session, aes_key, &iv, &tampered, &[16, 32]),
+        Err(CKR_ENCRYPTED_DATA_INVALID)
+    );
 
     teardown_session(session);
 }

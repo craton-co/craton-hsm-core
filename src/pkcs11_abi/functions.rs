@@ -4986,6 +4986,37 @@ fn encrypt_mechanism_supports_multipart(mechanism: CK_MECHANISM_TYPE) -> bool {
     matches!(mechanism, CKM_AES_CBC | CKM_AES_CBC_PAD | CKM_AES_CTR)
 }
 
+/// Multi-part CBC-PAD decrypt: joins the bytes held back by earlier parts
+/// with `part` and splits off the last 1..=16 bytes, which may hold the
+/// padding block and are left for C_DecryptFinal to decrypt and unpad.
+/// Returns (whole blocks to decrypt now, bytes to keep).
+fn cbc_pad_split_held_back(held: &[u8], part: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let mut all = Vec::with_capacity(held.len() + part.len());
+    all.extend_from_slice(held);
+    all.extend_from_slice(part);
+    let keep = all.split_off(all.len().saturating_sub(1) / 16 * 16);
+    (all, keep)
+}
+
+/// CBC-PAD part of C_DecryptDigestUpdate / C_DecryptVerifyUpdate: decrypts the
+/// whole blocks that are safely before the end, without unpadding. Returns the
+/// plaintext, the bytes to hold back, and the next IV (None if nothing was
+/// decrypted).
+fn cbc_pad_decrypt_part(
+    backend: &dyn CryptoBackend,
+    key: &[u8],
+    iv: &[u8],
+    held: &[u8],
+    part: &[u8],
+) -> HsmResult<(Vec<u8>, Vec<u8>, Option<Vec<u8>>)> {
+    let (now, keep) = cbc_pad_split_held_back(held, part);
+    if now.is_empty() {
+        return Ok((Vec::new(), keep, None));
+    }
+    let pt = backend.aes_cbc_decrypt_unpadded(key, iv, &now)?;
+    Ok((pt, keep, Some(now[now.len() - 16..].to_vec())))
+}
+
 #[no_mangle]
 pub extern "C" fn C_EncryptUpdate(
     session: CK_SESSION_HANDLE,
@@ -6971,8 +7002,13 @@ pub extern "C" fn C_DecryptDigestUpdate(
         }
 
         if p_part.is_null() {
+            // Upper bound: CBC-PAD may also release bytes held back by earlier parts.
+            let held_len = match &sess.active_operation {
+                Some(ActiveOperation::Decrypt { data, .. }) => data.len() as CK_ULONG,
+                _ => 0,
+            };
             unsafe {
-                *pul_part_len = encrypted_part_len;
+                *pul_part_len = encrypted_part_len.saturating_add(held_len);
             }
             return CKR_OK;
         }
@@ -6988,17 +7024,19 @@ pub extern "C" fn C_DecryptDigestUpdate(
             return CKR_DATA_LEN_RANGE;
         }
 
-        let (mechanism, key_handle, mech_param, cached_object) = match &sess.active_operation {
+        let (mechanism, key_handle, mech_param, held, cached_object) = match &sess.active_operation
+        {
             Some(ActiveOperation::Decrypt {
                 mechanism,
                 key_handle,
                 mechanism_param,
+                data,
                 cached_object,
-                ..
             }) => (
                 *mechanism,
                 *key_handle,
                 mechanism_param.clone(),
+                data.clone(),
                 cached_object.clone(),
             ),
             _ => return CKR_OPERATION_NOT_INITIALIZED,
@@ -7026,29 +7064,25 @@ pub extern "C" fn C_DecryptDigestUpdate(
             }
         };
 
+        let mut cbc_pad_next: Option<(Vec<u8>, Option<Vec<u8>>)> = None;
         let decrypted = match mechanism {
             CKM_AES_CBC => {
                 hsm.crypto_backend
                     .aes_cbc_decrypt_unpadded(key_bytes, &mech_param, enc_part)
             }
-            CKM_AES_CBC_PAD => {
-                match hsm
-                    .crypto_backend
-                    .aes_cbc_decrypt(key_bytes, &mech_param, enc_part)
-                {
-                    Ok(pt) => Ok(pt),
-                    Err(crate::error::HsmError::EncryptedDataInvalid)
-                        if enc_part.len() % 16 == 0 =>
-                    {
-                        hsm.crypto_backend.aes_cbc_decrypt_unpadded(
-                            key_bytes,
-                            &mech_param,
-                            enc_part,
-                        )
-                    }
-                    Err(e) => Err(e),
-                }
-            }
+            // Padding exists only at the end of the whole message: hold back the
+            // last block for C_DecryptFinal instead of unpadding every part.
+            CKM_AES_CBC_PAD => cbc_pad_decrypt_part(
+                &*hsm.crypto_backend,
+                key_bytes,
+                &mech_param,
+                &held,
+                enc_part,
+            )
+            .map(|(pt, keep, iv)| {
+                cbc_pad_next = Some((keep, iv));
+                pt
+            }),
             CKM_AES_CTR => hsm
                 .crypto_backend
                 .aes_ctr_decrypt(key_bytes, &mech_param, enc_part),
@@ -7083,11 +7117,23 @@ pub extern "C" fn C_DecryptDigestUpdate(
         }
 
         if let Some(ActiveOperation::Decrypt {
-            mechanism_param, ..
+            mechanism_param,
+            data,
+            ..
         }) = &mut sess.active_operation
         {
             match mechanism {
-                CKM_AES_CBC | CKM_AES_CBC_PAD => {
+                CKM_AES_CBC_PAD => {
+                    if let Some((keep, iv)) = cbc_pad_next {
+                        if let Some(iv) = iv {
+                            mechanism_param.clear();
+                            mechanism_param.extend_from_slice(&iv);
+                        }
+                        data.clear();
+                        data.extend_from_slice(&keep);
+                    }
+                }
+                CKM_AES_CBC => {
                     if enc_part.len() >= 16 {
                         mechanism_param.clear();
                         mechanism_param.extend_from_slice(&enc_part[enc_part.len() - 16..]);
@@ -7276,8 +7322,13 @@ pub extern "C" fn C_DecryptVerifyUpdate(
         }
 
         if p_part.is_null() {
+            // Upper bound: CBC-PAD may also release bytes held back by earlier parts.
+            let held_len = match &sess.active_operation {
+                Some(ActiveOperation::Decrypt { data, .. }) => data.len() as CK_ULONG,
+                _ => 0,
+            };
             unsafe {
-                *pul_part_len = encrypted_part_len;
+                *pul_part_len = encrypted_part_len.saturating_add(held_len);
             }
             return CKR_OK;
         }
@@ -7293,17 +7344,19 @@ pub extern "C" fn C_DecryptVerifyUpdate(
             return CKR_DATA_LEN_RANGE;
         }
 
-        let (mechanism, key_handle, mech_param, cached_object) = match &sess.active_operation {
+        let (mechanism, key_handle, mech_param, held, cached_object) = match &sess.active_operation
+        {
             Some(ActiveOperation::Decrypt {
                 mechanism,
                 key_handle,
                 mechanism_param,
+                data,
                 cached_object,
-                ..
             }) => (
                 *mechanism,
                 *key_handle,
                 mechanism_param.clone(),
+                data.clone(),
                 cached_object.clone(),
             ),
             _ => return CKR_OPERATION_NOT_INITIALIZED,
@@ -7331,29 +7384,25 @@ pub extern "C" fn C_DecryptVerifyUpdate(
             }
         };
 
+        let mut cbc_pad_next: Option<(Vec<u8>, Option<Vec<u8>>)> = None;
         let decrypted = match mechanism {
             CKM_AES_CBC => {
                 hsm.crypto_backend
                     .aes_cbc_decrypt_unpadded(key_bytes, &mech_param, enc_part)
             }
-            CKM_AES_CBC_PAD => {
-                match hsm
-                    .crypto_backend
-                    .aes_cbc_decrypt(key_bytes, &mech_param, enc_part)
-                {
-                    Ok(pt) => Ok(pt),
-                    Err(crate::error::HsmError::EncryptedDataInvalid)
-                        if enc_part.len() % 16 == 0 =>
-                    {
-                        hsm.crypto_backend.aes_cbc_decrypt_unpadded(
-                            key_bytes,
-                            &mech_param,
-                            enc_part,
-                        )
-                    }
-                    Err(e) => Err(e),
-                }
-            }
+            // Padding exists only at the end of the whole message: hold back the
+            // last block for C_DecryptFinal instead of unpadding every part.
+            CKM_AES_CBC_PAD => cbc_pad_decrypt_part(
+                &*hsm.crypto_backend,
+                key_bytes,
+                &mech_param,
+                &held,
+                enc_part,
+            )
+            .map(|(pt, keep, iv)| {
+                cbc_pad_next = Some((keep, iv));
+                pt
+            }),
             CKM_AES_CTR => hsm
                 .crypto_backend
                 .aes_ctr_decrypt(key_bytes, &mech_param, enc_part),
@@ -7388,11 +7437,23 @@ pub extern "C" fn C_DecryptVerifyUpdate(
         }
 
         if let Some(ActiveOperation::Decrypt {
-            mechanism_param, ..
+            mechanism_param,
+            data,
+            ..
         }) = &mut sess.active_operation
         {
             match mechanism {
-                CKM_AES_CBC | CKM_AES_CBC_PAD => {
+                CKM_AES_CBC_PAD => {
+                    if let Some((keep, iv)) = cbc_pad_next {
+                        if let Some(iv) = iv {
+                            mechanism_param.clear();
+                            mechanism_param.extend_from_slice(&iv);
+                        }
+                        data.clear();
+                        data.extend_from_slice(&keep);
+                    }
+                }
+                CKM_AES_CBC => {
                     if enc_part.len() >= 16 {
                         mechanism_param.clear();
                         mechanism_param.extend_from_slice(&enc_part[enc_part.len() - 16..]);
