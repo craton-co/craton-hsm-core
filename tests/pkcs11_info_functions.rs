@@ -252,9 +252,9 @@ fn test_get_mechanism_list_count() {
 // =============================================================================
 // 12. C_GetMechanismList — contains CKM_SHA256_RSA_PKCS, CKM_AES_GCM, CKM_SHA256
 //
-// Note: raw CKM_RSA_PKCS is intentionally NOT advertised (the signer requires
-// a hash alg / DigestInfo prefix), so callers must use the CKM_SHAxxx_RSA_PKCS
-// hash-prefixed variants. Verify the prefixed variant is present instead.
+// Note: raw CKM_RSA_PKCS is advertised with only CKF_SIGN_RECOVER /
+// CKF_VERIFY_RECOVER: C_Sign needs a hash alg, so callers use the
+// CKM_SHAxxx_RSA_PKCS variants for plain signing.
 // =============================================================================
 #[test]
 fn test_get_mechanism_list_contents() {
@@ -268,9 +268,14 @@ fn test_get_mechanism_list_contents() {
     assert_eq!(rv, CKR_OK);
 
     assert!(
-        !mechs.contains(&CKM_RSA_PKCS),
-        "Mechanism list must NOT contain raw CKM_RSA_PKCS (unsupported)"
+        mechs.contains(&CKM_RSA_PKCS),
+        "Mechanism list must contain raw CKM_RSA_PKCS (sign/verify recover)"
     );
+    let mut info: CK_MECHANISM_INFO = unsafe { std::mem::zeroed() };
+    assert_eq!(C_GetMechanismInfo(0, CKM_RSA_PKCS, &mut info), CKR_OK);
+    let (flags, min, max) = (info.flags, info.min_key_size, info.max_key_size);
+    assert_eq!(flags, CKF_SIGN_RECOVER_FLAG | CKF_VERIFY_RECOVER_FLAG);
+    assert_eq!((min, max), (2048, 4096));
     assert!(
         mechs.contains(&CKM_SHA256_RSA_PKCS),
         "Mechanism list should contain CKM_SHA256_RSA_PKCS"
@@ -286,18 +291,21 @@ fn test_get_mechanism_list_contents() {
 }
 
 // =============================================================================
-// 13. C_GetMechanismInfo — raw CKM_RSA_PKCS is unsupported (returns
-// CKR_MECHANISM_INVALID). The hash-prefixed CKM_SHA256_RSA_PKCS variant
-// advertises SIGN|VERIFY flags instead.
+// 13. C_GetMechanismInfo — raw CKM_RSA_PKCS advertises only SIGN_RECOVER |
+// VERIFY_RECOVER (without CKF_SIGN/CKF_VERIFY, since C_Sign requires a
+// hash-prefixed CKM_SHAxxx_RSA_PKCS variant).
 // =============================================================================
 #[test]
 fn test_get_mechanism_info_rsa_pkcs() {
     ensure_init();
     let mut mech_info: CK_MECHANISM_INFO = unsafe { std::mem::zeroed() };
     let rv = C_GetMechanismInfo(0, CKM_RSA_PKCS, &mut mech_info);
+    assert_eq!(rv, CKR_OK);
+    let flags = mech_info.flags;
     assert_eq!(
-        rv, CKR_MECHANISM_INVALID,
-        "Raw CKM_RSA_PKCS must report CKR_MECHANISM_INVALID (signer needs a hash alg)"
+        flags,
+        CKF_SIGN_RECOVER_FLAG | CKF_VERIFY_RECOVER_FLAG,
+        "Raw CKM_RSA_PKCS should advertise only SIGN_RECOVER | VERIFY_RECOVER"
     );
 
     let mut mech_info: CK_MECHANISM_INFO = unsafe { std::mem::zeroed() };

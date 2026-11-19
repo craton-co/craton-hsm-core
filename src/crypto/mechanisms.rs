@@ -106,8 +106,9 @@ pub fn supported_mechanisms() -> Vec<CK_MECHANISM_TYPE> {
     vec![
         // RSA
         CKM_RSA_PKCS_KEY_PAIR_GEN,
-        // Note: raw CKM_RSA_PKCS is intentionally not advertised — the signer
-        // requires a hash alg, so callers must use CKM_SHAxxx_RSA_PKCS variants.
+        // Raw CKM_RSA_PKCS is advertised for C_SignRecover / C_VerifyRecover
+        // only; C_Sign needs a hash alg, so use the CKM_SHAxxx_RSA_PKCS variants.
+        CKM_RSA_PKCS,
         CKM_SHA256_RSA_PKCS,
         CKM_SHA384_RSA_PKCS,
         CKM_SHA512_RSA_PKCS,
