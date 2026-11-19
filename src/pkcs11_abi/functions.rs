@@ -1122,8 +1122,13 @@ pub extern "C" fn C_GetMechanismInfo(
                 max_key_size: 4096 as CK_ULONG,
                 flags: CKF_GENERATE_KEY_PAIR_FLAG,
             },
-            // Note: raw CKM_RSA_PKCS is intentionally not advertised — the signer
-            // requires a hash alg, so callers must use CKM_SHAxxx_RSA_PKCS variants.
+            // Raw CKM_RSA_PKCS works only with the recover calls: without CKF_SIGN,
+            // applications stay off C_Sign, which needs a hash alg.
+            CKM_RSA_PKCS => CK_MECHANISM_INFO {
+                min_key_size: 2048 as CK_ULONG,
+                max_key_size: 4096 as CK_ULONG,
+                flags: CKF_SIGN_RECOVER_FLAG | CKF_VERIFY_RECOVER_FLAG,
+            },
             CKM_SHA256_RSA_PKCS | CKM_SHA384_RSA_PKCS | CKM_SHA512_RSA_PKCS => CK_MECHANISM_INFO {
                 min_key_size: 2048 as CK_ULONG,
                 max_key_size: 4096 as CK_ULONG,
