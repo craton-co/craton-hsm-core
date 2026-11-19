@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.2] - 2026-11-18
+
+### Fixed
+
+- **CKM_AES_CBC_PAD dual-function decryption**: `C_DecryptDigestUpdate` and
+  `C_DecryptVerifyUpdate` now decrypt only whole blocks safely before the end
+  without unpadding, holding back the trailing 1..=16 bytes for `C_DecryptFinal`
+  to unpad once (and reject bad padding with `CKR_ENCRYPTED_DATA_INVALID`), and
+  accepting parts split off 16-byte block boundaries.
+- **P-521 ECDSA with shorter digests**: Left-pad digests shorter than the
+  66-byte P-521 field (such as SHA-256, SHA-224, and SHA-1) with zeros before
+  `sign_prehash` / `verify_prehash` in both the RustCrypto and AWS-LC backends.
+- **CKM_RSA_PKCS mechanism discovery**: Advertise raw `CKM_RSA_PKCS` in
+  `C_GetMechanismList` and `C_GetMechanismInfo` with
+  `CKF_SIGN_RECOVER | CKF_VERIFY_RECOVER` (2048–4096 bits, without `CKF_SIGN`).
+
 ## [0.11.1] - 2026-11-16
 
 ### Fixed
