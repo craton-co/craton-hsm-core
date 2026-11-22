@@ -274,6 +274,50 @@ fn test_ml_dsa_87_pkcs11_provider_flow() {
     assert!(vk.verify(message, &sig).is_ok());
 }
 
+/// pkcs11-tool --write-object: an imported ML-DSA private key holds only the
+/// seed, so CKA_PARAMETER_SET comes from the creation template.
+#[test]
+fn test_imported_ml_dsa_private_key_parameter_set() {
+    let session = setup_user_session();
+    let seed = [7u8; 32];
+    let template: Vec<(CK_ULONG, Vec<u8>)> = vec![
+        (CKA_CLASS, ck_ulong_bytes(CKO_PRIVATE_KEY)),
+        (CKA_KEY_TYPE, ck_ulong_bytes(CKK_ML_DSA)),
+        (CKA_PARAMETER_SET, ck_ulong_bytes(CKP_ML_DSA_65)),
+        (CKA_SIGN, vec![1]),
+        (CKA_VALUE, seed.to_vec()),
+    ];
+    let mut attrs: Vec<CK_ATTRIBUTE> = template
+        .iter()
+        .map(|(t, v)| CK_ATTRIBUTE {
+            attr_type: *t,
+            p_value: v.as_ptr() as CK_VOID_PTR,
+            value_len: v.len() as CK_ULONG,
+        })
+        .collect();
+    let mut key: CK_OBJECT_HANDLE = 0;
+    assert_eq!(
+        C_CreateObject(
+            session,
+            attrs.as_mut_ptr(),
+            attrs.len() as CK_ULONG,
+            &mut key
+        ),
+        CKR_OK
+    );
+    assert_eq!(read_ulong(session, key, CKA_PARAMETER_SET), CKP_ML_DSA_65);
+
+    let message = b"imported ML-DSA-65";
+    let mut mech = null_mechanism(CKM_ML_DSA);
+    let signature = sign(session, &mut mech, key, message).unwrap();
+    assert_eq!(signature.len(), 3309);
+
+    use ml_dsa::{signature::Verifier, Keypair};
+    let sk = ml_dsa::SigningKey::<ml_dsa::MlDsa65>::from_seed(&seed.into());
+    let sig = ml_dsa::Signature::<ml_dsa::MlDsa65>::try_from(signature.as_slice()).unwrap();
+    assert!(sk.verifying_key().verify(message, &sig).is_ok());
+}
+
 #[test]
 fn test_ml_dsa_find_by_standard_and_legacy_key_type() {
     let session = setup_user_session();

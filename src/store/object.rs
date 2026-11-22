@@ -198,14 +198,19 @@ impl StoredObject {
     /// PKCS#11 v3.2 `CKA_PARAMETER_SET` of a post-quantum key, derived from
     /// the length of its public key (FIPS 203 / 204 / 205). Deriving it keeps
     /// it correct for keys generated before the attribute existed.
+    ///
+    /// A private key imported with C_CreateObject has no public key (and an
+    /// ML-DSA / ML-KEM seed does not tell the parameter set apart), so it
+    /// falls back to the `CKA_PARAMETER_SET` given in the creation template.
     pub fn parameter_set(&self) -> Option<CK_ULONG> {
+        let key_type = self.key_type?;
         let public_key = match (&self.public_key_data, &self.key_material) {
-            (Some(pk), _) => pk.as_slice(),
+            (Some(pk), _) => Some(pk.as_slice()),
             // A public key imported with C_CreateObject keeps CKA_VALUE here.
-            (None, Some(km)) if self.class == CKO_PUBLIC_KEY => km.as_bytes(),
-            _ => return None,
+            (None, Some(km)) if self.class == CKO_PUBLIC_KEY => Some(km.as_bytes()),
+            _ => None,
         };
-        match (self.key_type?, public_key.len()) {
+        let derived = public_key.and_then(|pk| match (key_type, pk.len()) {
             (CKK_ML_DSA, 1312) => Some(CKP_ML_DSA_44),
             (CKK_ML_DSA, 1952) => Some(CKP_ML_DSA_65),
             (CKK_ML_DSA, 2592) => Some(CKP_ML_DSA_87),
@@ -215,7 +220,20 @@ impl StoredObject {
             (CKK_SLH_DSA, 32) => Some(CKP_SLH_DSA_SHA2_128S),
             (CKK_SLH_DSA, 64) => Some(CKP_SLH_DSA_SHA2_256S),
             _ => None,
-        }
+        });
+        derived.or_else(|| {
+            let ps = read_ck_ulong(self.extra_attributes.get(&CKA_PARAMETER_SET)?)?;
+            matches!(
+                (key_type, ps),
+                (CKK_ML_DSA, CKP_ML_DSA_44 | CKP_ML_DSA_65 | CKP_ML_DSA_87)
+                    | (
+                        CKK_ML_KEM,
+                        CKP_ML_KEM_512 | CKP_ML_KEM_768 | CKP_ML_KEM_1024
+                    )
+                    | (CKK_SLH_DSA, CKP_SLH_DSA_SHA2_128S | CKP_SLH_DSA_SHA2_256S)
+            )
+            .then_some(ps)
+        })
     }
 
     /// PKCS#11 §4.10 CKA_ALWAYS_AUTHENTICATE: each use of this private key
