@@ -781,6 +781,10 @@ pub fn apply_attribute(
                 return Err(HsmError::GeneralError);
             }
         }
+        // Set by the token, never by the caller (PKCS#11 §4.9 / §4.10).
+        CKA_LOCAL | CKA_ALWAYS_SENSITIVE | CKA_NEVER_EXTRACTABLE => {
+            return Err(HsmError::AttributeReadOnly);
+        }
         _ => {
             // Limit extra attribute value size and count to prevent resource exhaustion
             if value.len() > 8192 {
@@ -923,6 +927,21 @@ pub fn read_attribute(
         CKA_ALWAYS_AUTHENTICATE if obj.class == CKO_PRIVATE_KEY => {
             Ok(Some(vec![obj.always_authenticate() as u8]))
         }
+        CKA_LOCAL if matches!(obj.class, CKO_PUBLIC_KEY | CKO_PRIVATE_KEY | CKO_SECRET_KEY) => {
+            Ok(Some(flag(obj, attr_type, false)))
+        }
+        CKA_ALWAYS_SENSITIVE | CKA_NEVER_EXTRACTABLE
+            if crate::store::object::is_secret_class(obj.class) =>
+        {
+            Ok(Some(flag(obj, attr_type, false)))
+        }
+        // Defaults match what C_SignRecoverInit / C_VerifyRecoverInit enforce.
+        CKA_SIGN_RECOVER if obj.class == CKO_PRIVATE_KEY => {
+            Ok(Some(flag(obj, attr_type, obj.can_sign)))
+        }
+        CKA_VERIFY_RECOVER if obj.class == CKO_PUBLIC_KEY => {
+            Ok(Some(flag(obj, attr_type, obj.can_verify)))
+        }
         t if crate::store::object::SENSITIVE_COMPONENT_ATTRIBUTES.contains(&t) => {
             if obj.class == CKO_PRIVATE_KEY {
                 if obj.sensitive || !obj.extractable {
@@ -935,6 +954,15 @@ pub fn read_attribute(
         }
         _ => Ok(obj.extra_attributes.get(&attr_type).cloned()),
     }
+}
+
+/// A CK_BBOOL kept in `extra_attributes`, or `default` when absent.
+fn flag(obj: &StoredObject, attr_type: CK_ATTRIBUTE_TYPE, default: bool) -> Vec<u8> {
+    let v = obj
+        .extra_attributes
+        .get(&attr_type)
+        .map_or(default, |v| v.first() == Some(&1));
+    vec![v as u8]
 }
 
 /// Parse a `CK_ULONG` from raw bytes. Returns `None` if the input is

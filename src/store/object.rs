@@ -236,6 +236,19 @@ impl StoredObject {
         })
     }
 
+    /// Record that this key was generated on the token: CKA_LOCAL, and the
+    /// creation-time CKA_ALWAYS_SENSITIVE / CKA_NEVER_EXTRACTABLE. Keys that
+    /// are imported, unwrapped or derived keep the absent (false) values.
+    pub fn mark_generated(&mut self) {
+        self.extra_attributes.insert(CKA_LOCAL, vec![1]);
+        if self.class != CKO_PUBLIC_KEY {
+            self.extra_attributes
+                .insert(CKA_ALWAYS_SENSITIVE, vec![self.sensitive as u8]);
+            self.extra_attributes
+                .insert(CKA_NEVER_EXTRACTABLE, vec![!self.extractable as u8]);
+        }
+    }
+
     /// PKCS#11 §4.10 CKA_ALWAYS_AUTHENTICATE: each use of this private key
     /// needs a C_Login(CKU_CONTEXT_SPECIFIC) after the operation's *Init.
     pub fn always_authenticate(&self) -> bool {

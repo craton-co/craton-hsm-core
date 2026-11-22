@@ -242,7 +242,16 @@ fn test_ml_dsa_87_pkcs11_provider_flow() {
         assert_eq!(read_ulong(session, key, CKA_PARAMETER_SET), CKP_ML_DSA_87);
         read_attribute(session, key, CKA_COPYABLE).unwrap();
         read_attribute(session, key, CKA_TOKEN).unwrap();
+        assert_eq!(read_attribute(session, key, CKA_LOCAL).unwrap(), vec![1]);
     }
+    assert_eq!(
+        read_attribute(session, priv_key, CKA_ALWAYS_SENSITIVE).unwrap(),
+        vec![1]
+    );
+    assert_eq!(
+        read_attribute(session, priv_key, CKA_NEVER_EXTRACTABLE).unwrap(),
+        vec![1]
+    );
 
     // fetch_mldsa_key(): the public key's CKA_VALUE is the FIPS 204 encoding.
     let public_key = read_attribute(session, pub_key, CKA_VALUE).unwrap();
@@ -306,6 +315,14 @@ fn test_imported_ml_dsa_private_key_parameter_set() {
         CKR_OK
     );
     assert_eq!(read_ulong(session, key, CKA_PARAMETER_SET), CKP_ML_DSA_65);
+    // pkcs11-tool reads these back after --write-object.
+    for attr in [CKA_LOCAL, CKA_ALWAYS_SENSITIVE, CKA_NEVER_EXTRACTABLE] {
+        assert_eq!(read_attribute(session, key, attr).unwrap(), vec![0]);
+    }
+    assert_eq!(
+        read_attribute(session, key, CKA_SIGN_RECOVER).unwrap(),
+        vec![1]
+    );
 
     let message = b"imported ML-DSA-65";
     let mut mech = null_mechanism(CKM_ML_DSA);

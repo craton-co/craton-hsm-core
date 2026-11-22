@@ -977,6 +977,7 @@ impl HsmService for HsmServiceImpl {
                     .map_err(hsm_err_to_status)?;
             }
 
+            obj.mark_generated();
             let key_handle = self
                 .hsm
                 .object_store()
@@ -1320,6 +1321,8 @@ impl HsmService for HsmServiceImpl {
                     .map_err(hsm_err_to_status)?;
             }
 
+            pub_obj.mark_generated();
+            priv_obj.mark_generated();
             let pub_h = self
                 .hsm
                 .object_store()

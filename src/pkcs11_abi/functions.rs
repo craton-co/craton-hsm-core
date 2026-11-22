@@ -3690,6 +3690,7 @@ pub extern "C" fn C_GenerateKey(
         }
 
         obj.session_handle = Some(session);
+        obj.mark_generated();
         if let Err(e) = hsm.object_store.insert_object(obj) {
             return err_to_rv(e);
         }
@@ -3911,6 +3912,8 @@ fn generate_rsa_keypair(
     // Insert both halves under one store transaction: one fsync instead of
     // two, and a crash can no longer persist the public key without its
     // private half.
+    pub_obj.mark_generated();
+    priv_obj.mark_generated();
     hsm.object_store
         .insert_objects(vec![pub_obj, priv_obj])
         .map_err(err_to_rv)?;
@@ -4016,6 +4019,8 @@ fn generate_ec_keypair(
     // Insert both halves under one store transaction: one fsync instead of
     // two, and a crash can no longer persist the public key without its
     // private half.
+    pub_obj.mark_generated();
+    priv_obj.mark_generated();
     hsm.object_store
         .insert_objects(vec![pub_obj, priv_obj])
         .map_err(err_to_rv)?;
@@ -4110,6 +4115,8 @@ fn generate_ed25519_keypair(
     // Insert both halves under one store transaction: one fsync instead of
     // two, and a crash can no longer persist the public key without its
     // private half.
+    pub_obj.mark_generated();
+    priv_obj.mark_generated();
     hsm.object_store
         .insert_objects(vec![pub_obj, priv_obj])
         .map_err(err_to_rv)?;
@@ -4236,6 +4243,8 @@ fn generate_pqc_keypair(
     // Insert both halves under one store transaction: one fsync instead of
     // two, and a crash can no longer persist the public key without its
     // private half.
+    pub_obj.mark_generated();
+    priv_obj.mark_generated();
     hsm.object_store
         .insert_objects(vec![pub_obj, priv_obj])
         .map_err(err_to_rv)?;
@@ -4911,8 +4920,17 @@ pub extern "C" fn C_CopyObject(
                     }
                     // Reject security-relevant attributes that could be
                     // used to inject key material or bypass access controls
-                    CKA_VALUE | CKA_PRIVATE_EXPONENT | CKA_PRIME_1 | CKA_PRIME_2
-                    | CKA_EXPONENT_1 | CKA_EXPONENT_2 | CKA_COEFFICIENT => {
+                    CKA_VALUE
+                    | CKA_PRIVATE_EXPONENT
+                    | CKA_PRIME_1
+                    | CKA_PRIME_2
+                    | CKA_EXPONENT_1
+                    | CKA_EXPONENT_2
+                    | CKA_COEFFICIENT
+                    | CKA_PARAMETER_SET
+                    | CKA_LOCAL
+                    | CKA_ALWAYS_SENSITIVE
+                    | CKA_NEVER_EXTRACTABLE => {
                         return CKR_ATTRIBUTE_READ_ONLY;
                     }
                     // Store other attributes as extra
