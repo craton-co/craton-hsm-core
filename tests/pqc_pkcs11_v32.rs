@@ -514,12 +514,15 @@ fn test_v32_mechanisms_advertised() {
     assert_eq!(C_GetMechanismList(0, ptr::null_mut(), &mut count), CKR_OK);
     let mut list = vec![0 as CK_MECHANISM_TYPE; count as usize];
     assert_eq!(C_GetMechanismList(0, list.as_mut_ptr(), &mut count), CKR_OK);
-    for mech in [
-        CKM_ML_DSA_KEY_PAIR_GEN,
-        CKM_ML_DSA,
-        CKM_ML_KEM_KEY_PAIR_GEN,
-        CKM_SLH_DSA_KEY_PAIR_GEN,
-        CKM_SLH_DSA,
+    // ML-DSA / SLH-DSA: public key bytes; EdDSA: bits (PKCS#11 v3.2).
+    for (mech, sizes) in [
+        (CKM_ML_DSA_KEY_PAIR_GEN, Some((1312, 2592))),
+        (CKM_ML_DSA, Some((1312, 2592))),
+        (CKM_ML_KEM_KEY_PAIR_GEN, None),
+        (CKM_SLH_DSA_KEY_PAIR_GEN, Some((32, 64))),
+        (CKM_SLH_DSA, Some((32, 64))),
+        (CKM_EC_EDWARDS_KEY_PAIR_GEN, Some((255, 255))),
+        (CKM_EDDSA, Some((255, 255))),
     ] {
         assert!(list.contains(&mech), "mechanism 0x{mech:X} not listed");
         let mut info = CK_MECHANISM_INFO {
@@ -528,6 +531,9 @@ fn test_v32_mechanisms_advertised() {
             flags: 0,
         };
         assert_eq!(C_GetMechanismInfo(0, mech, &mut info), CKR_OK);
+        if let Some(sizes) = sizes {
+            assert_eq!((info.min_key_size, info.max_key_size), sizes);
+        }
     }
 }
 

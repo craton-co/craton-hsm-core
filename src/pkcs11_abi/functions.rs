@@ -1164,14 +1164,16 @@ pub extern "C" fn C_GetMechanismInfo(
                 max_key_size: 521 as CK_ULONG,
                 flags: CKF_DERIVE_FLAG,
             },
+            // PKCS#11 v3.2 §6.3: EdDSA key sizes are 255 (Ed25519) or 448
+            // (Ed448) bits; only Ed25519 is implemented.
             CKM_EC_EDWARDS_KEY_PAIR_GEN => CK_MECHANISM_INFO {
-                min_key_size: 256 as CK_ULONG,
-                max_key_size: 256 as CK_ULONG,
+                min_key_size: 255 as CK_ULONG,
+                max_key_size: 255 as CK_ULONG,
                 flags: CKF_GENERATE_KEY_PAIR_FLAG,
             },
             CKM_EDDSA => CK_MECHANISM_INFO {
-                min_key_size: 256 as CK_ULONG,
-                max_key_size: 256 as CK_ULONG,
+                min_key_size: 255 as CK_ULONG,
+                max_key_size: 255 as CK_ULONG,
                 flags: CKF_SIGN_FLAG | CKF_VERIFY_FLAG | CKF_GENERATE_KEY_PAIR_FLAG,
             },
             CKM_AES_KEY_GEN => CK_MECHANISM_INFO {
@@ -1195,31 +1197,33 @@ pub extern "C" fn C_GetMechanismInfo(
                 max_key_size: 0 as CK_ULONG,
                 flags: CKF_DIGEST_FLAG,
             },
-            // Post-Quantum, PKCS#11 v3.2: the key sizes are the range of
+            // Post-Quantum, PKCS#11 v3.2: ML-KEM key sizes are the range of
             // supported CKA_PARAMETER_SET values.
             CKM_ML_KEM_KEY_PAIR_GEN => CK_MECHANISM_INFO {
                 min_key_size: CKP_ML_KEM_512,
                 max_key_size: CKP_ML_KEM_1024,
                 flags: CKF_GENERATE_KEY_PAIR_FLAG,
             },
+            // PKCS#11 v3.2 §6.67 / §6.69: ML-DSA and SLH-DSA key sizes are
+            // public key lengths in bytes (ML-DSA-44..87, SLH-DSA 128s..256s).
             CKM_ML_DSA_KEY_PAIR_GEN => CK_MECHANISM_INFO {
-                min_key_size: CKP_ML_DSA_44,
-                max_key_size: CKP_ML_DSA_87,
+                min_key_size: 1312 as CK_ULONG,
+                max_key_size: 2592 as CK_ULONG,
                 flags: CKF_GENERATE_KEY_PAIR_FLAG,
             },
             CKM_ML_DSA => CK_MECHANISM_INFO {
-                min_key_size: CKP_ML_DSA_44,
-                max_key_size: CKP_ML_DSA_87,
+                min_key_size: 1312 as CK_ULONG,
+                max_key_size: 2592 as CK_ULONG,
                 flags: CKF_SIGN_FLAG | CKF_VERIFY_FLAG,
             },
             CKM_SLH_DSA_KEY_PAIR_GEN => CK_MECHANISM_INFO {
-                min_key_size: CKP_SLH_DSA_SHA2_128S,
-                max_key_size: CKP_SLH_DSA_SHA2_256S,
+                min_key_size: 32 as CK_ULONG,
+                max_key_size: 64 as CK_ULONG,
                 flags: CKF_GENERATE_KEY_PAIR_FLAG,
             },
             CKM_SLH_DSA => CK_MECHANISM_INFO {
-                min_key_size: CKP_SLH_DSA_SHA2_128S,
-                max_key_size: CKP_SLH_DSA_SHA2_256S,
+                min_key_size: 32 as CK_ULONG,
+                max_key_size: 64 as CK_ULONG,
                 flags: CKF_SIGN_FLAG | CKF_VERIFY_FLAG,
             },
             // Post-Quantum: ML-KEM (Key Encapsulation)
