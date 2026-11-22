@@ -6,6 +6,9 @@
 # documented inline with the reason and (where relevant) the review cadence.
 
 [advisories]
+# An ignore entry that no longer matches the lock file is an error, so it
+# cannot keep muting an advisory after the crate is updated.
+unused-ignored-advisory = "deny"
 # In cargo-deny >= 0.16, every advisory (vulnerability / unmaintained /
 # unsound / yanked / notice) is a hard error unless silenced below. The
 # ignore list is reviewed quarterly — last reviewed 2026-05-07.
@@ -15,25 +18,6 @@ ignore = [
     # (including cached and prehashed operations); the crate remains only for
     # public-key work, key generation, and debug/explicit compatibility tests.
     { id = "RUSTSEC-2023-0071", reason = "release private-key operations are hard-disabled pending upstream fix" },
-
-    # rustls-pemfile unmaintained — pulled in transitively by the daemon's
-    # TLS stack. Tracked for the next daemon dependency sweep.
-    { id = "RUSTSEC-2025-0134", reason = "transitive daemon TLS dep; update pending" },
-
-    # aws-lc-fips-sys / aws-lc-sys / rustls-webpki — optional FIPS backend
-    # and daemon TLS dependencies. Updates pending the next aws-lc-rs and
-    # rustls release cycles. Mirrors the ignore list in the
-    # security-audit.yml workflow so `cargo audit` and `cargo deny` agree.
-    { id = "RUSTSEC-2026-0042", reason = "optional aws-lc-fips backend; update pending" },
-    { id = "RUSTSEC-2026-0044", reason = "transitive via optional aws-lc-rs" },
-    { id = "RUSTSEC-2026-0045", reason = "transitive via optional aws-lc-rs" },
-    { id = "RUSTSEC-2026-0046", reason = "transitive via optional aws-lc-rs" },
-    { id = "RUSTSEC-2026-0047", reason = "transitive via optional aws-lc-rs" },
-    { id = "RUSTSEC-2026-0048", reason = "transitive via optional aws-lc-rs" },
-    { id = "RUSTSEC-2026-0049", reason = "daemon TLS dep (rustls-webpki); update pending" },
-    { id = "RUSTSEC-2026-0098", reason = "daemon TLS dep (rustls-webpki); update pending" },
-    { id = "RUSTSEC-2026-0099", reason = "daemon TLS dep (rustls-webpki); update pending" },
-    { id = "RUSTSEC-2026-0104", reason = "daemon TLS dep (rustls-webpki); update pending" },
 
     # crypto-bigint 0.5.5 constant-time timing variability. Classical RustCrypto
     # stack (elliptic-curve 0.13, p256 0.13, p384 0.13, ecdsa 0.16) pins 0.5;

@@ -241,17 +241,6 @@ job_audit() {
         echo -e "\n${BOLD}  cargo audit${NC}"
         if cargo audit \
             --ignore RUSTSEC-2023-0071 \
-            --ignore RUSTSEC-2026-0042 \
-            --ignore RUSTSEC-2026-0044 \
-            --ignore RUSTSEC-2026-0045 \
-            --ignore RUSTSEC-2026-0046 \
-            --ignore RUSTSEC-2026-0047 \
-            --ignore RUSTSEC-2026-0048 \
-            --ignore RUSTSEC-2026-0049 \
-            --ignore RUSTSEC-2026-0098 \
-            --ignore RUSTSEC-2026-0099 \
-            --ignore RUSTSEC-2026-0104 \
-            --ignore RUSTSEC-2025-0134 \
             --ignore RUSTSEC-2026-0387 2>&1; then
             echo -e "  ${GREEN}✓${NC} cargo-audit passed"
         else
