@@ -1621,6 +1621,10 @@ pub extern "C" fn C_CreateObject(
             }
         }
 
+        if let Err(rv) = check_curve25519_template(&template) {
+            return rv;
+        }
+
         // PKCS#11 §5.7.1: Creating private/secret key objects requires login.
         let is_key_object = template.iter().any(|(attr_type, value)| {
             *attr_type == CKA_CLASS && value.len() >= std::mem::size_of::<CK_ULONG>() && {
@@ -4037,6 +4041,54 @@ fn is_ed25519_params(ec_params: &[u8]) -> bool {
     const ED25519_OID: &[u8] = &[0x06, 0x03, 0x2B, 0x65, 0x70];
     const ED25519_NAME: &[u8] = b"\x13\x0cedwards25519";
     ec_params == ED25519_OID || ec_params == ED25519_NAME
+}
+
+/// Helper to check if EC params correspond to X25519 (id-X25519 OID 1.3.101.110
+/// or PrintableString "curve25519").
+fn is_x25519_params(ec_params: &[u8]) -> bool {
+    const X25519_OID: &[u8] = &[0x06, 0x03, 0x2B, 0x65, 0x6E];
+    const X25519_NAME: &[u8] = b"
+curve25519";
+    ec_params == X25519_OID || ec_params == X25519_NAME
+}
+
+/// PKCS#11 v3.2 Edwards / Montgomery key objects: `CKA_EC_PARAMS` must name
+/// the curve of the key type, and a private `CKA_VALUE` is the 32-byte
+/// RFC 8032 / RFC 7748 key. Refused at C_CreateObject instead of at first use.
+fn check_curve25519_template(template: &[(CK_ATTRIBUTE_TYPE, Vec<u8>)]) -> Result<(), CK_RV> {
+    let edwards = match read_ulong_attr(template, CKA_KEY_TYPE) {
+        Some(CKK_EC_EDWARDS) => true,
+        Some(CKK_EC_MONTGOMERY) => false,
+        _ => return Ok(()),
+    };
+    let attr = |t| {
+        template
+            .iter()
+            .find(|(a, _)| *a == t)
+            .map(|(_, v)| v.as_slice())
+    };
+    if let Some(params) = attr(CKA_EC_PARAMS) {
+        let matches = if edwards {
+            is_ed25519_params(params)
+        } else {
+            is_x25519_params(params)
+        };
+        if !matches {
+            // The other 25519 curve contradicts the key type; anything else
+            // (Ed448 / X448 included) is a curve this token does not have.
+            return Err(if is_ed25519_params(params) || is_x25519_params(params) {
+                CKR_TEMPLATE_INCONSISTENT
+            } else {
+                CKR_CURVE_NOT_SUPPORTED
+            });
+        }
+    }
+    if read_ulong_attr(template, CKA_CLASS) == Some(CKO_PRIVATE_KEY)
+        && attr(CKA_VALUE).is_some_and(|v| v.len() != 32)
+    {
+        return Err(CKR_ATTRIBUTE_VALUE_INVALID);
+    }
+    Ok(())
 }
 
 /// Ed25519 key pair generation helper
