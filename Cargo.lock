@@ -550,7 +550,7 @@ dependencies = [
 
 [[package]]
 name = "craton-hsm"
-version = "0.11.2"
+version = "0.11.3"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -603,7 +603,7 @@ dependencies = [
 
 [[package]]
 name = "craton-hsm-admin"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "clap",
  "comfy-table",

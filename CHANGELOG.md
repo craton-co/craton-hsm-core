@@ -6,6 +6,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.3] - 2026-11-23
+
+### Fixed
+
+- **CKA_PARAMETER_SET on imported PQC private keys**: An ML-DSA / ML-KEM /
+  SLH-DSA private key created with `C_CreateObject` (e.g. `pkcs11-tool
+  --write-object`) now reports the `CKA_PARAMETER_SET` from its creation
+  template, and `CKM_ML_DSA` / `CKM_SLH_DSA` can sign with it.
+- **Key attributes**: Keys now report `CKA_LOCAL`, `CKA_ALWAYS_SENSITIVE`,
+  `CKA_NEVER_EXTRACTABLE` (true only for keys generated on the token) and
+  `CKA_SIGN_RECOVER` / `CKA_VERIFY_RECOVER` instead of
+  `CKR_ATTRIBUTE_TYPE_INVALID`. Callers cannot set the first three in
+  `C_CreateObject` or `C_CopyObject` templates.
+- **Mechanism key sizes (PKCS#11 v3.2)**: `CKM_EC_EDWARDS_KEY_PAIR_GEN` /
+  `CKM_EDDSA` report 255 bits; `CKM_ML_DSA*` report 1312–2592 and
+  `CKM_SLH_DSA*` 32–64 public key bytes.
+
+### Changed
+
+- **Admin CLI 0.5.0**: `craton-hsm-admin` reads the config path from
+  `CRATON_HSM_CONFIG` when `--config` is not given.
+
+### Security
+
+- **cargo-deny**: Removed advisory ignores that no longer match `Cargo.lock`
+  and set `unused-ignored-advisory = "deny"`.
+
 ## [0.11.2] - 2026-11-18
 
 ### Fixed
