@@ -4067,21 +4067,21 @@ fn check_curve25519_template(template: &[(CK_ATTRIBUTE_TYPE, Vec<u8>)]) -> Resul
             .find(|(a, _)| *a == t)
             .map(|(_, v)| v.as_slice())
     };
-    if let Some(params) = attr(CKA_EC_PARAMS) {
-        let matches = if edwards {
-            is_ed25519_params(params)
+    // CKA_EC_PARAMS must be given when the object is created.
+    let params = attr(CKA_EC_PARAMS).ok_or(CKR_TEMPLATE_INCOMPLETE)?;
+    let matches = if edwards {
+        is_ed25519_params(params)
+    } else {
+        is_x25519_params(params)
+    };
+    if !matches {
+        // The other 25519 curve contradicts the key type; anything else
+        // (Ed448 / X448 included) is a curve this token does not have.
+        return Err(if is_ed25519_params(params) || is_x25519_params(params) {
+            CKR_TEMPLATE_INCONSISTENT
         } else {
-            is_x25519_params(params)
-        };
-        if !matches {
-            // The other 25519 curve contradicts the key type; anything else
-            // (Ed448 / X448 included) is a curve this token does not have.
-            return Err(if is_ed25519_params(params) || is_x25519_params(params) {
-                CKR_TEMPLATE_INCONSISTENT
-            } else {
-                CKR_CURVE_NOT_SUPPORTED
-            });
-        }
+            CKR_CURVE_NOT_SUPPORTED
+        });
     }
     if read_ulong_attr(template, CKA_CLASS) == Some(CKO_PRIVATE_KEY)
         && attr(CKA_VALUE).is_some_and(|v| v.len() != 32)

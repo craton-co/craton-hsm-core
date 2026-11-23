@@ -20,7 +20,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `CKR_ATTRIBUTE_TYPE_INVALID`. Callers cannot set the first three in
   `C_CreateObject` or `C_CopyObject` templates.
 - **Ed25519 / X25519 key import**: `C_CreateObject` of a `CKK_EC_EDWARDS` /
-  `CKK_EC_MONTGOMERY` key refuses a `CKA_EC_PARAMS` naming the other curve
+  `CKK_EC_MONTGOMERY` key refuses a missing `CKA_EC_PARAMS`
+  (`CKR_TEMPLATE_INCOMPLETE`), one naming the other curve
   (`CKR_TEMPLATE_INCONSISTENT`) or an unsupported one
   (`CKR_CURVE_NOT_SUPPORTED`), and a private `CKA_VALUE` that is not 32 bytes
   (`CKR_ATTRIBUTE_VALUE_INVALID`), instead of failing at first use.

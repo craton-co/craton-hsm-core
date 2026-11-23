@@ -2764,41 +2764,31 @@ fn test_create_object_unsupported_ec_curve_rejected() {
     assert_eq!(rv, CKR_CURVE_NOT_SUPPORTED);
 }
 
-/// C_CreateObject of an Edwards / Montgomery private key refuses a
-/// CKA_EC_PARAMS naming the other curve and a CKA_VALUE that is not 32 bytes.
+/// C_CreateObject of an Edwards / Montgomery private key refuses a missing
+/// CKA_EC_PARAMS, one naming the other curve, and a CKA_VALUE that is not 32 bytes.
 #[test]
 fn test_create_object_curve25519_private_key_validated() {
     let session = setup_user_session();
     const X25519_OID: [u8; 5] = [0x06, 0x03, 0x2B, 0x65, 0x6E];
     const ED25519_OID: [u8; 5] = [0x06, 0x03, 0x2B, 0x65, 0x70];
     const ED448_OID: [u8; 5] = [0x06, 0x03, 0x2B, 0x65, 0x71];
-    let create = |key_type: CK_ULONG, oid: [u8; 5], len: usize| {
-        let mut class_val = CKO_PRIVATE_KEY;
-        let mut key_type_val = key_type;
-        let mut oid = oid;
-        let mut value: Vec<u8> = (0..len as u8).map(|i| 0x40 + i).collect();
-        let mut tpl = [
-            CK_ATTRIBUTE {
-                attr_type: CKA_CLASS,
-                p_value: &mut class_val as *mut _ as CK_VOID_PTR,
-                value_len: std::mem::size_of::<CK_ULONG>() as CK_ULONG,
-            },
-            CK_ATTRIBUTE {
-                attr_type: CKA_KEY_TYPE,
-                p_value: &mut key_type_val as *mut _ as CK_VOID_PTR,
-                value_len: std::mem::size_of::<CK_ULONG>() as CK_ULONG,
-            },
-            CK_ATTRIBUTE {
-                attr_type: CKA_EC_PARAMS,
-                p_value: oid.as_mut_ptr() as CK_VOID_PTR,
-                value_len: oid.len() as CK_ULONG,
-            },
-            CK_ATTRIBUTE {
-                attr_type: CKA_VALUE,
-                p_value: value.as_mut_ptr() as CK_VOID_PTR,
-                value_len: value.len() as CK_ULONG,
-            },
+    let create = |key_type: CK_ULONG, oid: Option<[u8; 5]>, len: usize| {
+        let mut attrs: Vec<(CK_ULONG, Vec<u8>)> = vec![
+            (CKA_CLASS, CKO_PRIVATE_KEY.to_ne_bytes().to_vec()),
+            (CKA_KEY_TYPE, key_type.to_ne_bytes().to_vec()),
+            (CKA_VALUE, (0..len as u8).map(|i| 0x40 + i).collect()),
         ];
+        if let Some(oid) = oid {
+            attrs.push((CKA_EC_PARAMS, oid.to_vec()));
+        }
+        let mut tpl: Vec<CK_ATTRIBUTE> = attrs
+            .iter_mut()
+            .map(|(t, v)| CK_ATTRIBUTE {
+                attr_type: *t,
+                p_value: v.as_mut_ptr() as CK_VOID_PTR,
+                value_len: v.len() as CK_ULONG,
+            })
+            .collect();
         let mut handle: CK_OBJECT_HANDLE = 0;
         C_CreateObject(
             session,
@@ -2807,27 +2797,29 @@ fn test_create_object_curve25519_private_key_validated() {
             &mut handle,
         )
     };
-    assert_eq!(create(CKK_EC_EDWARDS, ED25519_OID, 32), CKR_OK);
-    assert_eq!(create(CKK_EC_MONTGOMERY, X25519_OID, 32), CKR_OK);
+    assert_eq!(create(CKK_EC_EDWARDS, Some(ED25519_OID), 32), CKR_OK);
+    assert_eq!(create(CKK_EC_MONTGOMERY, Some(X25519_OID), 32), CKR_OK);
+    assert_eq!(create(CKK_EC_EDWARDS, None, 32), CKR_TEMPLATE_INCOMPLETE);
+    assert_eq!(create(CKK_EC_MONTGOMERY, None, 32), CKR_TEMPLATE_INCOMPLETE);
     assert_eq!(
-        create(CKK_EC_EDWARDS, X25519_OID, 32),
+        create(CKK_EC_EDWARDS, Some(X25519_OID), 32),
         CKR_TEMPLATE_INCONSISTENT
     );
     assert_eq!(
-        create(CKK_EC_MONTGOMERY, ED25519_OID, 32),
+        create(CKK_EC_MONTGOMERY, Some(ED25519_OID), 32),
         CKR_TEMPLATE_INCONSISTENT
     );
     assert_eq!(
-        create(CKK_EC_EDWARDS, ED448_OID, 32),
+        create(CKK_EC_EDWARDS, Some(ED448_OID), 32),
         CKR_CURVE_NOT_SUPPORTED
     );
     for len in [31, 33] {
         assert_eq!(
-            create(CKK_EC_EDWARDS, ED25519_OID, len),
+            create(CKK_EC_EDWARDS, Some(ED25519_OID), len),
             CKR_ATTRIBUTE_VALUE_INVALID
         );
         assert_eq!(
-            create(CKK_EC_MONTGOMERY, X25519_OID, len),
+            create(CKK_EC_MONTGOMERY, Some(X25519_OID), len),
             CKR_ATTRIBUTE_VALUE_INVALID
         );
     }
