@@ -8,8 +8,8 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(name = "craton-hsm-admin", about = "Craton HSM Admin CLI")]
 struct Cli {
-    /// Path to craton_hsm.toml config file
-    #[arg(long, default_value = "craton_hsm.toml")]
+    /// Path to craton_hsm.toml config file (same env var as the PKCS#11 module)
+    #[arg(long, env = "CRATON_HSM_CONFIG", default_value = "craton_hsm.toml")]
     config: String,
 
     /// Output in JSON format
