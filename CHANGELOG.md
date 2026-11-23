@@ -20,8 +20,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `CKR_ATTRIBUTE_TYPE_INVALID`. Callers cannot set the first three in
   `C_CreateObject` or `C_CopyObject` templates.
 - **Mechanism key sizes (PKCS#11 v3.2)**: `CKM_EC_EDWARDS_KEY_PAIR_GEN` /
-  `CKM_EDDSA` report 255 bits; `CKM_ML_DSA*` report 1312–2592 and
-  `CKM_SLH_DSA*` 32–64 public key bytes.
+  `CKM_EDDSA` report 255 bits; `CKM_ML_DSA*` report 1312–2592,
+  `CKM_ML_KEM_KEY_PAIR_GEN` 800–1568 and `CKM_SLH_DSA*` 32–64 public key bytes.
 
 ### Changed
 

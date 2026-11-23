@@ -1197,11 +1197,11 @@ pub extern "C" fn C_GetMechanismInfo(
                 max_key_size: 0 as CK_ULONG,
                 flags: CKF_DIGEST_FLAG,
             },
-            // Post-Quantum, PKCS#11 v3.2: ML-KEM key sizes are the range of
-            // supported CKA_PARAMETER_SET values.
+            // PKCS#11 v3.2: ML-KEM key sizes are public key lengths in
+            // bytes (ML-KEM-512..1024).
             CKM_ML_KEM_KEY_PAIR_GEN => CK_MECHANISM_INFO {
-                min_key_size: CKP_ML_KEM_512,
-                max_key_size: CKP_ML_KEM_1024,
+                min_key_size: 800 as CK_ULONG,
+                max_key_size: 1568 as CK_ULONG,
                 flags: CKF_GENERATE_KEY_PAIR_FLAG,
             },
             // PKCS#11 v3.2 §6.67 / §6.69: ML-DSA and SLH-DSA key sizes are
