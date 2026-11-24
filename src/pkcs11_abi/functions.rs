@@ -737,10 +737,7 @@ pub extern "C" fn C_GetInfo(p_info: CK_INFO_PTR) -> CK_RV {
             manufacturer_id: [b' '; 32],
             flags: 0,
             library_description: [b' '; 32],
-            library_version: CK_VERSION {
-                major: 0,
-                minor: 10,
-            },
+            library_version: CRATE_VERSION,
         };
         pad_string(&mut info.manufacturer_id, "Craton HSM Project");
         pad_string(&mut info.library_description, "Craton HSM Software HSM");
@@ -842,10 +839,7 @@ pub extern "C" fn C_GetSlotInfo(slot_id: CK_SLOT_ID, p_info: CK_SLOT_INFO_PTR) -
             manufacturer_id: [b' '; 32],
             flags: CKF_SLOT_TOKEN_PRESENT,
             hardware_version: CK_VERSION { major: 0, minor: 1 },
-            firmware_version: CK_VERSION {
-                major: 0,
-                minor: 10,
-            },
+            firmware_version: CRATE_VERSION,
         };
         pad_string(&mut info.slot_description, "Craton HSM Virtual Slot");
         pad_string(&mut info.manufacturer_id, "Craton HSM Project");
@@ -892,10 +886,7 @@ pub extern "C" fn C_GetTokenInfo(slot_id: CK_SLOT_ID, p_info: CK_TOKEN_INFO_PTR)
             total_private_memory: CK_UNAVAILABLE_INFORMATION,
             free_private_memory: CK_UNAVAILABLE_INFORMATION,
             hardware_version: CK_VERSION { major: 0, minor: 1 },
-            firmware_version: CK_VERSION {
-                major: 0,
-                minor: 10,
-            },
+            firmware_version: CRATE_VERSION,
             utc_time: [b' '; 16],
         };
         pad_string(&mut info.manufacturer_id, "Craton HSM Project");
@@ -8324,6 +8315,24 @@ static FUNCTION_LIST: CK_FUNCTION_LIST = CK_FUNCTION_LIST {
 // ============================================================================
 // Helpers
 // ============================================================================
+
+/// This crate's major.minor version, reported as the library and firmware
+/// version so it cannot drift from Cargo.toml.
+const CRATE_VERSION: CK_VERSION = CK_VERSION {
+    major: parse_version_part(env!("CARGO_PKG_VERSION_MAJOR")),
+    minor: parse_version_part(env!("CARGO_PKG_VERSION_MINOR")),
+};
+
+const fn parse_version_part(s: &str) -> u8 {
+    let b = s.as_bytes();
+    let mut i = 0;
+    let mut n: u8 = 0;
+    while i < b.len() {
+        n = n * 10 + (b[i] - b'0');
+        i += 1;
+    }
+    n
+}
 
 /// Returns `true` if `attr_type` is a CK_BBOOL attribute per PKCS#11.
 #[allow(dead_code)]

@@ -29,6 +29,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Mechanism key sizes (PKCS#11 v3.2)**: `CKM_EC_EDWARDS_KEY_PAIR_GEN` /
   `CKM_EDDSA` report 255 bits; `CKM_ML_DSA*` report 1312–2592,
   `CKM_ML_KEM_KEY_PAIR_GEN` 800–1568 and `CKM_SLH_DSA*` 32–64 public key bytes.
+- **Library version**: `C_GetInfo` reports the crate's major.minor version
+  (0.11) as `libraryVersion`, and `C_GetSlotInfo` / `C_GetTokenInfo` as
+  `firmwareVersion`, instead of a hardcoded 0.10.
 
 ### Changed
 

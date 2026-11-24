@@ -88,6 +88,13 @@ fn test_get_info_returns_valid_version() {
         info.cryptoki_version.minor, 0,
         "Expected Cryptoki minor version 0"
     );
+    // The library version is the crate version, not a stale constant.
+    let crate_version = (
+        env!("CARGO_PKG_VERSION_MAJOR").parse::<u8>().unwrap(),
+        env!("CARGO_PKG_VERSION_MINOR").parse::<u8>().unwrap(),
+    );
+    let lib = info.library_version;
+    assert_eq!((lib.major, lib.minor), crate_version);
 }
 
 // =============================================================================
