@@ -4053,8 +4053,8 @@ curve25519";
 }
 
 /// PKCS#11 v3.2 Edwards / Montgomery key objects: `CKA_EC_PARAMS` must name
-/// the curve of the key type, and a private `CKA_VALUE` is the 32-byte
-/// RFC 8032 / RFC 7748 key. Refused at C_CreateObject instead of at first use.
+/// the curve of the key type, and a private `CKA_VALUE` / public
+/// `CKA_EC_POINT` is the 32-byte RFC 8032 / RFC 7748 key. Refused at C_CreateObject instead of at first use.
 fn check_curve25519_template(template: &[(CK_ATTRIBUTE_TYPE, Vec<u8>)]) -> Result<(), CK_RV> {
     let edwards = match read_ulong_attr(template, CKA_KEY_TYPE) {
         Some(CKK_EC_EDWARDS) => true,
@@ -4083,9 +4083,16 @@ fn check_curve25519_template(template: &[(CK_ATTRIBUTE_TYPE, Vec<u8>)]) -> Resul
             CKR_CURVE_NOT_SUPPORTED
         });
     }
-    if read_ulong_attr(template, CKA_CLASS) == Some(CKO_PRIVATE_KEY)
-        && attr(CKA_VALUE).is_some_and(|v| v.len() != 32)
-    {
+    // The private scalar and the public point (DER OCTET STRING or raw) are
+    // both 32 bytes for Ed25519 / X25519.
+    let bad_len = match read_ulong_attr(template, CKA_CLASS) {
+        Some(CKO_PRIVATE_KEY) => attr(CKA_VALUE).is_some_and(|v| v.len() != 32),
+        Some(CKO_PUBLIC_KEY) => {
+            attr(CKA_EC_POINT).is_some_and(|v| crate::store::ec_point::decode(v).len() != 32)
+        }
+        _ => false,
+    };
+    if bad_len {
         return Err(CKR_ATTRIBUTE_VALUE_INVALID);
     }
     Ok(())

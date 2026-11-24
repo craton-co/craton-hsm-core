@@ -2764,19 +2764,27 @@ fn test_create_object_unsupported_ec_curve_rejected() {
     assert_eq!(rv, CKR_CURVE_NOT_SUPPORTED);
 }
 
-/// C_CreateObject of an Edwards / Montgomery private key refuses a missing
-/// CKA_EC_PARAMS, one naming the other curve, and a CKA_VALUE that is not 32 bytes.
+/// C_CreateObject of an Edwards / Montgomery key refuses a missing
+/// CKA_EC_PARAMS, one naming the other curve, and a private CKA_VALUE or
+/// public CKA_EC_POINT that is not 32 bytes.
 #[test]
 fn test_create_object_curve25519_private_key_validated() {
     let session = setup_user_session();
     const X25519_OID: [u8; 5] = [0x06, 0x03, 0x2B, 0x65, 0x6E];
     const ED25519_OID: [u8; 5] = [0x06, 0x03, 0x2B, 0x65, 0x70];
     const ED448_OID: [u8; 5] = [0x06, 0x03, 0x2B, 0x65, 0x71];
-    let create = |key_type: CK_ULONG, oid: Option<[u8; 5]>, len: usize| {
+    let create_obj = |class: CK_ULONG, key_type: CK_ULONG, oid: Option<[u8; 5]>, len: usize| {
+        let key: Vec<u8> = (0..len as u8).map(|i| 0x40 + i).collect();
+        let key_attr = if class == CKO_PRIVATE_KEY {
+            (CKA_VALUE, key)
+        } else {
+            // DER OCTET STRING, as pkcs11-tool writes it.
+            (CKA_EC_POINT, [vec![0x04, len as u8], key].concat())
+        };
         let mut attrs: Vec<(CK_ULONG, Vec<u8>)> = vec![
-            (CKA_CLASS, CKO_PRIVATE_KEY.to_ne_bytes().to_vec()),
+            (CKA_CLASS, class.to_ne_bytes().to_vec()),
             (CKA_KEY_TYPE, key_type.to_ne_bytes().to_vec()),
-            (CKA_VALUE, (0..len as u8).map(|i| 0x40 + i).collect()),
+            key_attr,
         ];
         if let Some(oid) = oid {
             attrs.push((CKA_EC_PARAMS, oid.to_vec()));
@@ -2797,6 +2805,7 @@ fn test_create_object_curve25519_private_key_validated() {
             &mut handle,
         )
     };
+    let create = |key_type, oid, len| create_obj(CKO_PRIVATE_KEY, key_type, oid, len);
     assert_eq!(create(CKK_EC_EDWARDS, Some(ED25519_OID), 32), CKR_OK);
     assert_eq!(create(CKK_EC_MONTGOMERY, Some(X25519_OID), 32), CKR_OK);
     assert_eq!(create(CKK_EC_EDWARDS, None, 32), CKR_TEMPLATE_INCOMPLETE);
@@ -2822,5 +2831,13 @@ fn test_create_object_curve25519_private_key_validated() {
             create(CKK_EC_MONTGOMERY, Some(X25519_OID), len),
             CKR_ATTRIBUTE_VALUE_INVALID
         );
+        assert_eq!(
+            create_obj(CKO_PUBLIC_KEY, CKK_EC_EDWARDS, Some(ED25519_OID), len),
+            CKR_ATTRIBUTE_VALUE_INVALID
+        );
     }
+    assert_eq!(
+        create_obj(CKO_PUBLIC_KEY, CKK_EC_EDWARDS, Some(ED25519_OID), 32),
+        CKR_OK
+    );
 }

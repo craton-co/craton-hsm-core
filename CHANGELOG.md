@@ -23,7 +23,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `CKK_EC_MONTGOMERY` key refuses a missing `CKA_EC_PARAMS`
   (`CKR_TEMPLATE_INCOMPLETE`), one naming the other curve
   (`CKR_TEMPLATE_INCONSISTENT`) or an unsupported one
-  (`CKR_CURVE_NOT_SUPPORTED`), and a private `CKA_VALUE` that is not 32 bytes
+  (`CKR_CURVE_NOT_SUPPORTED`), and a private `CKA_VALUE` or public
+  `CKA_EC_POINT` that is not 32 bytes
   (`CKR_ATTRIBUTE_VALUE_INVALID`), instead of failing at first use.
 - **Mechanism key sizes (PKCS#11 v3.2)**: `CKM_EC_EDWARDS_KEY_PAIR_GEN` /
   `CKM_EDDSA` report 255 bits; `CKM_ML_DSA*` report 1312–2592,
