@@ -19,13 +19,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `CKA_SIGN_RECOVER` / `CKA_VERIFY_RECOVER` instead of
   `CKR_ATTRIBUTE_TYPE_INVALID`. Callers cannot set the first three in
   `C_CreateObject` or `C_CopyObject` templates.
-- **Ed25519 / X25519 key import**: `C_CreateObject` of a `CKK_EC_EDWARDS` /
-  `CKK_EC_MONTGOMERY` key refuses a missing `CKA_EC_PARAMS`
-  (`CKR_TEMPLATE_INCOMPLETE`), one naming the other curve
-  (`CKR_TEMPLATE_INCONSISTENT`) or an unsupported one
+- **Ed25519 / X25519 key import**: `C_CreateObject` of a `CKK_EC_EDWARDS`
+  key refuses a missing `CKA_EC_PARAMS` (`CKR_TEMPLATE_INCOMPLETE`), one naming
+  X25519 (`CKR_TEMPLATE_INCONSISTENT`) or an unsupported curve
   (`CKR_CURVE_NOT_SUPPORTED`), and a private `CKA_VALUE` or public
-  `CKA_EC_POINT` that is not 32 bytes
-  (`CKR_ATTRIBUTE_VALUE_INVALID`), instead of failing at first use.
+  `CKA_EC_POINT` that is not 32 bytes (`CKR_ATTRIBUTE_VALUE_INVALID`), instead
+  of failing at first use. `CKK_EC_MONTGOMERY` (X25519) keys, which no
+  mechanism supports, are refused with `CKR_CURVE_NOT_SUPPORTED`.
 - **Mechanism key sizes (PKCS#11 v3.2)**: `CKM_EC_EDWARDS_KEY_PAIR_GEN` /
   `CKM_EDDSA` report 255 bits; `CKM_ML_DSA*` report 1312–2592,
   `CKM_ML_KEM_KEY_PAIR_GEN` 800–1568 and `CKM_SLH_DSA*` 32–64 public key bytes.

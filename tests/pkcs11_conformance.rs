@@ -2764,9 +2764,9 @@ fn test_create_object_unsupported_ec_curve_rejected() {
     assert_eq!(rv, CKR_CURVE_NOT_SUPPORTED);
 }
 
-/// C_CreateObject of an Edwards / Montgomery key refuses a missing
-/// CKA_EC_PARAMS, one naming the other curve, and a private CKA_VALUE or
-/// public CKA_EC_POINT that is not 32 bytes.
+/// C_CreateObject of an Edwards key refuses a missing CKA_EC_PARAMS, one
+/// naming another curve, and a private CKA_VALUE or public CKA_EC_POINT that
+/// is not 32 bytes. Montgomery (X25519) keys are refused: nothing can use them.
 #[test]
 fn test_create_object_curve25519_private_key_validated() {
     let session = setup_user_session();
@@ -2807,16 +2807,21 @@ fn test_create_object_curve25519_private_key_validated() {
     };
     let create = |key_type, oid, len| create_obj(CKO_PRIVATE_KEY, key_type, oid, len);
     assert_eq!(create(CKK_EC_EDWARDS, Some(ED25519_OID), 32), CKR_OK);
-    assert_eq!(create(CKK_EC_MONTGOMERY, Some(X25519_OID), 32), CKR_OK);
+    for len in [31, 32, 33] {
+        assert_eq!(
+            create(CKK_EC_MONTGOMERY, Some(X25519_OID), len),
+            CKR_CURVE_NOT_SUPPORTED
+        );
+    }
     assert_eq!(create(CKK_EC_EDWARDS, None, 32), CKR_TEMPLATE_INCOMPLETE);
-    assert_eq!(create(CKK_EC_MONTGOMERY, None, 32), CKR_TEMPLATE_INCOMPLETE);
+    assert_eq!(create(CKK_EC_MONTGOMERY, None, 32), CKR_CURVE_NOT_SUPPORTED);
     assert_eq!(
         create(CKK_EC_EDWARDS, Some(X25519_OID), 32),
         CKR_TEMPLATE_INCONSISTENT
     );
     assert_eq!(
         create(CKK_EC_MONTGOMERY, Some(ED25519_OID), 32),
-        CKR_TEMPLATE_INCONSISTENT
+        CKR_CURVE_NOT_SUPPORTED
     );
     assert_eq!(
         create(CKK_EC_EDWARDS, Some(ED448_OID), 32),
@@ -2825,10 +2830,6 @@ fn test_create_object_curve25519_private_key_validated() {
     for len in [31, 33] {
         assert_eq!(
             create(CKK_EC_EDWARDS, Some(ED25519_OID), len),
-            CKR_ATTRIBUTE_VALUE_INVALID
-        );
-        assert_eq!(
-            create(CKK_EC_MONTGOMERY, Some(X25519_OID), len),
             CKR_ATTRIBUTE_VALUE_INVALID
         );
         assert_eq!(

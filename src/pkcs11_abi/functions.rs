@@ -4052,15 +4052,16 @@ curve25519";
     ec_params == X25519_OID || ec_params == X25519_NAME
 }
 
-/// PKCS#11 v3.2 Edwards / Montgomery key objects: `CKA_EC_PARAMS` must name
-/// the curve of the key type, and a private `CKA_VALUE` / public
-/// `CKA_EC_POINT` is the 32-byte RFC 8032 / RFC 7748 key. Refused at C_CreateObject instead of at first use.
+/// PKCS#11 v3.2 Edwards key objects: `CKA_EC_PARAMS` must name Ed25519, and
+/// a private `CKA_VALUE` / public `CKA_EC_POINT` is the 32-byte RFC 8032 key.
+/// Montgomery (X25519) keys are refused: no mechanism here can use them.
+/// Checked at C_CreateObject instead of failing at first use.
 fn check_curve25519_template(template: &[(CK_ATTRIBUTE_TYPE, Vec<u8>)]) -> Result<(), CK_RV> {
-    let edwards = match read_ulong_attr(template, CKA_KEY_TYPE) {
-        Some(CKK_EC_EDWARDS) => true,
-        Some(CKK_EC_MONTGOMERY) => false,
+    match read_ulong_attr(template, CKA_KEY_TYPE) {
+        Some(CKK_EC_EDWARDS) => {}
+        Some(CKK_EC_MONTGOMERY) => return Err(CKR_CURVE_NOT_SUPPORTED),
         _ => return Ok(()),
-    };
+    }
     let attr = |t| {
         template
             .iter()
@@ -4069,22 +4070,17 @@ fn check_curve25519_template(template: &[(CK_ATTRIBUTE_TYPE, Vec<u8>)]) -> Resul
     };
     // CKA_EC_PARAMS must be given when the object is created.
     let params = attr(CKA_EC_PARAMS).ok_or(CKR_TEMPLATE_INCOMPLETE)?;
-    let matches = if edwards {
-        is_ed25519_params(params)
-    } else {
-        is_x25519_params(params)
-    };
-    if !matches {
-        // The other 25519 curve contradicts the key type; anything else
-        // (Ed448 / X448 included) is a curve this token does not have.
-        return Err(if is_ed25519_params(params) || is_x25519_params(params) {
+    if !is_ed25519_params(params) {
+        // X25519 contradicts the key type; anything else (Ed448 included) is
+        // a curve this token does not have.
+        return Err(if is_x25519_params(params) {
             CKR_TEMPLATE_INCONSISTENT
         } else {
             CKR_CURVE_NOT_SUPPORTED
         });
     }
     // The private scalar and the public point (DER OCTET STRING or raw) are
-    // both 32 bytes for Ed25519 / X25519.
+    // both 32 bytes for Ed25519.
     let bad_len = match read_ulong_attr(template, CKA_CLASS) {
         Some(CKO_PRIVATE_KEY) => attr(CKA_VALUE).is_some_and(|v| v.len() != 32),
         Some(CKO_PUBLIC_KEY) => {
